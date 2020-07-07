@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -273,7 +274,7 @@ func TestFluxMonitorAntiSpamLogic(t *testing.T) {
 	initialBalance := currentBalance(t, &fa).Int64()
 	reportPrice := answer
 	priceResponse := func() string {
-		return fmt.Sprintf(`{"data":{"result": %d}}`, reportPrice)
+		return fmt.Sprintf(`{"data":{"result": %d}}`, atomic.LoadInt64(&reportPrice))
 	}
 	mockServer := cltest.NewHTTPMockServerWithAlterableResponse(t, priceResponse)
 	defer mockServer.Close()
@@ -302,7 +303,7 @@ func TestFluxMonitorAntiSpamLogic(t *testing.T) {
 	j := cltest.CreateJobSpecViaWeb(t, app, job)
 	jrs := cltest.WaitForRuns(t, j, app.Store, 1) // Submit answer from
 	reportedPrice := jrs[0].RunRequest.RequestParams.Get("result").String()
-	assert.Equal(t, reportedPrice, fmt.Sprintf("%d", reportPrice), "failed to report correct price to contract")
+	assert.Equal(t, reportedPrice, fmt.Sprintf("%d", atomic.LoadInt64(&reportPrice)), "failed to report correct price to contract")
 	var receiptBlock uint64
 	select { // block until FluxAggregator contract acknowledges chainlink message
 	case log := <-submissionReceived:
@@ -325,7 +326,7 @@ func TestFluxMonitorAntiSpamLogic(t *testing.T) {
 	//- have the malicious node start the next round.
 	nextRoundBalance := initialBalance - fee
 	// Triggers a new round, since price deviation exceeds threshold
-	reportPrice = answer + 1
+	atomic.StoreInt64(&reportPrice, answer+1)
 	select {
 	case log := <-submissionReceived:
 		receiptBlock = log.Raw.BlockNumber
@@ -333,7 +334,7 @@ func TestFluxMonitorAntiSpamLogic(t *testing.T) {
 		t.Fatalf("chainlink failed to submit answer to FluxAggregator contract")
 	}
 	newRound := roundId + 1
-	processedAnswer = 100 * reportPrice
+	processedAnswer = 100 * atomic.LoadInt64(&reportPrice)
 	checkSubmission(t,
 		answerParams{
 			fa:              &fa,
@@ -359,7 +360,7 @@ func TestFluxMonitorAntiSpamLogic(t *testing.T) {
 	// Have the malicious node try to start another round repeatedly until the
 	// roundDelay is reached, making sure that it isn't successful
 	newRound = newRound + 1
-	processedAnswer = 100 * reportPrice
+	processedAnswer = 100 * atomic.LoadInt64(&reportPrice)
 	precision := job.Initiators[0].InitiatorParams.Precision
 	// FORCE node to try to start a new round
 	err = app.FluxMonitor.(maliciousFluxMonitor).CreateJob(t, j.ID, decimal.New(processedAnswer, precision), big.NewInt(newRound))
@@ -386,7 +387,7 @@ func TestFluxMonitorAntiSpamLogic(t *testing.T) {
 		answer: processedAnswer, from: fa.neil, isNewRound: false,
 		completesAnswer: true})
 	// start a legitimate new round
-	reportPrice = reportPrice + 3
+	atomic.StoreInt64(&reportPrice, reportPrice+3)
 	select {
 	case <-submissionReceived:
 	case <-time.After(5 * timeout):
