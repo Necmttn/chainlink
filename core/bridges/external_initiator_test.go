@@ -4,16 +4,16 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/smartcontractkit/chainlink/v2/core/auth"
 	"github.com/smartcontractkit/chainlink/v2/core/bridges"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
-
-	"github.com/stretchr/testify/assert"
 )
 
 func TestNewExternalInitiator(t *testing.T) {
+	t.Parallel()
 	eia := auth.NewToken()
 	assert.Len(t, eia.AccessKey, 32)
 	assert.Len(t, eia.Secret, 64)
@@ -25,12 +25,13 @@ func TestNewExternalInitiator(t *testing.T) {
 		URL:  &url,
 	}
 	ei, err := bridges.NewExternalInitiator(eia, eir)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.NotEqual(t, ei.HashedSecret, eia.Secret)
 	assert.Equal(t, ei.AccessKey, eia.AccessKey)
 }
 
 func TestAuthenticateExternalInitiator(t *testing.T) {
+	t.Parallel()
 	eia := auth.NewToken()
 	ok, err := bridges.AuthenticateExternalInitiator(eia, &bridges.ExternalInitiator{
 		Salt:         "salt",

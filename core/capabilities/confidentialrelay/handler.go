@@ -1,0 +1,1086 @@
+package confidentialrelay
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/patrickmn/go-cache"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/beholder"
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities"
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities/actions/vault"
+	caperrors "github.com/smartcontractkit/chainlink-common/pkg/capabilities/errors"
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities/registry"
+	confidentialrelaytypes "github.com/smartcontractkit/chainlink-common/pkg/capabilities/v2/actions/confidentialrelay"
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities/v2/actions/confidentialworkflow"
+	"github.com/smartcontractkit/chainlink-common/pkg/contexts"
+	jsonrpc "github.com/smartcontractkit/chainlink-common/pkg/jsonrpc2"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/services"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/cresettings"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/limits"
+	"github.com/smartcontractkit/chainlink-common/pkg/teeattestation"
+	"github.com/smartcontractkit/chainlink-common/pkg/teeattestation/nitro"
+	"github.com/smartcontractkit/chainlink-common/pkg/types/core"
+	sdkpb "github.com/smartcontractkit/chainlink-protos/cre/go/sdk"
+)
+
+var _ core.GatewayConnectorHandler = (*Handler)(nil)
+
+const (
+	HandlerName          = "EnclaveRelayHandler"
+	internalErrorMessage = "internal error"
+
+	// confidentialWorkflowsCapID is the capability ID for the confidential
+	// workflows enclave pool. The relay handler uses it to look up trusted
+	// enclave measurements from the capabilities registry.
+	confidentialWorkflowsCapID = "confidential-workflows@1.0.0-alpha"
+
+	// defaultGetExecutionWait bounds how long a relay callback waits for a
+	// not-yet-registered execution handler to appear before giving up. The
+	// enclave runs one DON-shared execution and only needs a relay quorum, so its
+	// callback can reach a node before that node has started its own copy of the
+	// execution and registered a handler (the start-edge race). Waiting briefly
+	// lets a straggling node register and still sign, instead of dropping below
+	// quorum. Kept well under the gateway relay request timeout (RequestTimeoutSec,
+	// default 30s) so the node still answers in time to be counted.
+	defaultGetExecutionWait = 15 * time.Second
+)
+
+// relayError couples a failure with the JSON-RPC code the handler answered it
+// with, so one error value carries everything needed to reproduce that
+// answer. An owner publishes its failure to waiters as a relayError; each
+// waiter unwraps the code with relayErrorCode and builds its own response.
+// Mirrors how vaultSecretError carries its user/system classification.
+type relayError struct {
+	code int64
+	err  error
+}
+
+func (e *relayError) Error() string { return e.err.Error() }
+func (e *relayError) Unwrap() error { return e.err }
+
+// relayErrorCode reports the JSON-RPC code err was answered with, or fallback
+// if err carries none.
+func relayErrorCode(err error, fallback int64) int64 {
+	if re, ok := errors.AsType[*relayError](err); ok {
+		return re.code
+	}
+	return fallback
+}
+
+// enclaveEntry mirrors the enclave config shape stored in the capabilities
+// registry. Only the fields needed for attestation validation are included.
+type enclaveEntry struct {
+	TrustedValues []json.RawMessage `json:"trustedValues"`
+	CARootsPEM    string            `json:"caRootsPEM,omitempty"`
+}
+
+type enclavesList struct {
+	Enclaves []enclaveEntry
+}
+
+// requestLatencyBucketsMs covers relay requests up to and past the 60s
+// ConfidentialRelayHandlerTimeout; the SDK default buckets stop at 10s.
+var requestLatencyBucketsMs = []float64{
+	5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000,
+	10_000, 15_000, 20_000, 30_000, 45_000, 60_000, 90_000,
+}
+
+type handlerMetrics struct {
+	requestCount         metric.Int64Counter
+	requestLatency       metric.Int64Histogram
+	requestInternalError metric.Int64Counter
+	requestSuccess       metric.Int64Counter
+}
+
+func newMetrics() (*handlerMetrics, error) {
+	requestCount, err := beholder.GetMeter().Int64Counter("enclave_relay_request_count")
+	if err != nil {
+		return nil, fmt.Errorf("failed to register request count counter: %w", err)
+	}
+	requestLatency, err := beholder.GetMeter().Int64Histogram("enclave_relay_request_latency_ms",
+		metric.WithUnit("ms"), metric.WithExplicitBucketBoundaries(requestLatencyBucketsMs...))
+	if err != nil {
+		return nil, fmt.Errorf("failed to register request latency histogram: %w", err)
+	}
+	requestInternalError, err := beholder.GetMeter().Int64Counter("enclave_relay_request_internal_error")
+	if err != nil {
+		return nil, fmt.Errorf("failed to register internal error counter: %w", err)
+	}
+	requestSuccess, err := beholder.GetMeter().Int64Counter("enclave_relay_request_success")
+	if err != nil {
+		return nil, fmt.Errorf("failed to register success counter: %w", err)
+	}
+	return &handlerMetrics{
+		requestCount:         requestCount,
+		requestLatency:       requestLatency,
+		requestInternalError: requestInternalError,
+		requestSuccess:       requestSuccess,
+	}, nil
+}
+
+// AttestationValidator validates TEE attestation documents, with or without a
+// custom CA root. Both the production Nitro validator and the insecure
+// passthrough validator implement it, so the handler validates the same way
+// regardless of which is configured.
+type AttestationValidator interface {
+	ValidateAttestation(attestation, expectedUserData, trustedMeasurements []byte) error
+	ValidateAttestationWithRoots(attestation, expectedUserData, trustedMeasurements []byte, caRootsPEM string) error
+}
+
+// nitroValidator is the production validator backed by AWS Nitro.
+type nitroValidator struct{}
+
+func (nitroValidator) ValidateAttestation(attestation, expectedUserData, trustedMeasurements []byte) error {
+	return nitro.ValidateAttestation(attestation, expectedUserData, trustedMeasurements)
+}
+
+func (nitroValidator) ValidateAttestationWithRoots(attestation, expectedUserData, trustedMeasurements []byte, caRootsPEM string) error {
+	return nitro.ValidateAttestationWithRoots(attestation, expectedUserData, trustedMeasurements, caRootsPEM)
+}
+
+// NewAttestationValidator returns the production validator backed by AWS Nitro.
+func NewAttestationValidator() AttestationValidator {
+	return nitroValidator{}
+}
+
+// Handler processes enclave relay requests from the gateway.
+// It validates attestations and proxies requests to VaultDON or capability DONs.
+type Handler struct {
+	services.Service
+	eng *services.Engine
+
+	capRegistry       registry.CapabilitiesRegistry
+	executionHandlers *ExecutionHandlers
+	gatewayConnector  core.GatewayConnector
+	responseSigner    relayResponseSigner
+	lggr              logger.Logger
+	metrics           *handlerMetrics
+
+	// validator validates TEE attestation documents.
+	validator AttestationValidator
+	// requireBFTQuorum selects the required signature quorum: when true the relay
+	// demands a Byzantine quorum of 2*F+1 unique signers, otherwise a crash-fault
+	// quorum of F+1.
+	requireBFTQuorum bool
+	limitsFactory    limits.Factory
+	// getExecutionWait is how long a relay callback waits for a not-yet-registered
+	// execution handler before failing (see defaultGetExecutionWait).
+	getExecutionWait time.Duration
+
+	// serveTime bounds how long one gateway request may be served for, from
+	// ConfidentialCompute.ConfidentialRelayHandlerTimeout. The connector's context
+	// carries no deadline of its own, so this is what keeps a stalled vault call
+	// from outliving the request it belongs to.
+	serveTime limits.TimeLimiter
+
+	// responseMemo caches completed signed results so the enclave's retry loop
+	// (re-fan-out after a gateway rotation or timeout) returns the cached result
+	// without re-executing the capability or vault fetch. The
+	// cap- and sec-prefixed keys share one cache instance; go-cache runs its own
+	// background cleanup goroutine, so there is no separate sweep to stop.
+	responseMemo *cache.Cache
+
+	// pendingRequests tracks logical identities currently being executed on
+	// this node, so a retry arriving while the original is still in flight
+	// waits on it and responds with its result instead of re-executing.
+	// Re-executing would fail the remote request server's duplicate-requester
+	// check ("request already received from peer"), a well-formed error the
+	// enclave's retry loop treats as terminal. TTL-bounded so a crashed owner
+	// ages out. pendingRequestsMu serializes the memo-then-pending lookup pair
+	// so a retried request cannot slip between the two checks.
+	pendingRequests   *cache.Cache
+	pendingRequestsMu sync.Mutex
+}
+
+func NewHandler(capRegistry registry.CapabilitiesRegistry, executionHandlers *ExecutionHandlers, conn core.GatewayConnector, responseSigner relayResponseSigner, lggr logger.Logger, lf limits.Factory, validator AttestationValidator, requireBFTQuorum bool) (*Handler, error) {
+	if responseSigner == nil {
+		return nil, errors.New("response signer is required")
+	}
+	m, err := newMetrics()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create metrics: %w", err)
+	}
+	serveTime, err := lf.MakeTimeLimiter(cresettings.Default.ConfidentialCompute.ConfidentialRelayHandlerTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create serve time limiter: %w", err)
+	}
+
+	memoCfg := cresettings.Default.ConfidentialCompute.RelayResponseCache
+	memoTTL, err := memoCfg.TTL.GetOrDefault(context.Background(), lf.Settings)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read relay response cache TTL: %w", err)
+	}
+	memoCleanup, err := memoCfg.CleanupInterval.GetOrDefault(context.Background(), lf.Settings)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read relay response cache cleanup interval: %w", err)
+	}
+
+	h := &Handler{
+		capRegistry:       capRegistry,
+		executionHandlers: executionHandlers,
+		gatewayConnector:  conn,
+		responseSigner:    responseSigner,
+		lggr:              logger.Named(lggr, HandlerName),
+		metrics:           m,
+		validator:         validator,
+		requireBFTQuorum:  requireBFTQuorum,
+		limitsFactory:     lf,
+		serveTime:         serveTime,
+		getExecutionWait:  defaultGetExecutionWait,
+		responseMemo:      cache.New(memoTTL, memoCleanup),
+		pendingRequests:   cache.New(memoTTL, memoCleanup),
+	}
+	h.Service, h.eng = services.Config{
+		Name:  HandlerName,
+		Start: h.start,
+		Close: h.close,
+	}.NewServiceEngine(lggr)
+	return h, nil
+}
+
+func (h *Handler) start(ctx context.Context) error {
+	if err := h.gatewayConnector.AddHandler(ctx, h.Methods(), h); err != nil {
+		return fmt.Errorf("failed to add enclave relay handler to connector: %w", err)
+	}
+	return nil
+}
+
+func (h *Handler) close() error {
+	err := h.serveTime.Close()
+	if rmErr := h.gatewayConnector.RemoveHandler(context.Background(), h.Methods()); rmErr != nil {
+		err = errors.Join(err, fmt.Errorf("failed to remove enclave relay handler from connector: %w", rmErr))
+	}
+	return err
+}
+
+func (h *Handler) ID(_ context.Context) (string, error) {
+	return HandlerName, nil
+}
+
+func (h *Handler) Methods() []string {
+	return []string{confidentialrelaytypes.MethodSecretsGet, confidentialrelaytypes.MethodCapabilityExec}
+}
+
+func (h *Handler) HandleGatewayMessage(ctx context.Context, gatewayID string, req *jsonrpc.Request[json.RawMessage]) error {
+	h.lggr.Debugw("received message from gateway", "gatewayID", gatewayID, "requestID", req.ID)
+
+	// GoCtx ties the goroutine to the handler's service lifecycle, so Close waits
+	// for in-flight requests instead of abandoning them mid-vault-call.
+	h.eng.GoCtx(ctx, func(ctx context.Context) {
+		ctx, done, err := h.serveTime.WithTimeout(ctx)
+		if err != nil {
+			h.lggr.Errorw("failed to apply serve timeout, dropping request", "gatewayID", gatewayID, "requestID", req.ID, "err", err)
+			return
+		}
+		defer done()
+		h.serveGatewayMessage(ctx, gatewayID, req)
+	})
+
+	return nil
+}
+
+func (h *Handler) serveGatewayMessage(ctx context.Context, gatewayID string, req *jsonrpc.Request[json.RawMessage]) {
+	startTime := time.Now()
+	outcome := "success"
+	var errorCode int64
+	defer func() {
+		attrs := []attribute.KeyValue{
+			attribute.String("gateway_id", gatewayID),
+			attribute.String("method", req.Method),
+			attribute.String("outcome", outcome),
+		}
+		if errorCode != 0 {
+			attrs = append(attrs, attribute.Int64("error_code", errorCode))
+		}
+		h.metrics.requestCount.Add(ctx, 1, metric.WithAttributes(attrs...))
+		h.metrics.requestLatency.Record(ctx, time.Since(startTime).Milliseconds(), metric.WithAttributes(attrs...))
+	}()
+
+	var response *jsonrpc.Response[json.RawMessage]
+	switch req.Method {
+	case confidentialrelaytypes.MethodSecretsGet:
+		response = h.handleSecretsGet(ctx, gatewayID, req)
+	case confidentialrelaytypes.MethodCapabilityExec:
+		response = h.handleCapabilityExecute(ctx, gatewayID, req)
+	default:
+		response = h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrMethodNotFound, errors.New("unsupported method: "+req.Method))
+	}
+	if response != nil && response.Error != nil {
+		outcome = "error"
+		errorCode = response.Error.Code
+	}
+
+	if err := h.gatewayConnector.SendToGateway(ctx, gatewayID, response); err != nil {
+		outcome = "send_error"
+		h.lggr.Errorw("failed to send message to gateway", "gatewayID", gatewayID, "err", err)
+		return
+	}
+
+	h.lggr.Infow("sent message to gateway", "gatewayID", gatewayID, "requestID", req.ID)
+	if response.Error == nil {
+		h.metrics.requestSuccess.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("gateway_id", gatewayID),
+		))
+	}
+}
+
+func (h *Handler) handleSecretsGet(ctx context.Context, gatewayID string, req *jsonrpc.Request[json.RawMessage]) *jsonrpc.Response[json.RawMessage] {
+	if req.Params == nil {
+		return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInvalidParams, errors.New("missing params"))
+	}
+	var params confidentialrelaytypes.SecretsRequestParams
+	if err := json.Unmarshal(*req.Params, &params); err != nil {
+		return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInvalidParams, err)
+	}
+
+	// Every line below carries the gateway request id together with the
+	// workflow/execution identity, so a log can be correlated with the
+	// enclave's and the gateway's own lines for the same execution. The
+	// gateway request id changes per retry; the execution identity does not.
+	l := logger.With(h.lggr,
+		"requestID", req.ID,
+		"workflowID", params.WorkflowID,
+		"executionID", params.ExecutionID,
+	)
+
+	att := params.Attestation
+	params.Attestation = ""
+	if err := h.verifyAttestationHash(ctx, att, params, confidentialrelaytypes.DomainSecretsGet); err != nil {
+		l.Warnw("rejecting secrets request: attestation validation failed", "err", err)
+		return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInternal, err)
+	}
+	// Fetch the local node once: it provides the WorkflowDON snapshot for both the
+	// enclave-config check and the Workflow-DON authorization check below, plus the DON
+	// metadata on the vault request. A registry read failure is node-side, so ErrInternal.
+	localNode, err := h.capRegistry.LocalNode(ctx)
+	if err != nil {
+		return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInternal, fmt.Errorf("failed to get local node: %w", err))
+	}
+	// Verify the enclave's reported config matches the onchain DON state
+	// before treating the attested request as trusted: the Nitro attestation
+	// binds the request hash, but a malicious host can produce a
+	// genuinely-attested request over a forged enclave config unless we
+	// compare the config value against the DON reference.
+	if err = h.verifyEnclaveConfigMatchesDON(localNode, params.EnclaveConfig); err != nil {
+		l.Warnw("rejecting secrets request: enclave config does not match DON", "err", err)
+		return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInternal, err)
+	}
+
+	// Beyond attestation, verify the Workflow DON authorized this request: the enclave
+	// forwards the Workflow-DON-signed compute requests (a 2*F+1 quorum), whose PublicData
+	// names the authorized owner. A TEE breach passes attestation but cannot forge a Workflow
+	// DON quorum over a different owner (PRIV-433).
+	if err = h.verifyWorkflowAuthorization(localNode.WorkflowDON, params); err != nil {
+		l.Warnw("rejecting secrets request: workflow DON authorization failed", "err", err)
+		return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInvalidParams, err)
+	}
+
+	// A retry (same logical identity, new gateway request id) re-fans-out the
+	// same request; return the already-computed signed result from the memo
+	// instead of re-fetching from the vault. The signed result is params-bound,
+	// not id-bound, so jsonResponse re-wraps it with this request's id.
+	key := secretsKey(params)
+	l = logger.With(l, "key", key)
+
+	h.pendingRequestsMu.Lock()
+	if cached, ok := h.responseMemo.Get(key); ok {
+		if signed, ok := cached.(*confidentialrelaytypes.SignedSecretsResponseResult); ok {
+			h.pendingRequestsMu.Unlock()
+			l.Debugw("serving secrets request from memo")
+			return h.jsonResponse(req, signed)
+		}
+	}
+
+	// A retry that arrives while the original vault fetch is still in flight
+	// waits on it and responds with the owner's result, same rationale as
+	// handleCapabilityExecute.
+	pending, err := h.checkOrCreatePendingRequest(key)
+	if err != nil {
+		h.pendingRequestsMu.Unlock()
+		return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInternal, err)
+	}
+	h.pendingRequestsMu.Unlock()
+	if pending != nil {
+		signed, ok, ownerErr := waitForPendingRequest(ctx, pending)
+		switch {
+		case !ok:
+			l.Warnw("timed out waiting for in-flight secrets request", "err", ctx.Err())
+			return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInternal, errors.New("timed out waiting for in-flight secrets request"))
+		case ownerErr != nil:
+			ownerCode := relayErrorCode(ownerErr, jsonrpc.ErrInternal)
+			l.Debugw("in-flight secrets request failed; relaying its error", "errorCode", ownerCode)
+			return h.errorResponse(ctx, gatewayID, req, ownerCode, ownerErr)
+		}
+		if signed, ok := signed.(*confidentialrelaytypes.SignedSecretsResponseResult); ok {
+			l.Debugw("served retried secrets request from in-flight owner")
+			return h.jsonResponse(req, signed)
+		}
+		return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInternal, errors.New("in-flight secrets request completed without a result"))
+	}
+
+	// We own the pending entry: fetch, then publish the outcome to any waiters
+	// either way. A failure has to reach them with its real cause, and has to
+	// clear the entry so later retries re-execute rather than waiting on a
+	// request nobody completes (see failPendingRequest).
+	signedResult, err := h.fetchSecrets(ctx, l, params)
+	if err != nil {
+		h.pendingRequestsMu.Lock()
+		h.failPendingRequest(key, err)
+		h.pendingRequestsMu.Unlock()
+		return h.errorResponse(ctx, gatewayID, req, relayErrorCode(err, jsonrpc.ErrInternal), err)
+	}
+
+	h.pendingRequestsMu.Lock()
+	h.responseMemo.SetDefault(key, signedResult)
+	h.completePendingRequest(key, signedResult)
+	h.pendingRequestsMu.Unlock()
+	l.Infow("fetched and signed secrets response")
+	return h.jsonResponse(req, signedResult)
+}
+
+// fetchSecrets resolves the execution handler, fetches the requested secrets
+// from the vault DON, and signs the result. Errors are relayErrors carrying
+// the JSON-RPC code the request should be answered with, so the caller can
+// both answer this request and publish the same failure to any waiters.
+func (h *Handler) fetchSecrets(
+	ctx context.Context,
+	l logger.Logger,
+	params confidentialrelaytypes.SecretsRequestParams,
+) (*confidentialrelaytypes.SignedSecretsResponseResult, error) {
+	secretsRequest := &sdkpb.GetSecretsRequest{
+		Requests:   make([]*sdkpb.SecretRequest, 0, len(params.Secrets)),
+		CallbackId: params.CallbackID,
+	}
+
+	for _, s := range params.Secrets {
+		secretsRequest.Requests = append(secretsRequest.Requests, &sdkpb.SecretRequest{
+			Id:        s.Key,
+			Namespace: s.Namespace,
+		})
+	}
+
+	// Resolve the execution handler only after attestation and Workflow-DON
+	// authorization have passed, so an unverified callback cannot make the node
+	// park a waiter. The enclave's callback can arrive before this node has started
+	// its own copy of the execution (start-edge race); wait briefly for the handler
+	// to register rather than failing and dropping below relay quorum. Bounded so a
+	// callback for an execution this node never runs still fails in time to respond
+	// within the gateway's relay request window.
+	waitCtx, cancel := context.WithTimeout(ctx, h.getExecutionWait)
+	defer cancel()
+	handler, ok := h.executionHandlers.GetExecutionWithWait(waitCtx, params.WorkflowID, params.ExecutionID)
+	if !ok {
+		return nil, &relayError{code: jsonrpc.ErrInternal, err: fmt.Errorf("execution handler for workflow %s execution %s not found", params.WorkflowID, params.ExecutionID)}
+	}
+
+	vaultResp, err := handler.GetRawSecretsResponse(ctx, secretsRequest, teeKeyFetcher(params.EnclavePublicKey))
+	if err != nil {
+		// A user-origin caperrors.Error (e.g. an oversized GetSecrets batch
+		// rejected by the vault) keeps its classification across the remote
+		// boundary: answer invalid params with the real cause. Anything else
+		// stays internal, mirroring translateVaultResponse.
+		code := jsonrpc.ErrInternal
+		respErr := err
+		userErr := false
+		if capErr, ok := errors.AsType[caperrors.Error](err); ok && capErr.Origin() == caperrors.OriginUser {
+			code = jsonrpc.ErrInvalidParams
+			respErr = capErr // surface the vault's message, not the transport-wrapped chain
+			userErr = true
+		}
+		logVaultFailure(l, "vault secrets fetch failed", userErr, err)
+		return nil, &relayError{code: code, err: respErr}
+	}
+
+	result, err := translateVaultResponse(vaultResp, params.EnclavePublicKey)
+	if err != nil {
+		code := jsonrpc.ErrInternal
+		userErr := IsUserError(err)
+		if userErr {
+			code = jsonrpc.ErrInvalidParams
+		}
+		logVaultFailure(l, "translating vault response failed", userErr, err)
+		return nil, &relayError{code: code, err: err}
+	}
+
+	signedResult, err := h.signSecretsResponse(params, result)
+	if err != nil {
+		l.Errorw("signing secrets response failed", "err", err)
+		return nil, &relayError{code: jsonrpc.ErrInternal, err: fmt.Errorf("failed to sign secrets response: %w", err)}
+	}
+
+	l.Debugw("fetched secrets from vault", "secrets", len(result.Secrets))
+	return signedResult, nil
+}
+
+// logVaultFailure logs user errors (e.g. a missing secret) at info so they
+// don't drown out system failures at error level.
+func logVaultFailure(l logger.Logger, msg string, userErr bool, err error) {
+	if userErr {
+		l.Infow(msg, "userError", true, "err", err)
+		return
+	}
+	l.Errorw(msg, "userError", false, "err", err)
+}
+
+// translateVaultResponse converts a vault GetSecretsResponse to the enclave relay protocol format.
+// Encoding conversion: ciphertext hex (vault) -> base64 (enclave relay); encrypted shares may be
+// binary or hex (vault) -> base64 (enclave relay).
+func translateVaultResponse(vaultResp *vault.GetSecretsResponse, enclaveKey string) (*confidentialrelaytypes.SecretsResponseResult, error) {
+	// Forward the DKG instance's public key so the enclave verifies/aggregates these
+	// shares against the live key rather than its (possibly stale) configured key.
+	result := &confidentialrelaytypes.SecretsResponseResult{
+		RawVaultPublicKey: vaultResp.GetRawVaultPublicKey(),
+	}
+
+	for _, sr := range vaultResp.GetResponses() {
+		if sr.GetError() != "" {
+			return nil, newVaultSecretError(sr.Id.GetNamespace(), sr.Id.GetKey(), sr.GetError())
+		}
+
+		data := sr.GetData()
+		if data == nil {
+			return nil, fmt.Errorf("vault returned no data for secret %s/%s", sr.Id.GetNamespace(), sr.Id.GetKey())
+		}
+
+		encryptedBytes, err := hex.DecodeString(data.EncryptedValue)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode encrypted value for %s: %w", sr.Id.GetKey(), err)
+		}
+
+		var shares []string
+		for _, es := range data.EncryptedDecryptionKeyShares {
+			if es.EncryptionKey == enclaveKey {
+				if len(es.BinaryShares) > 0 {
+					for _, shareBytes := range es.BinaryShares {
+						shares = append(shares, base64.StdEncoding.EncodeToString(shareBytes))
+					}
+				} else {
+					for _, share := range es.Shares {
+						shareBytes, err := hex.DecodeString(share)
+						if err != nil {
+							return nil, fmt.Errorf("failed to decode share: %w", err)
+						}
+						shares = append(shares, base64.StdEncoding.EncodeToString(shareBytes))
+					}
+				}
+				break
+			}
+		}
+		if len(shares) == 0 {
+			return nil, fmt.Errorf("no shares found for enclave key in secret %s/%s", sr.Id.GetNamespace(), sr.Id.GetKey())
+		}
+
+		result.Secrets = append(result.Secrets, confidentialrelaytypes.SecretEntry{
+			ID: confidentialrelaytypes.SecretIdentifier{
+				Key:       sr.Id.GetKey(),
+				Namespace: sr.Id.GetNamespace(),
+			},
+			Ciphertext:      base64.StdEncoding.EncodeToString(encryptedBytes),
+			EncryptedShares: shares,
+		})
+	}
+
+	return result, nil
+}
+
+func (h *Handler) handleCapabilityExecute(ctx context.Context, gatewayID string, req *jsonrpc.Request[json.RawMessage]) *jsonrpc.Response[json.RawMessage] {
+	if req.Params == nil {
+		return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInvalidParams, errors.New("missing params"))
+	}
+	var params confidentialrelaytypes.CapabilityRequestParams
+	if err := json.Unmarshal(*req.Params, &params); err != nil {
+		return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInvalidParams, err)
+	}
+
+	// The enclave's capability calls arrive as fresh gateway messages rather than
+	// through the workflow engine, so ctx carries none of the CRE tenants the engine
+	// seeds.
+	//
+	// Seeded as soon as the params are parsed so every ctx use below carries the
+	// tenant.
+	ctx = contexts.WithCRE(ctx, contexts.CRE{
+		Org:      params.OrgID,
+		Owner:    params.Owner,
+		Workflow: params.WorkflowID,
+	})
+
+	// See handleSecretsGet: the gateway request id plus the workflow/execution
+	// identity on every line, so logs correlate across the gateway, this node
+	// and the enclave for one execution.
+	l := logger.With(h.lggr,
+		"requestID", req.ID,
+		"workflowID", params.WorkflowID,
+		"executionID", params.ExecutionID,
+	)
+
+	att := params.Attestation
+	params.Attestation = ""
+	if err := h.verifyAttestationHash(ctx, att, params, confidentialrelaytypes.DomainCapabilityExec); err != nil {
+		l.Warnw("rejecting capability request: attestation validation failed", "err", err)
+		return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInternal, err)
+	}
+
+	// Verify the enclave's reported config matches the onchain DON state, same as
+	// handleSecretsGet (PRIV-458): the Nitro attestation binds the request hash but
+	// not the config value, so a malicious host could otherwise produce a
+	// genuinely-attested request over a forged enclave config.
+	localNode, err := h.capRegistry.LocalNode(ctx)
+	if err != nil {
+		return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInternal, fmt.Errorf("failed to get local node: %w", err))
+	}
+	if err = h.verifyEnclaveConfigMatchesDON(localNode, params.EnclaveConfig); err != nil {
+		l.Warnw("rejecting capability request: enclave config does not match DON", "err", err)
+		return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInternal, err)
+	}
+
+	// A retry (same logical identity, new gateway request id) re-fans-out the
+	// same request; return the already-computed signed result from the memo
+	// instead of re-executing the capability. The signed result is params-bound,
+	// not id-bound, so jsonResponse re-wraps it with this request's id.
+	key := capExecKey(params)
+	l = logger.With(l, "key", key)
+
+	h.pendingRequestsMu.Lock()
+	if cached, ok := h.responseMemo.Get(key); ok {
+		if signed, ok := cached.(*confidentialrelaytypes.SignedCapabilityResponseResult); ok {
+			h.pendingRequestsMu.Unlock()
+			l.Debugw("serving capability request from memo")
+			return h.jsonResponse(req, signed)
+		}
+	}
+
+	// A retry that arrives while the original execution is still in flight
+	// waits on it and responds with the owner's result rather than
+	// re-executing.
+	pending, err := h.checkOrCreatePendingRequest(key)
+	if err != nil {
+		h.pendingRequestsMu.Unlock()
+		return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInternal, err)
+	}
+	h.pendingRequestsMu.Unlock()
+	if pending != nil {
+		signed, ok, pendingReqErr := waitForPendingRequest(ctx, pending)
+		switch {
+		case !ok:
+			l.Warnw("timed out waiting for in-flight capability request", "err", ctx.Err())
+			return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInternal, errors.New("timed out waiting for in-flight capability request"))
+		case pendingReqErr != nil:
+			errorCode := relayErrorCode(pendingReqErr, jsonrpc.ErrInternal)
+			l.Debugw("in-flight capability request failed; relaying its error", "errorCode", errorCode)
+			return h.errorResponse(ctx, gatewayID, req, errorCode, pendingReqErr)
+		}
+		if signed, ok := signed.(*confidentialrelaytypes.SignedCapabilityResponseResult); ok {
+			l.Debugw("served retried capability request from in-flight owner")
+			return h.jsonResponse(req, signed)
+		}
+		return h.errorResponse(ctx, gatewayID, req, jsonrpc.ErrInternal, errors.New("in-flight capability request completed without a result"))
+	}
+
+	// We own the pending entry: execute, then publish the outcome to any
+	// waiters either way; see handleSecretsGet.
+	signedResult, err := h.executeCapability(ctx, l, params)
+	if err != nil {
+		h.pendingRequestsMu.Lock()
+		h.failPendingRequest(key, err)
+		h.pendingRequestsMu.Unlock()
+		return h.errorResponse(ctx, gatewayID, req, relayErrorCode(err, jsonrpc.ErrInternal), err)
+	}
+
+	h.pendingRequestsMu.Lock()
+	h.responseMemo.SetDefault(key, signedResult)
+	h.completePendingRequest(key, signedResult)
+	h.pendingRequestsMu.Unlock()
+	l.Infow("executed and signed capability response", "capability", params.CapabilityID)
+	return h.jsonResponse(req, signedResult)
+}
+
+// executeCapability decodes the request payload, resolves the execution
+// handler, runs the capability, and signs the result. Errors are relayErrors
+// carrying the JSON-RPC code the request should be answered with, so the
+// caller can both answer this request and publish the same failure to any
+// waiters. A capability that itself returns an error is not an error here: it
+// produces a signed error result the enclave's quorum logic handles.
+func (h *Handler) executeCapability(
+	ctx context.Context,
+	l logger.Logger,
+	params confidentialrelaytypes.CapabilityRequestParams,
+) (*confidentialrelaytypes.SignedCapabilityResponseResult, error) {
+	payloadBytes, err := base64.StdEncoding.DecodeString(params.Payload)
+	if err != nil {
+		return nil, &relayError{code: jsonrpc.ErrInvalidParams, err: fmt.Errorf("failed to decode payload: %w", err)}
+	}
+
+	sdkReq := &sdkpb.CapabilityRequest{}
+	if err = proto.Unmarshal(payloadBytes, sdkReq); err != nil {
+		return nil, &relayError{code: jsonrpc.ErrInvalidParams, err: fmt.Errorf("failed to unmarshal capability request: %w", err)}
+	}
+
+	// Resolve the execution handler only after attestation and enclave-config
+	// verification, so an unverified callback cannot make the node park a waiter.
+	// The enclave's callback can beat this node's own execution start (start-edge
+	// race); a bounded wait lets a straggler register and sign instead of dropping
+	// below relay quorum (see handleSecretsGet).
+	waitCtx, cancel := context.WithTimeout(ctx, h.getExecutionWait)
+	defer cancel()
+	handler, ok := h.executionHandlers.GetExecutionWithWait(waitCtx, params.WorkflowID, params.ExecutionID)
+	if !ok {
+		return nil, &relayError{code: jsonrpc.ErrInternal, err: fmt.Errorf("execution handler for workflow %s execution %s not found", params.WorkflowID, params.ExecutionID)}
+	}
+
+	capResp, execErr := handler.CallCapability(ctx, sdkReq)
+
+	var result confidentialrelaytypes.CapabilityResponseResult
+	if execErr != nil {
+		// Not an error from this node's perspective: the execution result is a
+		// signed error response the enclave's quorum logic handles; log it so
+		// the capability-side failure is attributable to this node.
+		l.Infow("capability execution returned an error result", "capability", sdkReq.Id, "err", execErr)
+		result.Error = execErr.Error()
+	} else {
+		// Deterministic marshal so every relay node emits byte-identical
+		// response payloads; relay aggregation requires identical bytes to
+		// reach quorum. [CL112-05]
+		var respBytes []byte
+		respBytes, err = proto.MarshalOptions{Deterministic: true}.Marshal(capResp)
+		if err != nil {
+			return nil, &relayError{code: jsonrpc.ErrInternal, err: fmt.Errorf("marshalling capability response: %w", err)}
+		}
+		result.Payload = base64.StdEncoding.EncodeToString(respBytes)
+	}
+
+	signedResult, err := h.signCapabilityResponse(params, result)
+	if err != nil {
+		l.Errorw("signing capability response failed", "err", err)
+		return nil, &relayError{code: jsonrpc.ErrInternal, err: fmt.Errorf("failed to sign capability response: %w", err)}
+	}
+
+	return signedResult, nil
+}
+
+// verifyEnclaveConfigMatchesDON compares the enclave's reported EnclaveConfig
+// against the local node's WorkflowDON membership and fault tolerance. The
+// relay DON runs on the same nodes as the workflow DON, so
+// localNode.WorkflowDON.Members is the right comparison target.
+//
+// PRIV-458: the Nitro attestation binds the request hash but does not on its
+// own prove the config matches the DON, so a malicious host could produce a
+// genuinely-attested request over a forged config. Comparing the attested
+// config against onchain DON state closes that gap.
+//
+// localNode is passed in so each request fetches it once (it feeds request
+// metadata too); the caller's lookup is an O(1) in-memory read populated by
+// the registry syncer, so this stays off the RPC hot path.
+//
+// cfg is required: a nil EnclaveConfig is rejected. The wire field stays
+// optional in chainlink-common so older senders compile, but the relay is the
+// security boundary and will not service a request that omits the config, since
+// an absent config cannot be checked against onchain DON state.
+func (h *Handler) verifyEnclaveConfigMatchesDON(localNode capabilities.Node, cfg *confidentialrelaytypes.EnclaveConfig) error {
+	if cfg == nil {
+		return errors.New("enclave config is required")
+	}
+	expectedF := uint32(localNode.WorkflowDON.F)
+	// F is a floor, matching the CC-side check (validateEnclaveSigners): the
+	// enclave's reported F must meet or exceed the DON's fault tolerance. A
+	// higher F is a stricter quorum and is acceptable; a lower one is not.
+	if cfg.F < expectedF {
+		return fmt.Errorf("enclave config F %d does not meet the minimum required DON F %d", cfg.F, expectedF)
+	}
+	if len(cfg.Signers) != len(localNode.WorkflowDON.Members) {
+		return fmt.Errorf("enclave config signers count mismatch: enclave reports %d, expected %d",
+			len(cfg.Signers), len(localNode.WorkflowDON.Members))
+	}
+	expected := make([][]byte, len(localNode.WorkflowDON.Members))
+	for i := range localNode.WorkflowDON.Members {
+		expected[i] = localNode.WorkflowDON.Members[i][:]
+	}
+	actual := append([][]byte(nil), cfg.Signers...)
+	sort.Slice(actual, func(i, j int) bool { return bytes.Compare(actual[i], actual[j]) < 0 })
+	sort.Slice(expected, func(i, j int) bool { return bytes.Compare(expected[i], expected[j]) < 0 })
+	for i := range actual {
+		if !bytes.Equal(actual[i], expected[i]) {
+			return fmt.Errorf("enclave config signer mismatch at sorted index %d: enclave reports %x, expected %x",
+				i, actual[i], expected[i])
+		}
+	}
+	return nil
+}
+
+// getEnclaveAttestationConfig reads the enclave pool configuration from the
+// capabilities registry and returns trusted measurement sets and CA roots
+// for attestation validation. Called per-request so the config stays fresh
+// (same pattern as CC's EnsureFreshEnclaves).
+func (h *Handler) getEnclaveAttestationConfig(ctx context.Context) ([]json.RawMessage, string, error) {
+	dons, err := h.capRegistry.DONsForCapability(ctx, confidentialWorkflowsCapID)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to find DON for %s: %w", confidentialWorkflowsCapID, err)
+	}
+	if len(dons) == 0 {
+		return nil, "", fmt.Errorf("no DON found hosting %s", confidentialWorkflowsCapID)
+	}
+
+	capConfig, err := h.capRegistry.ConfigForCapability(ctx, confidentialWorkflowsCapID, dons[0].DON.ID)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to get config for %s: %w", confidentialWorkflowsCapID, err)
+	}
+
+	if capConfig.DefaultConfig == nil {
+		return nil, "", fmt.Errorf("no default config for %s", confidentialWorkflowsCapID)
+	}
+
+	var enclaves enclavesList
+	if err := capConfig.DefaultConfig.UnwrapTo(&enclaves); err != nil {
+		return nil, "", fmt.Errorf("failed to unwrap enclave config: %w", err)
+	}
+
+	var measurements []json.RawMessage
+	var caRootsPEM string
+	for _, e := range enclaves.Enclaves {
+		measurements = append(measurements, e.TrustedValues...)
+		if caRootsPEM == "" && e.CARootsPEM != "" {
+			caRootsPEM = e.CARootsPEM
+		}
+	}
+	return measurements, caRootsPEM, nil
+}
+
+func (h *Handler) verifyAttestationHash(ctx context.Context, attestationB64 string, cleanParams any, domainTag string) error {
+	if attestationB64 == "" {
+		return errors.New("missing attestation")
+	}
+
+	paramsJSON, err := json.Marshal(cleanParams)
+	if err != nil {
+		return fmt.Errorf("failed to marshal params for attestation: %w", err)
+	}
+
+	hash := teeattestation.DomainHash(domainTag, paramsJSON)
+
+	attestationBytes, err := base64.StdEncoding.DecodeString(attestationB64)
+	if err != nil {
+		return fmt.Errorf("failed to decode attestation: %w", err)
+	}
+
+	// Look up trusted measurements from the capabilities registry.
+	// Each enclave instance may have different PCR values, so we try each set
+	// and succeed if any match (same approach as pool.go's
+	// validateAttestationAgainstMultipleMeasurements).
+	measurements, caRootsPEM, err := h.getEnclaveAttestationConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get enclave attestation config: %w", err)
+	}
+
+	if len(measurements) == 0 {
+		return errors.New("no trusted measurements found in capabilities registry")
+	}
+
+	var validationErr error
+	for _, m := range measurements {
+		var err error
+		if caRootsPEM != "" {
+			err = h.validator.ValidateAttestationWithRoots(attestationBytes, hash, m, caRootsPEM)
+		} else {
+			err = h.validator.ValidateAttestation(attestationBytes, hash, m)
+		}
+		if err == nil {
+			return nil
+		}
+		validationErr = errors.Join(validationErr, err)
+	}
+	return fmt.Errorf("no trusted measurement set matched: %w", validationErr)
+}
+
+// verifyWorkflowAuthorization is the PRIV-433 check beyond attestation. Attestation only
+// proves the request came from genuine enclave code; it does not prove the Workflow DON
+// authorized fetching this owner's secrets. A compromised TEE would still pass attestation
+// while self-asserting a victim's owner.
+//
+// The enclave forwards the Workflow-DON-signed compute requests it executed (a 2*F+1 quorum,
+// where F is the Workflow DON fault tolerance). Each node signs the same ComputeRequest.Hash();
+// we reconstruct that hash, verify each signature against the onchain Workflow DON signer set,
+// and require the quorum of unique signers. The signed PublicData names the authorized owner
+// and workflow, which must match this request. A breached enclave cannot forge a Workflow DON
+// quorum over a different owner.
+//
+// All failures here are client errors: the request is unauthorized. The caller fetches the
+// Workflow DON (a server-side concern) and passes it in, so registry failures stay internal.
+func (h *Handler) verifyWorkflowAuthorization(don capabilities.DON, params confidentialrelaytypes.SecretsRequestParams) error {
+	if len(params.SignedComputeRequests) == 0 {
+		return errors.New("missing signed compute requests")
+	}
+
+	// Match the enclave's own quorum. With requireBFTQuorum the relay demands a
+	// Byzantine quorum of 2*F+1 unique signers; otherwise a crash-fault quorum of
+	// F+1 suffices.
+	threshold := int(don.F) + 1
+	if h.requireBFTQuorum {
+		threshold = 2*int(don.F) + 1
+	}
+
+	// The forwarded requests differ only in their signature; they all sign one shared
+	// ComputeRequest hash. Reconstruct that hash once and verify each signature over it.
+	hash := params.SignedComputeRequests[0].Hash()
+	payload := confidentialrelaytypes.SignedComputeRequestSignaturePayload(hash)
+
+	signers := make(map[string]struct{})
+	for _, scr := range params.SignedComputeRequests {
+		if scr.Hash() != hash {
+			return errors.New("forwarded signed compute requests do not share one compute request")
+		}
+		for _, member := range don.Members {
+			if ed25519.Verify(ed25519.PublicKey(member[:]), payload, scr.Signature) {
+				signers[member.String()] = struct{}{}
+				break
+			}
+		}
+	}
+	if len(signers) < threshold {
+		return fmt.Errorf("insufficient Workflow DON signatures: %d unique signers, need %d", len(signers), threshold)
+	}
+
+	// The signed request authorizes a specific owner and workflow; the secrets request must
+	// match both, or a breached enclave could fetch another owner's secrets.
+	var execution confidentialworkflow.WorkflowExecution
+	if err := proto.Unmarshal(params.SignedComputeRequests[0].PublicData, &execution); err != nil {
+		return fmt.Errorf("failed to unmarshal workflow execution from public data: %w", err)
+	}
+	if !common.IsHexAddress(params.Owner) || !common.IsHexAddress(execution.GetOwner()) {
+		return errors.New("invalid owner address")
+	}
+	if common.HexToAddress(execution.GetOwner()) != common.HexToAddress(params.Owner) {
+		return fmt.Errorf("owner not authorized: request %q vs signed %q", params.Owner, execution.GetOwner())
+	}
+	if execution.GetWorkflowId() != params.WorkflowID {
+		return fmt.Errorf("workflow_id not authorized: request %q vs signed %q", params.WorkflowID, execution.GetWorkflowId())
+	}
+	return nil
+}
+
+func (h *Handler) jsonResponse(req *jsonrpc.Request[json.RawMessage], result any) *jsonrpc.Response[json.RawMessage] {
+	resultBytes, err := json.Marshal(result)
+	if err != nil {
+		h.lggr.Errorw("failed to marshal response", "err", err)
+		return &jsonrpc.Response[json.RawMessage]{
+			Version: jsonrpc.JsonRpcVersion,
+			ID:      req.ID,
+			Method:  req.Method,
+			Error: &jsonrpc.WireError{
+				Code:    jsonrpc.ErrInternal,
+				Message: internalErrorMessage,
+			},
+		}
+	}
+	resultJSON := json.RawMessage(resultBytes)
+	return &jsonrpc.Response[json.RawMessage]{
+		Version: jsonrpc.JsonRpcVersion,
+		ID:      req.ID,
+		Method:  req.Method,
+		Result:  &resultJSON,
+	}
+}
+
+func (h *Handler) signSecretsResponse(
+	params confidentialrelaytypes.SecretsRequestParams,
+	result *confidentialrelaytypes.SecretsResponseResult,
+) (*confidentialrelaytypes.SignedSecretsResponseResult, error) {
+	if h.responseSigner == nil {
+		return nil, errors.New("response signer not configured")
+	}
+
+	hash, err := result.Hash(params)
+	if err != nil {
+		return nil, fmt.Errorf("hash secrets response: %w", err)
+	}
+	signature, err := h.responseSigner.Sign(confidentialrelaytypes.RelayResponseSignaturePayload(hash))
+	if err != nil {
+		return nil, err
+	}
+
+	sig := confidentialrelaytypes.RelayResponseSignature{
+		Signer:    h.responseSigner.PublicKey(),
+		Signature: signature,
+	}
+	return &confidentialrelaytypes.SignedSecretsResponseResult{
+		Result:    *result,
+		Signature: sig,
+		// Keep populating Signatures too: there are still readers of the array. The
+		// cleanup order is readers first, then writers (this), then the field itself,
+		// or builds go red.
+		Signatures: []confidentialrelaytypes.RelayResponseSignature{sig}, //nolint:staticcheck // SA1019 backward compatibility
+	}, nil
+}
+
+func (h *Handler) signCapabilityResponse(
+	params confidentialrelaytypes.CapabilityRequestParams,
+	result confidentialrelaytypes.CapabilityResponseResult,
+) (*confidentialrelaytypes.SignedCapabilityResponseResult, error) {
+	if h.responseSigner == nil {
+		return nil, errors.New("response signer not configured")
+	}
+
+	hash, err := result.Hash(params)
+	if err != nil {
+		return nil, fmt.Errorf("hash capability response: %w", err)
+	}
+	signature, err := h.responseSigner.Sign(confidentialrelaytypes.RelayResponseSignaturePayload(hash))
+	if err != nil {
+		return nil, err
+	}
+
+	sig := confidentialrelaytypes.RelayResponseSignature{
+		Signer:    h.responseSigner.PublicKey(),
+		Signature: signature,
+	}
+	return &confidentialrelaytypes.SignedCapabilityResponseResult{
+		Result:    result,
+		Signature: sig,
+		// Keep populating Signatures too: there are still readers of the array. The
+		// cleanup order is readers first, then writers (this), then the field itself,
+		// or builds go red.
+		Signatures: []confidentialrelaytypes.RelayResponseSignature{sig}, //nolint:staticcheck // SA1019 backward compatibility
+	}, nil
+}
+
+func (h *Handler) errorResponse(
+	ctx context.Context,
+	gatewayID string,
+	req *jsonrpc.Request[json.RawMessage],
+	errorCode int64,
+	err error,
+) *jsonrpc.Response[json.RawMessage] {
+	h.lggr.Errorw("request error", "requestID", req.ID, "method", req.Method, "errorCode", errorCode, "err", err)
+	h.metrics.requestInternalError.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("gateway_id", gatewayID),
+		attribute.Int64("error_code", errorCode),
+	))
+
+	message := err.Error()
+	if errorCode == jsonrpc.ErrInternal {
+		message = internalErrorMessage
+	}
+
+	return &jsonrpc.Response[json.RawMessage]{
+		Version: jsonrpc.JsonRpcVersion,
+		ID:      req.ID,
+		Method:  req.Method,
+		Error: &jsonrpc.WireError{
+			Code:    errorCode,
+			Message: message,
+		},
+	}
+}

@@ -14,31 +14,38 @@ import (
 	"time"
 
 	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink-common/pkg/services"
-	"github.com/smartcontractkit/chainlink/v2/core/config"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	coreconfig "github.com/smartcontractkit/chainlink/v2/core/config"
 	"github.com/smartcontractkit/chainlink/v2/core/store/models"
 )
 
-const bufferCapacity = 2048
-const webRequestTimeout = 10
+const (
+	bufferCapacity    = 2048
+	webRequestTimeout = 10
+)
 
 type Data = map[string]any
 
-type AuditLogger interface {
+type Logger interface {
 	services.Service
 
 	Audit(eventID EventID, data Data)
 }
 
+// AuditLogger is an alias for Logger retained for backward compatibility.
+//
+//nolint:revive // backward compatibility alias
+type AuditLogger = Logger
+
 type HTTPAuditLoggerInterface interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-type AuditLoggerService struct {
+type LoggerService struct {
 	logger          logger.Logger            // The standard logger configured in the node
 	enabled         bool                     // Whether the audit logger is enabled or not
-	forwardToUrl    commonconfig.URL         // Location we are going to send logs to
+	forwardToURL    commonconfig.URL         // Location we are going to send logs to
 	headers         []models.ServiceHeader   // Headers to be sent along with logs for identification/authentication
 	jsonWrapperKey  string                   // Wrap audit data as a map under this key if present
 	environmentName string                   // Decorate the environment this is coming from
@@ -51,23 +58,28 @@ type AuditLoggerService struct {
 	chDone         chan struct{}
 }
 
+// AuditLoggerService is an alias for LoggerService retained for backward compatibility.
+//
+//nolint:revive // backward compatibility alias
+type AuditLoggerService = LoggerService
+
 type wrappedAuditLog struct {
 	eventID EventID
 	data    Data
 }
 
-var NoopLogger AuditLogger = &AuditLoggerService{}
+var NoopLogger Logger = &LoggerService{}
 
 // NewAuditLogger returns a buffer push system that ingests audit log events and
 // asynchronously pushes them up to an HTTP log service.
 // Parses and validates the AUDIT_LOGS_* environment values and returns an enabled
 // AuditLogger instance. If the environment variables are not set, the logger
 // is disabled and short circuits execution via enabled flag.
-func NewAuditLogger(logger logger.Logger, config config.AuditLogger) (AuditLogger, error) {
+func NewAuditLogger(lggr logger.Logger, config coreconfig.AuditLogger) (Logger, error) {
 	// If the unverified config is nil, then we assume this came from the
 	// configuration system and return a nil logger.
 	if config == nil || !config.Enabled() {
-		return &AuditLoggerService{}, nil
+		return &LoggerService{}, nil
 	}
 
 	hostname, err := os.Hostname()
@@ -75,23 +87,23 @@ func NewAuditLogger(logger logger.Logger, config config.AuditLogger) (AuditLogge
 		return nil, fmt.Errorf("initialization error - unable to get hostname: %w", err)
 	}
 
-	forwardToUrl, err := config.ForwardToUrl()
+	forwardToURL, err := config.ForwardToUrl()
 	if err != nil {
-		return &AuditLoggerService{}, nil
+		return nil, fmt.Errorf("initialization error - unable to get forward URL: %w", err)
 	}
 
 	headers, err := config.Headers()
 	if err != nil {
-		return &AuditLoggerService{}, nil
+		return nil, fmt.Errorf("initialization error - unable to get headers: %w", err)
 	}
 
 	loggingChannel := make(chan wrappedAuditLog, bufferCapacity)
 
-	// Create new AuditLoggerService
-	auditLogger := AuditLoggerService{
-		logger:          logger.Helper(1),
+	// Create new LoggerService
+	auditLogger := LoggerService{
+		logger:          logger.Helper(lggr, 1),
 		enabled:         true,
-		forwardToUrl:    forwardToUrl,
+		forwardToURL:    forwardToURL,
 		headers:         headers,
 		jsonWrapperKey:  config.JsonWrapperKey(),
 		environmentName: config.Environment(),
@@ -107,16 +119,16 @@ func NewAuditLogger(logger logger.Logger, config config.AuditLogger) (AuditLogge
 	return &auditLogger, nil
 }
 
-func (l *AuditLoggerService) SetLoggingClient(newClient HTTPAuditLoggerInterface) {
+func (l *LoggerService) SetLoggingClient(newClient HTTPAuditLoggerInterface) {
 	l.loggingClient = newClient
 }
 
 // Entrypoint for new audit logs. This buffers all logs that come in they will
-// sent out by the goroutine that was started when the AuditLoggerService was
-// created. If this service was not enabled, this immeidately returns.
+// sent out by the goroutine that was started when the LoggerService was
+// created. If this service was not enabled, this immediately returns.
 //
 // This function never blocks.
-func (l *AuditLoggerService) Audit(eventID EventID, data Data) {
+func (l *LoggerService) Audit(eventID EventID, data Data) {
 	if !l.enabled {
 		return
 	}
@@ -134,9 +146,9 @@ func (l *AuditLoggerService) Audit(eventID EventID, data Data) {
 }
 
 // Start the audit logger and begin processing logs on the channel
-func (l *AuditLoggerService) Start(context.Context) error {
+func (l *LoggerService) Start(context.Context) error {
 	if !l.enabled {
-		return errors.New("The audit logger is not enabled")
+		return errors.New("the audit logger is not enabled")
 	}
 
 	go l.runLoop()
@@ -144,9 +156,9 @@ func (l *AuditLoggerService) Start(context.Context) error {
 }
 
 // Stops the logger and will close the channel.
-func (l *AuditLoggerService) Close() error {
+func (l *LoggerService) Close() error {
 	if !l.enabled {
-		return errors.New("The audit logger is not enabled")
+		return errors.New("the audit logger is not enabled")
 	}
 
 	l.logger.Warnf("Disabled the audit logger service")
@@ -156,11 +168,11 @@ func (l *AuditLoggerService) Close() error {
 	return nil
 }
 
-func (l *AuditLoggerService) Name() string {
+func (l *LoggerService) Name() string {
 	return l.logger.Name()
 }
 
-func (l *AuditLoggerService) HealthReport() map[string]error {
+func (l *LoggerService) HealthReport() map[string]error {
 	var err error
 	if !l.enabled {
 		err = errors.New("the audit logger is not enabled")
@@ -170,7 +182,7 @@ func (l *AuditLoggerService) HealthReport() map[string]error {
 	return map[string]error{l.Name(): err}
 }
 
-func (l *AuditLoggerService) Ready() error {
+func (l *LoggerService) Ready() error {
 	if !l.enabled {
 		return errors.New("the audit logger is not enabled")
 	}
@@ -182,7 +194,7 @@ func (l *AuditLoggerService) Ready() error {
 // logs as they come in.
 //
 // This function calls postLogToLogService which blocks.
-func (l *AuditLoggerService) runLoop() {
+func (l *LoggerService) runLoop() {
 	defer close(l.chDone)
 
 	for {
@@ -202,9 +214,9 @@ func (l *AuditLoggerService) runLoop() {
 // due to transient network errors.
 //
 // This function blocks when called.
-func (l *AuditLoggerService) postLogToLogService(eventID EventID, data Data) {
+func (l *LoggerService) postLogToLogService(eventID EventID, data Data) {
 	// Audit log JSON data
-	logItem := map[string]interface{}{
+	logItem := map[string]any{
 		"eventID":  eventID,
 		"hostname": l.hostname,
 		"localIP":  l.localIP,
@@ -214,7 +226,7 @@ func (l *AuditLoggerService) postLogToLogService(eventID EventID, data Data) {
 
 	// Optionally wrap audit log data into JSON object to help dynamically structure for an HTTP log service call
 	if l.jsonWrapperKey != "" {
-		logItem = map[string]interface{}{l.jsonWrapperKey: logItem}
+		logItem = map[string]any{l.jsonWrapperKey: logItem}
 	}
 
 	serializedLog, err := json.Marshal(logItem)
@@ -226,7 +238,7 @@ func (l *AuditLoggerService) postLogToLogService(eventID EventID, data Data) {
 	defer cancel()
 
 	// Send to remote service
-	req, err := http.NewRequestWithContext(ctx, "POST", (*url.URL)(&l.forwardToUrl).String(), bytes.NewReader(serializedLog))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, (*url.URL)(&l.forwardToURL).String(), bytes.NewReader(serializedLog))
 	if err != nil {
 		l.logger.Error("failed to create request to remote logging service!")
 	}
@@ -238,7 +250,10 @@ func (l *AuditLoggerService) postLogToLogService(eventID EventID, data Data) {
 		l.logger.Errorw("failed to send audit log to HTTP log service", "err", err, "logItem", logItem)
 		return
 	}
-	if resp.StatusCode != 200 {
+	if resp.Body != nil {
+		defer resp.Body.Close()
+	}
+	if resp.StatusCode != http.StatusOK {
 		if resp.Body == nil {
 			l.logger.Errorw("no body to read. Possibly an error occurred sending", "logItem", logItem)
 			return
@@ -251,7 +266,6 @@ func (l *AuditLoggerService) postLogToLogService(eventID EventID, data Data) {
 		}
 		l.logger.Errorw("error sending log to HTTP log service", "statusCode", resp.StatusCode, "bodyString", string(bodyBytes))
 		return
-
 	}
 }
 

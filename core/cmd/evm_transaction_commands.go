@@ -8,11 +8,10 @@ import (
 	"math/big"
 
 	"github.com/urfave/cli"
-	"go.uber.org/multierr"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/assets"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils"
-	ubig "github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
+	"github.com/smartcontractkit/chainlink-evm/pkg/utils"
 	"github.com/smartcontractkit/chainlink/v2/core/store/models"
 	"github.com/smartcontractkit/chainlink/v2/core/utils/stringutils"
 	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
@@ -74,15 +73,16 @@ type EthTxPresenter struct {
 // RenderTable implements TableRenderer
 func (p *EthTxPresenter) RenderTable(rt RendererTable) error {
 	table := rt.newTable([]string{"From", "Nonce", "To", "State"})
-	table.Append([]string{
+	if err := table.Append([]string{
 		p.From.Hex(),
 		p.Nonce,
 		p.To.Hex(),
-		fmt.Sprint(p.State),
-	})
+		p.State,
+	}); err != nil {
+		return err
+	}
 
-	render(fmt.Sprintf("Ethereum Transaction %v", p.Hash.Hex()), table)
-	return nil
+	return render(fmt.Sprintf("Ethereum Transaction %v", p.Hash.Hex()), table)
 }
 
 type EthTxPresenters []EthTxPresenter
@@ -91,18 +91,19 @@ type EthTxPresenters []EthTxPresenter
 func (ps EthTxPresenters) RenderTable(rt RendererTable) error {
 	table := rt.newTable([]string{"Hash", "Nonce", "From", "GasPrice", "SentAt", "State"})
 	for _, p := range ps {
-		table.Append([]string{
+		if err := table.Append([]string{
 			p.Hash.Hex(),
 			p.Nonce,
 			p.From.Hex(),
 			p.GasPrice,
 			p.SentAt,
-			fmt.Sprint(p.State),
-		})
+			p.State,
+		}); err != nil {
+			return err
+		}
 	}
 
-	render("Ethereum Transactions", table)
-	return nil
+	return render("Ethereum Transactions", table)
 }
 
 // IndexTransactions returns the list of transactions in descending order,
@@ -123,7 +124,7 @@ func (s *Shell) ShowTransaction(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = errors.Join(err, cerr)
 		}
 	}()
 
@@ -144,33 +145,37 @@ func (s *Shell) SendEther(c *cli.Context) (err error) {
 
 		value, err = stringutils.ToInt64(c.Args().Get(0))
 		if err != nil {
-			return s.errorOut(multierr.Combine(
-				errors.New("while parsing WEI transfer amount"), err))
+			return s.errorOut(errors.Join(
+				errors.New("while parsing WEI transfer amount"), err,
+			))
 		}
 
 		amount = assets.NewEthValue(value)
 	} else {
 		amount, err = assets.NewEthValueS(c.Args().Get(0))
 		if err != nil {
-			return s.errorOut(multierr.Combine(
-				errors.New("while parsing ETH transfer amount"), err))
+			return s.errorOut(errors.Join(
+				errors.New("while parsing ETH transfer amount"), err,
+			))
 		}
 	}
 
 	unparsedFromAddress := c.Args().Get(1)
 	fromAddress, err := utils.ParseEthereumAddress(unparsedFromAddress)
 	if err != nil {
-		return s.errorOut(multierr.Combine(
+		return s.errorOut(errors.Join(
 			fmt.Errorf("while parsing withdrawal source address %v",
-				unparsedFromAddress), err))
+				unparsedFromAddress), err,
+		))
 	}
 
 	unparsedDestinationAddress := c.Args().Get(2)
 	destinationAddress, err := utils.ParseEthereumAddress(unparsedDestinationAddress)
 	if err != nil {
-		return s.errorOut(multierr.Combine(
+		return s.errorOut(errors.Join(
 			fmt.Errorf("while parsing withdrawal destination address %v",
-				unparsedDestinationAddress), err))
+				unparsedDestinationAddress), err,
+		))
 	}
 
 	var evmChainID *big.Int
@@ -187,7 +192,7 @@ func (s *Shell) SendEther(c *cli.Context) (err error) {
 		DestinationAddress: destinationAddress,
 		FromAddress:        fromAddress,
 		Amount:             amount,
-		EVMChainID:         (*ubig.Big)(evmChainID),
+		EVMChainID:         (*sqlutil.Big)(evmChainID),
 		AllowHigherAmounts: c.IsSet("force"),
 	}
 
@@ -204,7 +209,7 @@ func (s *Shell) SendEther(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = errors.Join(err, cerr)
 		}
 	}()
 

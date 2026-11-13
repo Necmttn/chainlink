@@ -1,0 +1,216 @@
+package executable
+
+import (
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"strings"
+
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities"
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities/pb"
+	aptoscappb "github.com/smartcontractkit/chainlink-common/pkg/capabilities/v2/chain-capabilities/aptos"
+	evmcappb "github.com/smartcontractkit/chainlink-common/pkg/capabilities/v2/chain-capabilities/evm"
+	solcappb "github.com/smartcontractkit/chainlink-common/pkg/capabilities/v2/chain-capabilities/solana"
+	stellarcappb "github.com/smartcontractkit/chainlink-common/pkg/capabilities/v2/chain-capabilities/stellar"
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/limits"
+	"github.com/smartcontractkit/chainlink-protos/cre/go/sdk"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities/remote/types"
+)
+
+// V2 Capabilities (Executables) default to a simple hasher that hashes an
+// explicit allowlist of metadata fields. WriteReport methods use a hasher that
+// also excludes signatures from the WriteReportRequest.
+// Additional hashers can be added here as needed.
+type simpleHasher struct {
+	cfg OptInHasherConfig
+}
+
+func (r *simpleHasher) Hash(ctx context.Context, msg *types.MessageBody) ([32]byte, error) {
+	req, err := pb.UnmarshalCapabilityRequest(msg.Payload)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("failed to unmarshal capability request: %w", err)
+	}
+
+	req.Metadata = applyMetadataFields(ctx, req.Metadata, r.cfg)
+
+	reqBytes, err := pb.MarshalCapabilityRequest(req)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("failed to marshal capability request: %w", err)
+	}
+	hash := sha256.Sum256(reqBytes)
+	return hash, nil
+}
+
+func NewSimpleHasher(cfg OptInHasherConfig) types.MessageHasher {
+	return &simpleHasher{cfg: cfg}
+}
+
+type writeReportExcludeSignaturesHasher struct {
+	cfg OptInHasherConfig
+}
+
+func (r *writeReportExcludeSignaturesHasher) Hash(ctx context.Context, msg *types.MessageBody) ([32]byte, error) {
+	req, err := pb.UnmarshalCapabilityRequest(msg.Payload)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("failed to unmarshal capability request: %w", err)
+	}
+	if req.Payload == nil {
+		return [32]byte{}, errors.New("capability request payload is nil")
+	}
+
+	req.Metadata = applyMetadataFields(ctx, req.Metadata, r.cfg)
+
+	family, familyErr := getWriteReportFamily(msg.CapabilityId)
+	if familyErr != nil {
+		return [32]byte{}, familyErr
+	}
+
+	wrReq, err := unmarshalWriteReportRequest(family, req.Payload)
+	if err != nil {
+		return [32]byte{}, err
+	}
+
+	wrReq.GetReport().Sigs = nil // exclude signatures from hash
+	payload, err := anypb.New(wrReq)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("failed to marshal WriteReportRequest back to anypb: %w", err)
+	}
+
+	req.Payload = payload
+
+	reqBytes, err := pb.MarshalCapabilityRequest(req)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("failed to marshal capability request: %w", err)
+	}
+	return sha256.Sum256(reqBytes), nil
+}
+
+type writeReportFamily string
+
+var (
+	writeReportFamilyEVM     writeReportFamily = "evm"
+	writeReportFamilySolana  writeReportFamily = "solana"
+	writeReportFamilyAptos   writeReportFamily = "aptos"
+	writeReportFamilyStellar writeReportFamily = "stellar"
+)
+
+// writeReportRequest is implemented by the WriteReportRequest of every supported chain family.
+type writeReportRequest interface {
+	proto.Message
+	GetReport() *sdk.ReportResponse
+}
+
+func unmarshalWriteReportRequest(family writeReportFamily, payload *anypb.Any) (writeReportRequest, error) {
+	var wrReq writeReportRequest
+	switch family {
+	case writeReportFamilyEVM:
+		wrReq = &evmcappb.WriteReportRequest{}
+	case writeReportFamilySolana:
+		wrReq = &solcappb.WriteReportRequest{}
+	case writeReportFamilyAptos:
+		wrReq = &aptoscappb.WriteReportRequest{}
+	case writeReportFamilyStellar:
+		wrReq = &stellarcappb.WriteReportRequest{}
+	default:
+		return nil, fmt.Errorf("unexpected report family: %s", family)
+	}
+
+	if err := payload.UnmarshalTo(wrReq); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal Payload to WriteReportRequest: %w", err)
+	}
+	if wrReq.GetReport() == nil {
+		return nil, errors.New("WriteReportRequest.Report is nil")
+	}
+	return wrReq, nil
+}
+
+func getWriteReportFamily(capabilityID string) (writeReportFamily, error) {
+	ss := strings.Split(capabilityID, ":")
+	if len(ss) < 1 {
+		return "", errors.New("failed to parse family from capability id")
+	}
+	family := ss[0]
+	switch family {
+	case "evm":
+		return writeReportFamilyEVM, nil
+	case "solana":
+		return writeReportFamilySolana, nil
+	case "aptos":
+		return writeReportFamilyAptos, nil
+	case "stellar":
+		return writeReportFamilyStellar, nil
+	}
+
+	return "", errors.New("report family is unknown, available families: evm, solana, aptos, stellar")
+}
+
+func NewWriteReportExcludeSignaturesHasher(cfg OptInHasherConfig) types.MessageHasher {
+	return &writeReportExcludeSignaturesHasher{cfg: cfg}
+}
+
+// OptInHasherConfig holds per-field feature flags that control which optional
+// metadata fields are included in the request hash beyond the base allowlist.
+//
+// To opt in a new field in the future:
+//  1. Add a feature flag (Setting[Range[commonconfig.Timestamp]]) in cresettings,
+//     named FeatureRequestHashInclude<Field>ActivePeriod.
+//  2. Add a field of type limits.RangeLimiter[commonconfig.Timestamp] to this struct.
+//  3. Add the conditional copy in applyMetadataFields.
+//  4. Construct the limiter in launcher.NewLauncher and pass it via OptInHasherConfig.
+//
+// To EXCLUDE a field that is currently included (e.g. WorkflowTag):
+//  1. The field must already be under a per-field flag that is ON by default.
+//  2. After all nodes are rolled out, set the flag's window to the far future
+//     to deactivate it.
+//
+// Each flag is evaluated against the request's DON-derived ExecutionTimestamp,
+// so all nodes processing the same request include or exclude the field
+// atomically — no cross-version requestID divergence.
+type OptInHasherConfig struct {
+	// IncludeWorkflowTag is ON by default (window covers all timestamps including
+	// zero time.Time{}), so WorkflowTag is included in the hash matching current
+	// prod behavior. After rollout, set to far-future window to exclude it.
+	IncludeWorkflowTag limits.RangeLimiter[commonconfig.Timestamp]
+}
+
+// baseMetadataFields returns a copy of the metadata containing only the
+// base allowlisted fields. New metadata fields added in the future are excluded
+// from the hash by default, preventing cross-version requestID divergence.
+func baseMetadataFields(md capabilities.RequestMetadata) capabilities.RequestMetadata {
+	return capabilities.RequestMetadata{
+		WorkflowID:                    md.WorkflowID,
+		WorkflowExecutionID:           md.WorkflowExecutionID,
+		WorkflowOwner:                 md.WorkflowOwner,
+		OrgID:                         md.OrgID,
+		WorkflowName:                  md.WorkflowName,
+		WorkflowDonID:                 md.WorkflowDonID,
+		WorkflowDonConfigVersion:      md.WorkflowDonConfigVersion,
+		ReferenceID:                   md.ReferenceID,
+		DecodedWorkflowName:           md.DecodedWorkflowName,
+		WorkflowRegistryChainSelector: md.WorkflowRegistryChainSelector,
+		WorkflowRegistryAddress:       md.WorkflowRegistryAddress,
+		EngineVersion:                 md.EngineVersion,
+	}
+}
+
+// applyMetadataFields returns a copy of the metadata containing the base
+// allowlisted fields plus any optional fields whose per-field feature flag is
+// active for the given ExecutionTimestamp.
+func applyMetadataFields(ctx context.Context, md capabilities.RequestMetadata, cfg OptInHasherConfig) capabilities.RequestMetadata {
+	result := baseMetadataFields(md)
+	ts := commonconfig.Timestamp(md.ExecutionTimestamp.Unix())
+
+	ctx = md.ContextWithCRE(ctx)
+	if cfg.IncludeWorkflowTag != nil {
+		if err := cfg.IncludeWorkflowTag.Check(ctx, ts); err == nil {
+			result.WorkflowTag = md.WorkflowTag
+		}
+	}
+
+	return result
+}

@@ -2,12 +2,12 @@ package pipeline
 
 import (
 	"context"
+	stderrors "errors"
 
 	"github.com/pkg/errors"
-	"go.uber.org/multierr"
 
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/cbor"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
 )
 
 // Return types:
@@ -41,7 +41,7 @@ func (t *CBORParseTask) Run(_ context.Context, _ logger.Logger, vars Vars, input
 		data BytesParam
 		mode StringParam
 	)
-	err = multierr.Combine(
+	err = stderrors.Join(
 		errors.Wrap(ResolveParam(&data, From(VarExpr(t.Data, vars))), "data"),
 		errors.Wrap(ResolveParam(&mode, From(NonemptyString(t.Mode), "diet")), "mode"),
 	)

@@ -1,19 +1,17 @@
 package web_test
 
 import (
-	"fmt"
 	"net/http"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/smartcontractkit/chainlink-common/pkg/utils"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
 	"github.com/smartcontractkit/chainlink/v2/core/web"
 	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestStarkNetKeysController_Index_HappyPath(t *testing.T) {
@@ -28,7 +26,7 @@ func TestStarkNetKeysController_Index_HappyPath(t *testing.T) {
 
 	resources := []presenters.StarkNetKeyResource{}
 	err := web.ParseJSONAPIResponse(cltest.ParseResponseBody(t, response), &resources)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	require.Len(t, resources, len(keys))
 
@@ -40,7 +38,7 @@ func TestStarkNetKeysController_Create_HappyPath(t *testing.T) {
 	t.Parallel()
 
 	app := cltest.NewApplicationEVMDisabled(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 	client := app.NewHTTPClient(nil)
 	keyStore := app.GetKeyStore()
 
@@ -53,7 +51,7 @@ func TestStarkNetKeysController_Create_HappyPath(t *testing.T) {
 
 	resource := presenters.StarkNetKeyResource{}
 	err := web.ParseJSONAPIResponse(cltest.ParseResponseBody(t, response), &resource)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	assert.Equal(t, keys[0].ID(), resource.ID)
 	assert.Equal(t, keys[0].StarkKeyStr(), resource.StarkKey)
@@ -75,29 +73,31 @@ func TestStarkNetKeysController_Delete_NonExistentStarkNetKeyID(t *testing.T) {
 
 func TestStarkNetKeysController_Delete_HappyPath(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	client, keyStore := setupStarkNetKeysControllerTests(t)
 
 	keys, _ := keyStore.StarkNet().GetAll()
 	initialLength := len(keys)
-	key, _ := keyStore.StarkNet().Create()
+	key, _ := keyStore.StarkNet().Create(ctx)
 
-	response, cleanup := client.Delete(fmt.Sprintf("/v2/keys/starknet/%s", key.ID()))
+	response, cleanup := client.Delete("/v2/keys/starknet/" + key.ID())
 	t.Cleanup(cleanup)
 	assert.Equal(t, http.StatusOK, response.StatusCode)
-	assert.Error(t, utils.JustError(keyStore.StarkNet().Get(key.ID())))
+	require.Error(t, utils.JustError(keyStore.StarkNet().Get(key.ID())))
 
 	keys, _ = keyStore.StarkNet().GetAll()
-	assert.Equal(t, initialLength, len(keys))
+	assert.Len(t, keys, initialLength)
 }
 
 func setupStarkNetKeysControllerTests(t *testing.T) (cltest.HTTPClientCleaner, keystore.Master) {
 	t.Helper()
+	ctx := t.Context()
 
 	app := cltest.NewApplication(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
-	require.NoError(t, app.KeyStore.OCR().Add(cltest.DefaultOCRKey))
-	require.NoError(t, app.KeyStore.StarkNet().Add(cltest.DefaultStarkNetKey))
+	require.NoError(t, app.Start(ctx))
+	require.NoError(t, app.KeyStore.OCR().Add(ctx, cltest.DefaultOCRKey))
+	require.NoError(t, app.KeyStore.StarkNet().Add(ctx, cltest.DefaultStarkNetKey))
 
 	client := app.NewHTTPClient(nil)
 

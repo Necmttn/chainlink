@@ -4,20 +4,24 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/graph-gophers/graphql-go"
 	"github.com/pkg/errors"
 
+	chainsel "github.com/smartcontractkit/chain-selectors"
+
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/vrfkey"
 	"github.com/smartcontractkit/chainlink-common/pkg/types"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
 	"github.com/smartcontractkit/chainlink/v2/core/bridges"
-	"github.com/smartcontractkit/chainlink/v2/core/chains"
+	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/vrfkey"
-	"github.com/smartcontractkit/chainlink/v2/core/services/relay"
-	evmrelay "github.com/smartcontractkit/chainlink/v2/core/services/relay/evm"
 	"github.com/smartcontractkit/chainlink/v2/core/utils/stringutils"
+	"github.com/smartcontractkit/chainlink/v2/core/web/loader"
 )
 
 // Bridge retrieves a bridges by name.
@@ -31,7 +35,7 @@ func (r *Resolver) Bridge(ctx context.Context, args struct{ ID graphql.ID }) (*B
 		return nil, err
 	}
 
-	bridge, err := r.App.BridgeORM().FindBridge(name)
+	bridge, err := r.App.BridgeORM().FindBridge(ctx, name)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewBridgePayload(bridge, err), nil
@@ -47,7 +51,8 @@ func (r *Resolver) Bridge(ctx context.Context, args struct{ ID graphql.ID }) (*B
 func (r *Resolver) Bridges(ctx context.Context, args struct {
 	Offset *int32
 	Limit  *int32
-}) (*BridgesPayloadResolver, error) {
+},
+) (*BridgesPayloadResolver, error) {
 	if err := authenticateUser(ctx); err != nil {
 		return nil, err
 	}
@@ -55,39 +60,66 @@ func (r *Resolver) Bridges(ctx context.Context, args struct {
 	offset := pageOffset(args.Offset)
 	limit := pageLimit(args.Limit)
 
-	brdgs, count, err := r.App.BridgeORM().BridgeTypes(offset, limit)
+	brdgs, count, err := r.App.BridgeORM().BridgeTypes(ctx, offset, limit)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewBridgesPayload(brdgs, int32(count)), nil
+	return NewBridgesPayload(brdgs, safeInt32(count)), nil
+}
+
+func safeInt32(n int) int32 {
+	if n > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if n < math.MinInt32 {
+		return math.MinInt32
+	}
+	return int32(n)
 }
 
 // Chain retrieves a chain by id.
-func (r *Resolver) Chain(ctx context.Context, args struct{ ID graphql.ID }) (*ChainPayloadResolver, error) {
+func (r *Resolver) Chain(ctx context.Context,
+	args struct {
+		ID      graphql.ID
+		Network *string
+	},
+) (*ChainPayloadResolver, error) {
 	if err := authenticateUser(ctx); err != nil {
 		return nil, err
 	}
 
-	cs, _, err := r.App.EVMORM().Chains(relay.ChainID(args.ID))
+	// fall back to EVM if network is not provided
+	if args.Network == nil {
+		relayID := types.NewRelayID(chainsel.FamilyEVM, string(args.ID))
+		id, err := loader.GetChainByRelayID(ctx, relayID.Name())
+		if err != nil {
+			if errors.Is(err, chains.ErrNotFound) {
+				return NewChainPayload(chainlink.NetworkChainStatus{}, chains.ErrNotFound), nil
+			}
+			return nil, err
+		}
+		return NewChainPayload(*id, nil), nil
+	}
+
+	relayID := types.NewRelayID(*args.Network, string(args.ID))
+	id, err := loader.GetChainByRelayID(ctx, relayID.Name())
 	if err != nil {
+		if errors.Is(err, chains.ErrNotFound) {
+			return NewChainPayload(chainlink.NetworkChainStatus{}, chains.ErrNotFound), nil
+		}
 		return nil, err
 	}
-	l := len(cs)
-	if l == 0 {
-		return NewChainPayload(types.ChainStatus{}, chains.ErrNotFound), nil
-	}
-	if l > 1 {
-		return nil, fmt.Errorf("multiple chains found: %d", len(cs))
-	}
-	return NewChainPayload(cs[0], nil), nil
+
+	return NewChainPayload(*id, nil), nil
 }
 
 // Chains retrieves a paginated list of chains.
 func (r *Resolver) Chains(ctx context.Context, args struct {
 	Offset *int32
 	Limit  *int32
-}) (*ChainsPayloadResolver, error) {
+},
+) (*ChainsPayloadResolver, error) {
 	if err := authenticateUser(ctx); err != nil {
 		return nil, err
 	}
@@ -95,20 +127,47 @@ func (r *Resolver) Chains(ctx context.Context, args struct {
 	offset := pageOffset(args.Offset)
 	limit := pageLimit(args.Limit)
 
-	chains, count, err := r.App.EVMORM().Chains()
-	if err != nil {
-		return nil, err
+	relayersMap := r.App.GetRelayers().GetIDToRelayerMap()
+
+	chains := make([]chainlink.NetworkChainStatus, 0, len(relayersMap))
+	for k, v := range relayersMap {
+		s, err := v.GetChainStatus(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		chains = append(chains, chainlink.NetworkChainStatus{
+			ChainStatus: s,
+			Network:     k.Network,
+		})
 	}
+
+	count := len(chains)
+	if count == 0 {
+		// No chains are configured, return an empty ChainsPayload, so we don't break the UI
+		return NewChainsPayload(nil, 0), nil
+	}
+
 	// bound the chain results
-	if offset >= len(chains) {
+	if offset >= count {
 		return nil, fmt.Errorf("offset %d out of range", offset)
 	}
-	end := len(chains)
+	end := count
 	if limit > 0 && offset+limit < end {
 		end = offset + limit
 	}
 
-	return NewChainsPayload(chains[offset:end], int32(count)), nil
+	sortByNetworkAndID(chains)
+	return NewChainsPayload(chains[offset:end], safeInt32(count)), nil
+}
+
+func sortByNetworkAndID(chains []chainlink.NetworkChainStatus) {
+	sort.SliceStable(chains, func(i, j int) bool {
+		if chains[i].Network == chains[j].Network {
+			return chains[i].ID < chains[j].ID
+		}
+		return chains[i].Network < chains[j].Network
+	})
 }
 
 // FeedsManager retrieves a feeds manager by id.
@@ -122,7 +181,7 @@ func (r *Resolver) FeedsManager(ctx context.Context, args struct{ ID graphql.ID 
 		return nil, err
 	}
 
-	mgr, err := r.App.GetFeedsService().GetManager(id)
+	mgr, err := r.App.GetFeedsService().GetManager(ctx, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewFeedsManagerPayload(nil, err), nil
@@ -139,7 +198,7 @@ func (r *Resolver) FeedsManagers(ctx context.Context) (*FeedsManagersPayloadReso
 		return nil, err
 	}
 
-	mgrs, err := r.App.GetFeedsService().ListManagers()
+	mgrs, err := r.App.GetFeedsService().ListManagers(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -158,13 +217,13 @@ func (r *Resolver) Job(ctx context.Context, args struct{ ID graphql.ID }) (*JobP
 		return nil, err
 	}
 
-	j, err := r.App.JobORM().FindJobWithoutSpecErrors(id)
+	j, err := r.App.JobORM().FindJobWithoutSpecErrors(ctx, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewJobPayload(r.App, nil, err), nil
 		}
 
-		//We still need to show the job in UI/CLI even if the chain id is disabled
+		// We still need to show the job in UI/CLI even if the chain id is disabled
 		if errors.Is(err, chains.ErrNoSuchChainID) {
 			return NewJobPayload(r.App, &j, err), nil
 		}
@@ -179,7 +238,8 @@ func (r *Resolver) Job(ctx context.Context, args struct{ ID graphql.ID }) (*JobP
 func (r *Resolver) Jobs(ctx context.Context, args struct {
 	Offset *int32
 	Limit  *int32
-}) (*JobsPayloadResolver, error) {
+},
+) (*JobsPayloadResolver, error) {
 	if err := authenticateUser(ctx); err != nil {
 		return nil, err
 	}
@@ -187,12 +247,12 @@ func (r *Resolver) Jobs(ctx context.Context, args struct {
 	offset := pageOffset(args.Offset)
 	limit := pageLimit(args.Limit)
 
-	jobs, count, err := r.App.JobORM().FindJobs(offset, limit)
+	jobs, count, err := r.App.JobORM().FindJobs(ctx, offset, limit)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewJobsPayload(r.App, jobs, int32(count)), nil
+	return NewJobsPayload(r.App, jobs, safeInt32(count)), nil
 }
 
 func (r *Resolver) OCRKeyBundles(ctx context.Context) (*OCRKeyBundlesPayloadResolver, error) {
@@ -238,25 +298,25 @@ func (r *Resolver) Node(ctx context.Context, args struct{ ID graphql.ID }) (*Nod
 	r.App.GetLogger().Debug("resolver Node args %v", args)
 	name := string(args.ID)
 	r.App.GetLogger().Debug("resolver Node name %s", name)
-	node, err := r.App.EVMORM().NodeStatus(name)
-	if err != nil {
-		r.App.GetLogger().Errorw("resolver getting node status", "err", err)
 
-		if errors.Is(err, chains.ErrNotFound) {
-			npr, warn := NewNodePayloadResolver(nil, err)
-			if warn != nil {
-				r.App.GetLogger().Warnw("Error creating NodePayloadResolver", "name", name, "err", warn)
-			}
-			return npr, nil
+	for rid, relayer := range r.App.GetRelayers().GetIDToRelayerMap() {
+		statuses, _, _, err := relayer.ListNodeStatuses(ctx, 0, "")
+		if err != nil {
+			return nil, err
 		}
-		return nil, err
+		for _, s := range statuses {
+			if s.Name == name {
+				npr, err2 := NewNodePayloadResolver(&chainlink.NetworkNodeStatus{Network: rid.Network, NodeStatus: s}, nil)
+				if err2 != nil {
+					return nil, err2
+				}
+				return npr, nil
+			}
+		}
 	}
 
-	npr, warn := NewNodePayloadResolver(&node, nil)
-	if warn != nil {
-		r.App.GetLogger().Warnw("Error creating NodePayloadResolver", "name", name, "err", warn)
-	}
-	return npr, nil
+	r.App.GetLogger().Errorw("resolver getting node status", "err", chains.ErrNotFound)
+	return NewNodePayloadResolver(nil, chains.ErrNotFound)
 }
 
 func (r *Resolver) P2PKeys(ctx context.Context) (*P2PKeysPayloadResolver, error) {
@@ -289,7 +349,8 @@ func (r *Resolver) VRFKeys(ctx context.Context) (*VRFKeysPayloadResolver, error)
 // VRFKey fetches the VRF key with the given ID.
 func (r *Resolver) VRFKey(ctx context.Context, args struct {
 	ID graphql.ID
-}) (*VRFKeyPayloadResolver, error) {
+},
+) (*VRFKeyPayloadResolver, error) {
 	if err := authenticateUser(ctx); err != nil {
 		return nil, err
 	}
@@ -308,7 +369,8 @@ func (r *Resolver) VRFKey(ctx context.Context, args struct {
 // JobProposal retrieves a job proposal by ID
 func (r *Resolver) JobProposal(ctx context.Context, args struct {
 	ID graphql.ID
-}) (*JobProposalPayloadResolver, error) {
+},
+) (*JobProposalPayloadResolver, error) {
 	if err := authenticateUser(ctx); err != nil {
 		return nil, err
 	}
@@ -318,7 +380,7 @@ func (r *Resolver) JobProposal(ctx context.Context, args struct {
 		return nil, err
 	}
 
-	jp, err := r.App.GetFeedsService().GetJobProposal(id)
+	jp, err := r.App.GetFeedsService().GetJobProposal(ctx, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewJobProposalPayload(nil, err), nil
@@ -334,7 +396,8 @@ func (r *Resolver) JobProposal(ctx context.Context, args struct {
 func (r *Resolver) Nodes(ctx context.Context, args struct {
 	Offset *int32
 	Limit  *int32
-}) (*NodesPayloadResolver, error) {
+},
+) (*NodesPayloadResolver, error) {
 	if err := authenticateUser(ctx); err != nil {
 		return nil, err
 	}
@@ -349,7 +412,7 @@ func (r *Resolver) Nodes(ctx context.Context, args struct {
 		r.App.GetLogger().Errorw("Error creating get nodes status from app", "err", err)
 		return nil, err
 	}
-	npr, warn := NewNodesPayload(allNodes, int32(total))
+	npr, warn := NewNodesPayload(allNodes, safeInt32(total))
 	if warn != nil {
 		r.App.GetLogger().Warnw("Error creating NodesPayloadResolver", "err", warn)
 	}
@@ -359,7 +422,8 @@ func (r *Resolver) Nodes(ctx context.Context, args struct {
 func (r *Resolver) JobRuns(ctx context.Context, args struct {
 	Offset *int32
 	Limit  *int32
-}) (*JobRunsPayloadResolver, error) {
+},
+) (*JobRunsPayloadResolver, error) {
 	if err := authenticateUser(ctx); err != nil {
 		return nil, err
 	}
@@ -367,17 +431,18 @@ func (r *Resolver) JobRuns(ctx context.Context, args struct {
 	limit := pageLimit(args.Limit)
 	offset := pageOffset(args.Offset)
 
-	runs, count, err := r.App.JobORM().PipelineRuns(nil, offset, limit)
+	runs, count, err := r.App.JobORM().PipelineRuns(ctx, nil, offset, limit)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewJobRunsPayload(runs, int32(count), r.App), nil
+	return NewJobRunsPayload(runs, safeInt32(count), r.App), nil
 }
 
 func (r *Resolver) JobRun(ctx context.Context, args struct {
 	ID graphql.ID
-}) (*JobRunPayloadResolver, error) {
+},
+) (*JobRunPayloadResolver, error) {
 	if err := authenticateUser(ctx); err != nil {
 		return nil, err
 	}
@@ -387,7 +452,7 @@ func (r *Resolver) JobRun(ctx context.Context, args struct {
 		return nil, err
 	}
 
-	jr, err := r.App.JobORM().FindPipelineRunByID(id)
+	jr, err := r.App.JobORM().FindPipelineRunByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewJobRunPayload(nil, r.App, err), nil
@@ -406,41 +471,37 @@ func (r *Resolver) ETHKeys(ctx context.Context) (*ETHKeysPayloadResolver, error)
 
 	ks := r.App.GetKeyStore().Eth()
 
-	keys, err := ks.GetAll()
+	keys, err := ks.GetAll(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("error getting unlocked keys: %v", err)
+		return nil, fmt.Errorf("error getting unlocked keys: %w", err)
 	}
 
-	states, err := ks.GetStatesForKeys(keys)
+	states, err := ks.GetStatesForKeys(ctx, keys)
 	if err != nil {
-		return nil, fmt.Errorf("error getting key states: %v", err)
+		return nil, fmt.Errorf("error getting key states: %w", err)
 	}
 
 	var ethKeys []ETHKey
 
 	for _, state := range states {
-		k, err := ks.Get(state.Address.Hex())
+		k, err := ks.Get(ctx, state.Address.Hex())
 		if err != nil {
 			return nil, err
 		}
 
-		chain, err := r.App.GetRelayers().LegacyEVMChains().Get(state.EVMChainID.String())
-		if errors.Is(errors.Cause(err), evmrelay.ErrNoChains) {
-			ethKeys = append(ethKeys, ETHKey{
-				addr:  k.EIP55Address,
-				state: state,
-			})
-
-			continue
-		}
+		chainService, err := r.App.GetRelayers().LegacyEVMChains().Get(state.EVMChainID.String()) //nolint:staticcheck // LegacyEVMChains is deprecated but refactoring to new relayer interface requires larger architectural changes
 		// Don't include keys without valid chain.
 		// OperatorUI fails to show keys where chains are not in the config.
 		if err == nil {
-			ethKeys = append(ethKeys, ETHKey{
+			k := ETHKey{
 				addr:  k.EIP55Address,
 				state: state,
-				chain: chain,
-			})
+			}
+			chain, ok := chainService.(legacyevm.Chain)
+			if ok {
+				k.chain = chain
+			}
+			ethKeys = append(ethKeys, k)
 		}
 	}
 	// Put disabled keys to the end
@@ -463,13 +524,14 @@ func (r *Resolver) ConfigV2(ctx context.Context) (*ConfigV2PayloadResolver, erro
 
 func (r *Resolver) EthTransaction(ctx context.Context, args struct {
 	Hash graphql.ID
-}) (*EthTransactionPayloadResolver, error) {
+},
+) (*EthTransactionPayloadResolver, error) {
 	if err := authenticateUser(ctx); err != nil {
 		return nil, err
 	}
 
 	hash := common.HexToHash(string(args.Hash))
-	etx, err := r.App.TxmStorageService().FindTxByHash(hash)
+	etx, err := r.App.TxmStorageService().FindTxByHash(ctx, hash)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewEthTransactionPayload(nil, err), nil
@@ -484,7 +546,8 @@ func (r *Resolver) EthTransaction(ctx context.Context, args struct {
 func (r *Resolver) EthTransactions(ctx context.Context, args struct {
 	Offset *int32
 	Limit  *int32
-}) (*EthTransactionsPayloadResolver, error) {
+},
+) (*EthTransactionsPayloadResolver, error) {
 	if err := authenticateUser(ctx); err != nil {
 		return nil, err
 	}
@@ -492,18 +555,19 @@ func (r *Resolver) EthTransactions(ctx context.Context, args struct {
 	offset := pageOffset(args.Offset)
 	limit := pageLimit(args.Limit)
 
-	txs, count, err := r.App.TxmStorageService().Transactions(offset, limit)
+	txs, count, err := r.App.TxmStorageService().Transactions(ctx, offset, limit)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewEthTransactionsPayload(txs, int32(count)), nil
+	return NewEthTransactionsPayload(txs, safeInt32(count)), nil
 }
 
 func (r *Resolver) EthTransactionsAttempts(ctx context.Context, args struct {
 	Offset *int32
 	Limit  *int32
-}) (*EthTransactionsAttemptsPayloadResolver, error) {
+},
+) (*EthTransactionsAttemptsPayloadResolver, error) {
 	if err := authenticateUser(ctx); err != nil {
 		return nil, err
 	}
@@ -511,12 +575,12 @@ func (r *Resolver) EthTransactionsAttempts(ctx context.Context, args struct {
 	offset := pageOffset(args.Offset)
 	limit := pageLimit(args.Limit)
 
-	attempts, count, err := r.App.TxmStorageService().TxAttempts(offset, limit)
+	attempts, count, err := r.App.TxmStorageService().TxAttempts(ctx, offset, limit)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewEthTransactionsAttemptsPayload(attempts, int32(count)), nil
+	return NewEthTransactionsAttemptsPayload(attempts, safeInt32(count)), nil
 }
 
 func (r *Resolver) GlobalLogLevel(ctx context.Context) (*GlobalLogLevelPayloadResolver, error) {
@@ -540,6 +604,83 @@ func (r *Resolver) SolanaKeys(ctx context.Context) (*SolanaKeysPayloadResolver, 
 	}
 
 	return NewSolanaKeysPayload(keys), nil
+}
+
+func (r *Resolver) AptosKeys(ctx context.Context) (*AptosKeysPayloadResolver, error) {
+	if err := authenticateUser(ctx); err != nil {
+		return nil, err
+	}
+
+	keys, err := r.App.GetKeyStore().Aptos().GetAll()
+	if err != nil {
+		return nil, err
+	}
+
+	return NewAptosKeysPayload(keys), nil
+}
+
+func (r *Resolver) SuiKeys(ctx context.Context) (*SuiKeysPayloadResolver, error) {
+	if err := authenticateUser(ctx); err != nil {
+		return nil, err
+	}
+
+	keys, err := r.App.GetKeyStore().Sui().GetAll()
+	if err != nil {
+		return nil, err
+	}
+
+	return NewSuiKeysPayload(keys), nil
+}
+
+func (r *Resolver) StellarKeys(ctx context.Context) (*StellarKeysPayloadResolver, error) {
+	if err := authenticateUser(ctx); err != nil {
+		return nil, err
+	}
+
+	keys, err := r.App.GetKeyStore().Stellar().GetAll()
+	if err != nil {
+		return nil, err
+	}
+
+	return NewStellarKeysPayload(keys), nil
+}
+
+func (r *Resolver) StarkNetKeys(ctx context.Context) (*StarkNetKeysPayloadResolver, error) {
+	if err := authenticateUser(ctx); err != nil {
+		return nil, err
+	}
+	keys, err := r.App.GetKeyStore().StarkNet().GetAll()
+	if err != nil {
+		return nil, err
+	}
+
+	return NewStarkNetKeysPayload(keys), nil
+}
+
+func (r *Resolver) TronKeys(ctx context.Context) (*TronKeysPayloadResolver, error) {
+	if err := authenticateUser(ctx); err != nil {
+		return nil, err
+	}
+
+	keys, err := r.App.GetKeyStore().Tron().GetAll()
+	if err != nil {
+		return nil, err
+	}
+
+	return NewTronKeysPayload(keys), nil
+}
+
+func (r *Resolver) TONKeys(ctx context.Context) (*TONKeysPayloadResolver, error) {
+	if err := authenticateUser(ctx); err != nil {
+		return nil, err
+	}
+
+	keys, err := r.App.GetKeyStore().TON().GetAll()
+	if err != nil {
+		return nil, err
+	}
+
+	return NewTONKeysPayload(keys), nil
 }
 
 func (r *Resolver) SQLLogging(ctx context.Context) (*GetSQLLoggingPayloadResolver, error) {

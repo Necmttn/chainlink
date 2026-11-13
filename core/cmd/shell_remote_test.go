@@ -14,17 +14,18 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/hashicorp/consul/sdk/freeport"
 	"github.com/kylelemons/godebug/diff"
 	"github.com/pelletier/go-toml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli"
 
+	"github.com/smartcontractkit/freeport"
+
 	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	"github.com/smartcontractkit/chainlink-evm/pkg/client/clienttest"
 	"github.com/smartcontractkit/chainlink/v2/core/auth"
 	"github.com/smartcontractkit/chainlink/v2/core/bridges"
-	evmclimocks "github.com/smartcontractkit/chainlink/v2/core/chains/evm/client/mocks"
 	"github.com/smartcontractkit/chainlink/v2/core/cmd"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
@@ -39,13 +40,11 @@ import (
 	"github.com/smartcontractkit/chainlink/v2/core/web"
 )
 
-var (
-	nilContext = cli.NewContext(nil, nil, nil)
-)
+var nilContext = cli.NewContext(nil, nil, nil)
 
 type startOptions struct {
 	// Use to set up mocks on the app
-	FlagsAndDeps []interface{}
+	FlagsAndDeps []any
 	// Add a key on start up
 	WithKey bool
 }
@@ -54,7 +53,7 @@ func startNewApplicationV2(t *testing.T, overrideFn func(c *chainlink.Config, s 
 	t.Helper()
 
 	sopts := &startOptions{
-		FlagsAndDeps: []interface{}{},
+		FlagsAndDeps: []any{},
 	}
 	for _, fn := range setup {
 		fn(sopts)
@@ -72,12 +71,12 @@ func startNewApplicationV2(t *testing.T, overrideFn func(c *chainlink.Config, s 
 	})
 
 	app := cltest.NewApplicationWithConfigAndKey(t, config, sopts.FlagsAndDeps...)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	return app
 }
 
-func withMocks(mks ...interface{}) func(opts *startOptions) {
+func withMocks(mks ...any) func(opts *startOptions) {
 	return func(opts *startOptions) {
 		opts.FlagsAndDeps = mks
 	}
@@ -89,12 +88,12 @@ func withKey() func(opts *startOptions) {
 	}
 }
 
-func newEthMock(t *testing.T) *evmclimocks.Client {
+func newEthMock(t *testing.T) *clienttest.Client {
 	t.Helper()
 	return cltest.NewEthMocksWithStartupAssertions(t)
 }
 
-func newEthMockWithTransactionsOnBlocksAssertions(t *testing.T) *evmclimocks.Client {
+func newEthMockWithTransactionsOnBlocksAssertions(t *testing.T) *clienttest.Client {
 	t.Helper()
 
 	return cltest.NewEthMocksWithTransactionsOnBlocksAssertions(t)
@@ -116,10 +115,10 @@ func deleteKeyExportFile(t *testing.T) {
 func TestShell_ReplayBlocks(t *testing.T) {
 	t.Parallel()
 	app := startNewApplicationV2(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-		c.EVM[0].Enabled = ptr(true)
-		c.EVM[0].NonceAutoSync = ptr(false)
-		c.EVM[0].BalanceMonitor.Enabled = ptr(false)
-		c.EVM[0].GasEstimator.Mode = ptr("FixedPrice")
+		c.EVM[0].Enabled = new(true)
+		c.EVM[0].NonceAutoSync = new(false)
+		c.EVM[0].BalanceMonitor.Enabled = new(false)
+		c.EVM[0].GasEstimator.Mode = new("FixedPrice")
 	})
 	client, _ := app.NewShellAndRenderer()
 
@@ -127,11 +126,12 @@ func TestShell_ReplayBlocks(t *testing.T) {
 	flagSetApplyFromAction(client.ReplayFromBlock, set, "")
 
 	require.NoError(t, set.Set("block-number", "42"))
-	require.NoError(t, set.Set("evm-chain-id", "12345678"))
+	require.NoError(t, set.Set("chain-id", "12345678"))
+	require.NoError(t, set.Set("family", "evm"))
 	c := cli.NewContext(nil, set, nil)
-	assert.ErrorContains(t, client.ReplayFromBlock(c), "chain id does not match any local chains")
+	assert.ErrorContains(t, client.ReplayFromBlock(c), "chain id does not exist: 12345678") //nolint:testifylint // non-fatal
 
-	require.NoError(t, set.Set("evm-chain-id", "0"))
+	require.NoError(t, set.Set("chain-id", testutils.FixtureChainID.String()))
 	c = cli.NewContext(nil, set, nil)
 	assert.NoError(t, client.ReplayFromBlock(c))
 }
@@ -151,21 +151,22 @@ func TestShell_CreateExternalInitiator(t *testing.T) {
 	for _, tt := range tests {
 		test := tt
 		t.Run(test.name, func(t *testing.T) {
+			ctx := t.Context()
 			app := startNewApplicationV2(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-				c.JobPipeline.ExternalInitiatorsEnabled = ptr(true)
+				c.JobPipeline.ExternalInitiatorsEnabled = new(true)
 			})
 			client, _ := app.NewShellAndRenderer()
 
 			set := flag.NewFlagSet("create", 0)
 			flagSetApplyFromAction(client.CreateExternalInitiator, set, "")
-			assert.NoError(t, set.Parse(test.args))
+			require.NoError(t, set.Parse(test.args))
 			c := cli.NewContext(nil, set, nil)
 
 			err := client.CreateExternalInitiator(c)
 			require.NoError(t, err)
 
 			var exi bridges.ExternalInitiator
-			err = app.GetSqlxDB().Get(&exi, `SELECT * FROM external_initiators WHERE name = $1`, test.args[0])
+			err = app.GetDB().GetContext(ctx, &exi, `SELECT * FROM external_initiators WHERE name = $1`, test.args[0])
 			require.NoError(t, err)
 
 			if len(test.args) > 1 {
@@ -191,23 +192,23 @@ func TestShell_CreateExternalInitiator_Errors(t *testing.T) {
 		test := tt
 		t.Run(test.name, func(t *testing.T) {
 			app := startNewApplicationV2(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-				c.JobPipeline.ExternalInitiatorsEnabled = ptr(true)
+				c.JobPipeline.ExternalInitiatorsEnabled = new(true)
 			})
 			client, _ := app.NewShellAndRenderer()
 
-			initialExis := len(cltest.AllExternalInitiators(t, app.GetSqlxDB()))
+			initialCount := len(cltest.AllExternalInitiators(t, app.GetDB()))
 
 			set := flag.NewFlagSet("create", 0)
 			flagSetApplyFromAction(client.CreateExternalInitiator, set, "")
 
-			assert.NoError(t, set.Parse(test.args))
+			require.NoError(t, set.Parse(test.args))
 			c := cli.NewContext(nil, set, nil)
 
 			err := client.CreateExternalInitiator(c)
-			assert.Error(t, err)
+			require.Error(t, err)
 
-			exis := cltest.AllExternalInitiators(t, app.GetSqlxDB())
-			assert.Len(t, exis, initialExis)
+			externalInitiators := cltest.AllExternalInitiators(t, app.GetDB())
+			assert.Len(t, externalInitiators, initialCount)
 		})
 	}
 }
@@ -216,7 +217,7 @@ func TestShell_DestroyExternalInitiator(t *testing.T) {
 	t.Parallel()
 
 	app := startNewApplicationV2(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-		c.JobPipeline.ExternalInitiatorsEnabled = ptr(true)
+		c.JobPipeline.ExternalInitiatorsEnabled = new(true)
 	})
 	client, r := app.NewShellAndRenderer()
 
@@ -225,7 +226,7 @@ func TestShell_DestroyExternalInitiator(t *testing.T) {
 		&bridges.ExternalInitiatorRequest{Name: uuid.New().String()},
 	)
 	require.NoError(t, err)
-	err = app.BridgeORM().CreateExternalInitiator(exi)
+	err = app.BridgeORM().CreateExternalInitiator(t.Context(), exi)
 	require.NoError(t, err)
 
 	set := flag.NewFlagSet("test", 0)
@@ -234,7 +235,7 @@ func TestShell_DestroyExternalInitiator(t *testing.T) {
 	require.NoError(t, set.Parse([]string{exi.Name}))
 
 	c := cli.NewContext(nil, set, nil)
-	assert.NoError(t, client.DeleteExternalInitiator(c))
+	require.NoError(t, client.DeleteExternalInitiator(c))
 	assert.Empty(t, r.Renders)
 }
 
@@ -242,7 +243,7 @@ func TestShell_DestroyExternalInitiator_NotFound(t *testing.T) {
 	t.Parallel()
 
 	app := startNewApplicationV2(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-		c.JobPipeline.ExternalInitiatorsEnabled = ptr(true)
+		c.JobPipeline.ExternalInitiatorsEnabled = new(true)
 	})
 	client, r := app.NewShellAndRenderer()
 
@@ -252,12 +253,11 @@ func TestShell_DestroyExternalInitiator_NotFound(t *testing.T) {
 	require.NoError(t, set.Parse([]string{"bogus-ID"}))
 
 	c := cli.NewContext(nil, set, nil)
-	assert.Error(t, client.DeleteExternalInitiator(c))
+	require.Error(t, client.DeleteExternalInitiator(c))
 	assert.Empty(t, r.Renders)
 }
 
 func TestShell_RemoteLogin(t *testing.T) {
-
 	app := startNewApplicationV2(t, nil)
 	orm := app.AuthenticationProvider()
 
@@ -310,7 +310,7 @@ func TestShell_RemoteBuildCompatibility(t *testing.T) {
 	remoteVersion, remoteSha := "test"+static.Version, "abcd"+static.Sha
 	client.HTTP = &mockHTTPClient{client.HTTP, remoteVersion, remoteSha}
 
-	expErr := cmd.ErrIncompatible{
+	expErr := cmd.IncompatibleError{
 		CLIVersion:    static.Version,
 		CLISha:        static.Sha,
 		RemoteVersion: remoteVersion,
@@ -325,15 +325,15 @@ func TestShell_RemoteBuildCompatibility(t *testing.T) {
 
 	c := cli.NewContext(nil, set, nil)
 	err := client.RemoteLogin(c)
-	assert.Error(t, err)
-	assert.EqualError(t, err, expErr)
+	require.Error(t, err)
+	require.EqualError(t, err, expErr)
 
 	// Defaults to false
 	set = flag.NewFlagSet("test", 0)
 	flagSetApplyFromAction(client.RemoteLogin, set, "")
 	c = cli.NewContext(nil, set, nil)
 	err = client.RemoteLogin(c)
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.EqualError(t, err, expErr)
 }
 
@@ -364,8 +364,8 @@ func TestShell_CheckRemoteBuildCompatibility(t *testing.T) {
 
 			err := client.CheckRemoteBuildCompatibility(logger.TestLogger(t), test.bypassVersionFlag, test.cliVersion, test.cliSha)
 			if test.wantError {
-				assert.Error(t, err)
-				assert.ErrorIs(t, err, cmd.ErrIncompatible{
+				require.Error(t, err)
+				assert.ErrorIs(t, err, cmd.IncompatibleError{
 					RemoteVersion: test.remoteVersion,
 					RemoteSha:     test.remoteSha,
 					CLIVersion:    test.cliVersion,
@@ -390,7 +390,7 @@ func (h *mockHTTPClient) Get(ctx context.Context, path string, headers ...map[st
 		json := fmt.Sprintf(`{"version":"%s","commitSHA":"%s"}`, h.mockVersion, h.mockSha)
 		r := io.NopCloser(bytes.NewReader([]byte(json)))
 		return &http.Response{
-			StatusCode: 200,
+			StatusCode: http.StatusOK,
 			Body:       r,
 		}, nil
 	}
@@ -446,7 +446,7 @@ func TestShell_ChangePassword(t *testing.T) {
 	}
 	err = client.ChangePassword(cli.NewContext(nil, nil, nil))
 	require.Error(t, err)
-	assert.ErrorContains(t, err, "Expected password complexity")
+	require.ErrorContains(t, err, "Expected password complexity")
 
 	client.ChangePasswordPrompter = cltest.MockChangePasswordPrompter{
 		UpdatePasswordRequest: web.UpdatePasswordRequest{
@@ -455,43 +455,12 @@ func TestShell_ChangePassword(t *testing.T) {
 		},
 	}
 	err = client.ChangePassword(cli.NewContext(nil, nil, nil))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// otherClient should now be logged out
 	err = otherClient.IndexBridges(c)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Unauthorized")
-}
-
-func TestShell_Profile_InvalidSecondsParam(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplicationV2(t, nil)
-	u := cltest.NewUserWithSession(t, app.AuthenticationProvider())
-	enteredStrings := []string{u.Email, cltest.Password}
-	prompter := &cltest.MockCountingPrompter{T: t, EnteredStrings: enteredStrings}
-
-	client := app.NewAuthenticatingShell(prompter)
-
-	set := flag.NewFlagSet("test", 0)
-	flagSetApplyFromAction(client.RemoteLogin, set, "")
-
-	require.NoError(t, set.Set("file", "../internal/fixtures/apicredentials"))
-	require.NoError(t, set.Set("bypass-version-check", "true"))
-
-	c := cli.NewContext(nil, set, nil)
-	err := client.RemoteLogin(c)
-	require.NoError(t, err)
-
-	// pick a value larger than the default http service write timeout
-	d := app.Config.WebServer().HTTPWriteTimeout() + 2*time.Second
-	set.Uint("seconds", uint(d.Seconds()), "")
-	tDir := t.TempDir()
-	set.String("output_dir", tDir, "")
-	err = client.Profile(cli.NewContext(nil, set, nil))
-	wantErr := cmd.ErrProfileTooLong
-	require.ErrorAs(t, err, &wantErr)
-
 }
 
 func TestShell_Profile(t *testing.T) {
@@ -525,7 +494,7 @@ func TestShell_Profile(t *testing.T) {
 
 	ents, err := os.ReadDir(tDir)
 	require.NoError(t, err)
-	require.Greater(t, len(ents), 0, "ents %+v", ents)
+	require.NotEmpty(t, ents, "ents %+v", ents)
 }
 
 func TestShell_Profile_Unauthenticated(t *testing.T) {
@@ -564,26 +533,36 @@ func TestShell_ConfigV2(t *testing.T) {
 }
 
 func TestShell_RunOCRJob_HappyPath(t *testing.T) {
-	t.Parallel()
+	// Serial: full app + OCR + synchronous pipeline run; avoid parallel scheduling
+	// starving the test deadline and keep bridge traffic on local httptest only.
+	ctx := t.Context()
 	app := startNewApplicationV2(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-		c.EVM[0].Enabled = ptr(true)
-		c.OCR.Enabled = ptr(true)
-		c.P2P.V2.Enabled = ptr(true)
+		c.JobPipeline.HTTPRequest.DefaultTimeout = commonconfig.MustNewDuration(2 * time.Second)
+		c.EVM[0].Enabled = new(true)
+		c.OCR.Enabled = new(true)
+		c.P2P.V2.Enabled = new(true)
 		c.P2P.V2.ListenAddresses = &[]string{fmt.Sprintf("127.0.0.1:%d", freeport.GetOne(t))}
 		c.P2P.PeerID = &cltest.DefaultP2PPeerID
-		c.EVM[0].GasEstimator.Mode = ptr("FixedPrice")
+		c.EVM[0].GasEstimator.Mode = new("FixedPrice")
 	}, func(opts *startOptions) {
 		opts.FlagsAndDeps = append(opts.FlagsAndDeps, cltest.DefaultP2PKey)
 	})
 	client, _ := app.NewShellAndRenderer()
 
-	require.NoError(t, app.KeyStore.OCR().Add(cltest.DefaultOCRKey))
+	require.NoError(t, app.KeyStore.OCR().Add(ctx, cltest.DefaultOCRKey))
 
-	_, bridge := cltest.MustCreateBridge(t, app.GetSqlxDB(), cltest.BridgeOpts{}, app.GetConfig().Database())
-	_, bridge2 := cltest.MustCreateBridge(t, app.GetSqlxDB(), cltest.BridgeOpts{}, app.GetConfig().Database())
+	// Local mock adapters only: TriggerPipelineRun executes the observation pipeline synchronously.
+	mockDS1 := cltest.NewHTTPMockServer(t, 200, "POST", `{"one":{"two": 10}}`)
+	mockDS2 := cltest.NewHTTPMockServer(t, 200, "POST", `{"three":{"four": 20}}`)
+	_, bridge := cltest.MustCreateBridge(t, app.GetDB(), cltest.BridgeOpts{URL: mockDS1.URL})
+	_, bridge2 := cltest.MustCreateBridge(t, app.GetDB(), cltest.BridgeOpts{URL: mockDS2.URL})
 
 	var jb job.Job
-	ocrspec := testspecs.GenerateOCRSpec(testspecs.OCRSpecParams{DS1BridgeName: bridge.Name.String(), DS2BridgeName: bridge2.Name.String()})
+	ocrspec := testspecs.GenerateOCRSpec(testspecs.OCRSpecParams{
+		DS1BridgeName: bridge.Name.String(),
+		DS2BridgeName: bridge2.Name.String(),
+		EVMChainID:    testutils.FixtureChainID.String(),
+	})
 	err := toml.Unmarshal([]byte(ocrspec.Toml()), &jb)
 	require.NoError(t, err)
 	var ocrSpec job.OCROracleSpec
@@ -593,7 +572,7 @@ func TestShell_RunOCRJob_HappyPath(t *testing.T) {
 	key, _ := cltest.MustInsertRandomKey(t, app.KeyStore.Eth())
 	jb.OCROracleSpec.TransmitterAddress = &key.EIP55Address
 
-	err = app.AddJobV2(testutils.Context(t), &jb)
+	err = app.AddJobV2(t.Context(), &jb)
 	require.NoError(t, err)
 
 	set := flag.NewFlagSet("test", 0)
@@ -646,11 +625,12 @@ func TestShell_RunOCRJob_JobNotFound(t *testing.T) {
 
 func TestShell_AutoLogin(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	app := startNewApplicationV2(t, nil)
 
 	user := cltest.MustRandomUser(t)
-	require.NoError(t, app.BasicAdminUsersORM().CreateUser(&user))
+	require.NoError(t, app.BasicAdminUsersORM().CreateUser(ctx, &user))
 
 	sr := sessions.SessionRequest{
 		Email:    user.Email,
@@ -667,18 +647,19 @@ func TestShell_AutoLogin(t *testing.T) {
 	require.NoError(t, err)
 
 	// Expire the session and then try again
-	pgtest.MustExec(t, app.GetSqlxDB(), "delete from sessions where email = $1", user.Email)
+	pgtest.MustExec(t, app.GetDB(), "delete from sessions where email = $1", user.Email)
 	err = client.ListJobs(cli.NewContext(nil, fs, nil))
 	require.NoError(t, err)
 }
 
 func TestShell_AutoLogin_AuthFails(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	app := startNewApplicationV2(t, nil)
 
 	user := cltest.MustRandomUser(t)
-	require.NoError(t, app.BasicAdminUsersORM().CreateUser(&user))
+	require.NoError(t, app.BasicAdminUsersORM().CreateUser(ctx, &user))
 
 	sr := sessions.SessionRequest{
 		Email:    user.Email,
@@ -736,7 +717,7 @@ func TestShell_SetLogConfig(t *testing.T) {
 	c = cli.NewContext(nil, set, nil)
 
 	err = client.SetLogSQL(c)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, sqlEnabled, app.Config.Database().LogSQL())
 
 	sqlEnabled = false
@@ -747,6 +728,6 @@ func TestShell_SetLogConfig(t *testing.T) {
 	c = cli.NewContext(nil, set, nil)
 
 	err = client.SetLogSQL(c)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, sqlEnabled, app.Config.Database().LogSQL())
 }

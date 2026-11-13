@@ -8,7 +8,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 )
@@ -124,7 +123,7 @@ func TestMeanTask(t *testing.T) {
 					AllowedFaults: test.allowedFaults,
 					Precision:     test.precision,
 				}
-				output, runInfo := task.Run(testutils.Context(t), logger.TestLogger(t), pipeline.NewVarsFrom(nil), test.inputs)
+				output, runInfo := task.Run(t.Context(), logger.TestLogger(t), pipeline.NewVarsFrom(nil), test.inputs)
 				assert.False(t, runInfo.IsPending)
 				assert.False(t, runInfo.IsRetryable)
 				if output.Error != nil {
@@ -136,7 +135,7 @@ func TestMeanTask(t *testing.T) {
 				}
 			})
 			t.Run("with vars", func(t *testing.T) {
-				var inputs []interface{}
+				var inputs []any
 				for _, input := range test.inputs {
 					if input.Error != nil {
 						inputs = append(inputs, input.Error)
@@ -144,8 +143,8 @@ func TestMeanTask(t *testing.T) {
 						inputs = append(inputs, input.Value)
 					}
 				}
-				vars := pipeline.NewVarsFrom(map[string]interface{}{
-					"foo": map[string]interface{}{"bar": inputs},
+				vars := pipeline.NewVarsFrom(map[string]any{
+					"foo": map[string]any{"bar": inputs},
 				})
 				task := pipeline.MeanTask{
 					BaseTask:      pipeline.NewBaseTask(0, "task", nil, nil, 0),
@@ -153,7 +152,7 @@ func TestMeanTask(t *testing.T) {
 					AllowedFaults: test.allowedFaults,
 					Precision:     test.precision,
 				}
-				output, runInfo := task.Run(testutils.Context(t), logger.TestLogger(t), vars, nil)
+				output, runInfo := task.Run(t.Context(), logger.TestLogger(t), vars, nil)
 				assert.False(t, runInfo.IsPending)
 				assert.False(t, runInfo.IsRetryable)
 				if output.Error != nil {
@@ -165,7 +164,7 @@ func TestMeanTask(t *testing.T) {
 				}
 			})
 			t.Run("with json vars", func(t *testing.T) {
-				var inputs []interface{}
+				var inputs []any
 				for _, input := range test.inputs {
 					if input.Error != nil {
 						inputs = append(inputs, input.Error)
@@ -181,16 +180,16 @@ func TestMeanTask(t *testing.T) {
 					vars = pipeline.NewVarsFrom(nil)
 				case 1:
 					valuesParam = "[ $(foo) ]"
-					vars = pipeline.NewVarsFrom(map[string]interface{}{"foo": inputs[0]})
+					vars = pipeline.NewVarsFrom(map[string]any{"foo": inputs[0]})
 				case 2:
 					valuesParam = "[ $(foo), $(bar) ]"
-					vars = pipeline.NewVarsFrom(map[string]interface{}{"foo": inputs[0], "bar": inputs[1]})
+					vars = pipeline.NewVarsFrom(map[string]any{"foo": inputs[0], "bar": inputs[1]})
 				case 3:
 					valuesParam = "[ $(foo), $(bar), $(chain) ]"
-					vars = pipeline.NewVarsFrom(map[string]interface{}{"foo": inputs[0], "bar": inputs[1], "chain": inputs[2]})
+					vars = pipeline.NewVarsFrom(map[string]any{"foo": inputs[0], "bar": inputs[1], "chain": inputs[2]})
 				case 4:
 					valuesParam = "[ $(foo), $(bar), $(chain), $(link) ]"
-					vars = pipeline.NewVarsFrom(map[string]interface{}{"foo": inputs[0], "bar": inputs[1], "chain": inputs[2], "link": inputs[3]})
+					vars = pipeline.NewVarsFrom(map[string]any{"foo": inputs[0], "bar": inputs[1], "chain": inputs[2], "link": inputs[3]})
 				}
 
 				task := pipeline.MeanTask{
@@ -199,7 +198,7 @@ func TestMeanTask(t *testing.T) {
 					AllowedFaults: test.allowedFaults,
 					Precision:     test.precision,
 				}
-				output, runInfo := task.Run(testutils.Context(t), logger.TestLogger(t), vars, nil)
+				output, runInfo := task.Run(t.Context(), logger.TestLogger(t), vars, nil)
 				assert.False(t, runInfo.IsPending)
 				assert.False(t, runInfo.IsRetryable)
 				if output.Error != nil {

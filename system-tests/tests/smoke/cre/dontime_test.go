@@ -1,0 +1,42 @@
+package cre
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	commonevents "github.com/smartcontractkit/chainlink-protos/workflows/go/common"
+	workfloweventsv2 "github.com/smartcontractkit/chainlink-protos/workflows/go/v2"
+	"github.com/smartcontractkit/chainlink-testing-framework/framework"
+	crontypes "github.com/smartcontractkit/chainlink/core/scripts/cre/environment/examples/workflows/cron/types"
+	t_helpers "github.com/smartcontractkit/chainlink/system-tests/tests/test-helpers"
+	ttypes "github.com/smartcontractkit/chainlink/system-tests/tests/test-helpers/configuration"
+)
+
+func ExecuteDonTimeTest(t *testing.T, testEnv *ttypes.TestEnvironment) {
+	testLogger := framework.L
+	workflowFileLocation := "../../../../core/scripts/cre/environment/examples/workflows/time_consensus/main.go"
+	workflowName := t_helpers.UniqueWorkflowName(testEnv, "timechipingressstack")
+
+	userLogsCh := make(chan *workfloweventsv2.WorkflowUserLog, 1000)
+	baseMessageCh := make(chan *commonevents.BaseMessage, 1000)
+
+	server := t_helpers.StartChipTestSink(t, t_helpers.GetPublishFn(testLogger, userLogsCh, baseMessageCh))
+
+	t.Cleanup(func() {
+		// can't use t.Context() here because it will have been cancelled before the cleanup function is called
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		t_helpers.ShutdownChipSinkWithDrain(ctx, server, userLogsCh, baseMessageCh)
+	})
+
+	testLogger.Info().Msg("Creating Cron workflow configuration file...")
+	workflowConfig := crontypes.WorkflowConfig{
+		Schedule: "*/30 * * * * *", // every 30 seconds
+	}
+	workflowID := t_helpers.CompileAndDeployWorkflow(t, testEnv, testLogger, workflowName, &workflowConfig, workflowFileLocation)
+
+	expectedChipIngressStackLog := "Verified consensus on DON Time"
+	t_helpers.WatchWorkflowLogs(t, testLogger, userLogsCh, baseMessageCh, t_helpers.WorkflowEngineInitErrorLog, expectedChipIngressStackLog, 2*time.Minute, t_helpers.WithUserLogWorkflowID(workflowID))
+	testLogger.Info().Msg("DON Time test completed")
+}

@@ -14,18 +14,18 @@ import (
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
 
-	txmgrcommon "github.com/smartcontractkit/chainlink/v2/common/txmgr"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/txmgr"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/blockhash_store"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/trusted_blockhash_store"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/generated/blockhash_store"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/generated/trusted_blockhash_store"
+	evmkeystore "github.com/smartcontractkit/chainlink-evm/pkg/keys"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr"
+	"github.com/smartcontractkit/chainlink-evm/pkg/types"
+	txmgrcommon "github.com/smartcontractkit/chainlink-framework/chains/txmgr"
 )
 
 var _ BHS = &BulletproofBHS{}
 
 type bpBHSConfig interface {
-	LimitDefault() uint32
+	LimitDefault() uint64
 }
 
 type bpBHSDatabaseConfig interface {
@@ -38,26 +38,24 @@ type BulletproofBHS struct {
 	config        bpBHSConfig
 	dbConfig      bpBHSDatabaseConfig
 	jobID         uuid.UUID
-	fromAddresses []ethkey.EIP55Address
+	fromAddresses []types.EIP55Address
 	txm           txmgr.TxManager
 	abi           *abi.ABI
 	trustedAbi    *abi.ABI
 	bhs           blockhash_store.BlockhashStoreInterface
 	trustedBHS    *trusted_blockhash_store.TrustedBlockhashStore
-	chainID       *big.Int
-	gethks        keystore.Eth
+	gethks        evmkeystore.RoundRobin
 }
 
 // NewBulletproofBHS creates a new instance with the given transaction manager and blockhash store.
 func NewBulletproofBHS(
 	config bpBHSConfig,
 	dbConfig bpBHSDatabaseConfig,
-	fromAddresses []ethkey.EIP55Address,
+	fromAddresses []types.EIP55Address,
 	txm txmgr.TxManager,
 	bhs blockhash_store.BlockhashStoreInterface,
 	trustedBHS *trusted_blockhash_store.TrustedBlockhashStore,
-	chainID *big.Int,
-	gethks keystore.Eth,
+	gethks evmkeystore.RoundRobin,
 ) (*BulletproofBHS, error) {
 	bhsABI, err := blockhash_store.BlockhashStoreMetaData.GetAbi()
 	if err != nil {
@@ -79,7 +77,6 @@ func NewBulletproofBHS(
 		trustedAbi:    trustedBHSAbi,
 		bhs:           bhs,
 		trustedBHS:    trustedBHS,
-		chainID:       chainID,
 		gethks:        gethks,
 	}, nil
 }
@@ -91,7 +88,7 @@ func (c *BulletproofBHS) Store(ctx context.Context, blockNum uint64) error {
 		return errors.Wrap(err, "packing args")
 	}
 
-	fromAddress, err := c.gethks.GetRoundRobinAddress(c.chainID, SendingKeys(c.fromAddresses)...)
+	fromAddress, err := c.gethks.GetNextAddress(ctx, SendingKeys(c.fromAddresses)...)
 	if err != nil {
 		return errors.Wrap(err, "getting next from address")
 	}
@@ -104,7 +101,7 @@ func (c *BulletproofBHS) Store(ctx context.Context, blockNum uint64) error {
 
 		// Set a queue size of 256. At most we store the blockhash of every block, and only the
 		// latest 256 can possibly be stored.
-		Strategy: txmgrcommon.NewQueueingTxStrategy(c.jobID, 256, c.dbConfig.DefaultQueryTimeout()),
+		Strategy: txmgrcommon.NewQueueingTxStrategy(c.jobID, 256),
 	})
 	if err != nil {
 		return errors.Wrap(err, "creating transaction")
@@ -121,7 +118,7 @@ func (c *BulletproofBHS) StoreTrusted(
 	recentBlockhash common.Hash,
 ) error {
 	// Convert and pack arguments for a "storeTrusted" function call to the trusted BHS.
-	var blockNumsBig []*big.Int
+	blockNumsBig := make([]*big.Int, 0, len(blockNums))
 	for _, b := range blockNums {
 		blockNumsBig = append(blockNumsBig, new(big.Int).SetUint64(b))
 	}
@@ -132,7 +129,7 @@ func (c *BulletproofBHS) StoreTrusted(
 	}
 
 	// Create a transaction from the given batch and send it to the TXM.
-	fromAddress, err := c.gethks.GetRoundRobinAddress(c.chainID, SendingKeys(c.fromAddresses)...)
+	fromAddress, err := c.gethks.GetNextAddress(ctx, SendingKeys(c.fromAddresses)...)
 	if err != nil {
 		return errors.Wrap(err, "getting next from address")
 	}
@@ -159,9 +156,9 @@ func (c *BulletproofBHS) IsTrusted() bool {
 func (c *BulletproofBHS) IsStored(ctx context.Context, blockNum uint64) (bool, error) {
 	var err error
 	if c.IsTrusted() {
-		_, err = c.trustedBHS.GetBlockhash(&bind.CallOpts{Context: ctx}, big.NewInt(int64(blockNum)))
+		_, err = c.trustedBHS.GetBlockhash(&bind.CallOpts{Context: ctx}, big.NewInt(0).SetUint64(blockNum))
 	} else {
-		_, err = c.bhs.GetBlockhash(&bind.CallOpts{Context: ctx}, big.NewInt(int64(blockNum)))
+		_, err = c.bhs.GetBlockhash(&bind.CallOpts{Context: ctx}, big.NewInt(0).SetUint64(blockNum))
 	}
 	if err != nil && strings.Contains(err.Error(), "reverted") {
 		// Transaction reverted because the blockhash is not stored
@@ -173,7 +170,7 @@ func (c *BulletproofBHS) IsStored(ctx context.Context, blockNum uint64) (bool, e
 }
 
 func (c *BulletproofBHS) sendingKeys() []common.Address {
-	var keys []common.Address
+	keys := make([]common.Address, 0, len(c.fromAddresses))
 	for _, a := range c.fromAddresses {
 		keys = append(keys, a.Address())
 	}
@@ -186,7 +183,7 @@ func (c *BulletproofBHS) StoreEarliest(ctx context.Context) error {
 		return errors.Wrap(err, "packing args")
 	}
 
-	fromAddress, err := c.gethks.GetRoundRobinAddress(c.chainID, c.sendingKeys()...)
+	fromAddress, err := c.gethks.GetNextAddress(ctx, c.sendingKeys()...)
 	if err != nil {
 		return errors.Wrap(err, "getting next from address")
 	}

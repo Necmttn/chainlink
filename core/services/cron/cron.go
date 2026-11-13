@@ -6,9 +6,8 @@ import (
 
 	"github.com/robfig/cron/v3"
 
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink-common/pkg/services"
-
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 )
@@ -26,12 +25,15 @@ type Cron struct {
 func NewCronFromJobSpec(
 	jobSpec job.Job,
 	pipelineRunner pipeline.Runner,
-	logger logger.Logger,
+	lggr logger.Logger,
 ) (*Cron, error) {
-	cronLogger := logger.Named("Cron").With(
+	cronLogger := logger.With(logger.Named(lggr, "Cron"),
 		"jobID", jobSpec.ID,
 		"schedule", jobSpec.CronSpec.CronSchedule,
 	)
+	if id := jobSpec.CronSpec.EVMChainID; id != nil {
+		cronLogger = logger.With(cronLogger, "evmChainID", id)
+	}
 
 	return &Cron{
 		cronRunner:     cronRunner(),
@@ -48,7 +50,7 @@ func (cr *Cron) Start(context.Context) error {
 
 	_, err := cr.cronRunner.AddFunc(cr.jobSpec.CronSpec.CronSchedule, cr.runPipeline)
 	if err != nil {
-		cr.logger.Errorw(fmt.Sprintf("Error running cron job %d", cr.jobSpec.ID), "err", err, "schedule", cr.jobSpec.CronSpec.CronSchedule, "jobID", cr.jobSpec.ID)
+		cr.logger.Errorw(fmt.Sprintf("Error running cron job %d", cr.jobSpec.ID), "err", err)
 		return err
 	}
 	cr.cronRunner.Start()
@@ -67,20 +69,25 @@ func (cr *Cron) runPipeline() {
 	ctx, cancel := cr.chStop.NewCtx()
 	defer cancel()
 
-	vars := pipeline.NewVarsFrom(map[string]interface{}{
-		"jobSpec": map[string]interface{}{
-			"databaseID":    cr.jobSpec.ID,
-			"externalJobID": cr.jobSpec.ExternalJobID,
-			"name":          cr.jobSpec.Name.ValueOrZero(),
-		},
-		"jobRun": map[string]interface{}{
-			"meta": map[string]interface{}{},
+	jobSpec := map[string]any{
+		"databaseID":    cr.jobSpec.ID,
+		"externalJobID": cr.jobSpec.ExternalJobID,
+		"name":          cr.jobSpec.Name.ValueOrZero(),
+	}
+	if id := cr.jobSpec.CronSpec.EVMChainID; id != nil {
+		jobSpec["evmChainID"] = id.String()
+	}
+
+	vars := pipeline.NewVarsFrom(map[string]any{
+		"jobSpec": jobSpec,
+		"jobRun": map[string]any{
+			"meta": map[string]any{},
 		},
 	})
 
 	run := pipeline.NewRun(*cr.jobSpec.PipelineSpec, vars)
 
-	_, err := cr.pipelineRunner.Run(ctx, run, cr.logger, false, nil)
+	_, err := cr.pipelineRunner.Run(ctx, run, false, nil)
 	if err != nil {
 		cr.logger.Errorf("Error executing new run for jobSpec ID %v", cr.jobSpec.ID)
 	}

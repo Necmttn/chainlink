@@ -5,28 +5,39 @@ import (
 	"os"
 	"strings"
 
-	"github.com/smartcontractkit/chainlink/v2/core/store/models"
+	"github.com/smartcontractkit/chainlink-common/pkg/config"
 )
 
 var (
 	Config                       = Var("CL_CONFIG")
+	DockerTag                    = Var("CL_DOCKER_TAG")
 	DatabaseAllowSimplePasswords = Var("CL_DATABASE_ALLOW_SIMPLE_PASSWORDS")
-	DatabaseURL                  = Secret("CL_DATABASE_URL")
-	DatabaseBackupURL            = Secret("CL_DATABASE_BACKUP_URL")
-	PasswordKeystore             = Secret("CL_PASSWORD_KEYSTORE")
-	PasswordVRF                  = Secret("CL_PASSWORD_VRF")
-	PyroscopeAuthToken           = Secret("CL_PYROSCOPE_AUTH_TOKEN")
-	PrometheusAuthToken          = Secret("CL_PROMETHEUS_AUTH_TOKEN")
-	ThresholdKeyShare            = Secret("CL_THRESHOLD_KEY_SHARE")
+	IgnorePrereleaseVersionCheck = Var("CL_IGNORE_PRE_RELEASE_VERSION_CHECK")
+	SkipAppVersionCheck          = Var("CL_SKIP_APP_VERSION_CHECK")
+
+	DatabaseURL         = Secret("CL_DATABASE_URL")
+	DatabaseBackupURL   = Secret("CL_DATABASE_BACKUP_URL")
+	PasswordKeystore    = Secret("CL_PASSWORD_KEYSTORE")
+	PasswordVRF         = Secret("CL_PASSWORD_VRF")
+	PyroscopeAuthToken  = Secret("CL_PYROSCOPE_AUTH_TOKEN")
+	PrometheusAuthToken = Secret("CL_PROMETHEUS_AUTH_TOKEN")
+	ThresholdKeyShare   = Secret("CL_THRESHOLD_KEY_SHARE")
 	// Migrations env vars
 	EVMChainIDNotNullMigration0195 = "CL_EVM_CHAINID_NOT_NULL_MIGRATION_0195"
 )
 
 // LOOPP commands and vars
 var (
-	MedianPlugin   = NewPlugin("median")
-	SolanaPlugin   = NewPlugin("solana")
-	StarknetPlugin = NewPlugin("starknet")
+	MedianPlugin       = NewPlugin("median")
+	AptosPlugin        = NewPlugin("aptos")
+	EVMPlugin          = NewPlugin("evm")
+	SolanaPlugin       = NewPlugin("solana")
+	StarknetPlugin     = NewPlugin("starknet")
+	TronPlugin         = NewPlugin("tron")
+	TONPlugin          = NewPlugin("ton")
+	SuiPlugin          = NewPlugin("sui")
+	StellarPlugin      = NewPlugin("stellar")
+	CapabilitiesPlugin = NewPlugin("capabilities")
 	// PrometheusDiscoveryHostName is the externally accessible hostname
 	// published by the node in the `/discovery` endpoint. Generally, it is expected to match
 	// the public hostname of node.
@@ -55,11 +66,13 @@ func (e Var) IsTrue() bool { return strings.ToLower(e.Get()) == "true" }
 
 type Secret string
 
-func (e Secret) Get() models.Secret { return models.Secret(os.Getenv(string(e))) }
+func (e Secret) Get() config.SecretString { return config.SecretString(os.Getenv(string(e))) }
 
 type Plugin struct {
 	Cmd Var
 	Env Var
+
+	CmdDefault string
 }
 
 func NewPlugin(kind string) Plugin {
@@ -67,5 +80,7 @@ func NewPlugin(kind string) Plugin {
 	return Plugin{
 		Cmd: Var(fmt.Sprintf("CL_%s_CMD", kind)),
 		Env: Var(fmt.Sprintf("CL_%s_ENV", kind)),
+
+		CmdDefault: "chainlink-" + strings.ToLower(kind),
 	}
 }

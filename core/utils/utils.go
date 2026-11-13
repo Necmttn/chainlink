@@ -6,14 +6,16 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha3"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"math"
 	mrand "math/rand"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,7 +26,6 @@ import (
 	pkgerrors "github.com/pkg/errors"
 	"github.com/robfig/cron/v3"
 	"golang.org/x/crypto/bcrypt"
-	"golang.org/x/crypto/sha3"
 
 	ragep2ptypes "github.com/smartcontractkit/libocr/ragep2p/types"
 
@@ -53,12 +54,14 @@ func ISO8601UTC(t time.Time) string {
 
 // DurationFromNow returns the amount of time since the Time
 // field was last updated.
+//
+// Deprecated: Use [time.Until].
 func DurationFromNow(t time.Time) time.Duration {
 	return time.Until(t)
 }
 
 // FormatJSON applies indent to format a JSON response.
-func FormatJSON(v interface{}) ([]byte, error) {
+func FormatJSON(v any) ([]byte, error) {
 	return json.MarshalIndent(v, "", "  ")
 }
 
@@ -105,14 +108,14 @@ func IsEmpty(bytes []byte) bool {
 }
 
 // UnmarshalToMap takes an input json string and returns a map[string]interface i.e. a raw object
-func UnmarshalToMap(input string) (map[string]interface{}, error) {
-	var output map[string]interface{}
+func UnmarshalToMap(input string) (map[string]any, error) {
+	var output map[string]any
 	err := json.Unmarshal([]byte(input), &output)
 	return output, err
 }
 
 // MustUnmarshalToMap performs UnmarshalToMap, panics upon failure
-func MustUnmarshalToMap(input string) map[string]interface{} {
+func MustUnmarshalToMap(input string) map[string]any {
 	output, err := UnmarshalToMap(input)
 	if err != nil {
 		panic(err)
@@ -134,7 +137,7 @@ func CheckPasswordHash(password, hash string) bool {
 
 // Sha256 returns a hexadecimal encoded string of a hashed input
 func Sha256(in string) (string, error) {
-	hasher := sha3.New256()
+	hasher := hash.Hash(sha3.New256())
 	_, err := hasher.Write([]byte(in))
 	if err != nil {
 		return "", pkgerrors.Wrap(err, "sha256 write error")
@@ -143,21 +146,24 @@ func Sha256(in string) (string, error) {
 }
 
 // WithCloseChan wraps a context so that it is canceled if the passed in channel is closed.
+//
 // Deprecated: Call [services.StopChan.Ctx] directly
 func WithCloseChan(parentCtx context.Context, chStop chan struct{}) (context.Context, context.CancelFunc) {
 	return services.StopChan(chStop).Ctx(parentCtx)
 }
 
 // ContextFromChan creates a context that finishes when the provided channel receives or is closed.
+//
 // Deprecated: Call [services.StopChan.NewCtx] directly.
 func ContextFromChan(chStop chan struct{}) (context.Context, context.CancelFunc) {
 	return services.StopChan(chStop).NewCtx()
 }
 
 // ContextFromChanWithTimeout creates a context with a timeout that finishes when the provided channel receives or is closed.
+//
 // Deprecated: Call [services.StopChan.CtxCancel] directly
 func ContextFromChanWithTimeout(chStop chan struct{}, timeout time.Duration) (context.Context, context.CancelFunc) {
-	return services.StopChan(chStop).CtxCancel(context.WithTimeout(context.Background(), timeout))
+	return services.StopChan(chStop).CtxWithTimeout(timeout)
 }
 
 // Deprecated: use services.StopChan
@@ -229,12 +235,12 @@ type BoundedPriorityQueue[T any] struct {
 // NewBoundedPriorityQueue creates a new BoundedPriorityQueue
 func NewBoundedPriorityQueue[T any](capacities map[uint]int) *BoundedPriorityQueue[T] {
 	queues := make(map[uint]*BoundedQueue[T])
-	var priorities []uint
+	priorities := make([]uint, 0, len(capacities))
 	for priority, capacity := range capacities {
 		priorities = append(priorities, priority)
 		queues[priority] = NewBoundedQueue[T](capacity)
 	}
-	sort.Slice(priorities, func(i, j int) bool { return priorities[i] < priorities[j] })
+	slices.Sort(priorities)
 	bpq := BoundedPriorityQueue[T]{
 		queues:     queues,
 		priorities: priorities,
@@ -382,21 +388,22 @@ func (t *CronTicker) Start() bool {
 func (t *CronTicker) Stop() bool {
 	if t.Cron != nil {
 		if t.beenRun.CompareAndSwap(true, false) {
-			t.Cron.Stop()
+			ctx := t.Cron.Stop()
+			<-ctx.Done() // Wait for background routines
 			return true
 		}
 	}
 	return false
 }
 
-// Ticks returns the underlying chanel.
+// Ticks returns the underlying channel.
 func (t *CronTicker) Ticks() <-chan time.Time {
 	return t.ch
 }
 
 // ValidateCronSchedule returns an error if the given schedule is invalid.
 func ValidateCronSchedule(schedule string) error {
-	if !(strings.HasPrefix(schedule, "CRON_TZ=") || strings.HasPrefix(schedule, "@every ")) {
+	if !strings.HasPrefix(schedule, "CRON_TZ=") && !strings.HasPrefix(schedule, "@every ") {
 		return errors.New("cron schedule must specify a time zone using CRON_TZ, e.g. 'CRON_TZ=UTC 5 * * * *', or use the @every syntax, e.g. '@every 1h30m'")
 	}
 	parser := cron.NewParser(cron.SecondOptional | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
@@ -448,12 +455,8 @@ func (t *ResettableTimer) Reset(duration time.Duration) {
 	t.timer = time.NewTimer(duration)
 }
 
-var (
-	ErrAlreadyStopped      = errors.New("already stopped")
-	ErrCannotStopUnstarted = errors.New("cannot stop unstarted service")
-)
-
 // StartStopOnce contains a StartStopOnceState integer
+//
 // Deprecated: use services.StateMachine
 type StartStopOnce = services.StateMachine
 
@@ -464,10 +467,10 @@ func WithJitter(d time.Duration) time.Duration {
 		return 0
 	}
 	// ensure non-zero arg to Intn to avoid panic
-	max := math.Max(float64(d.Abs())/5.0, 1.)
+	maxVal := math.Max(float64(d.Abs())/5.0, 1.)
 	// #nosec - non critical randomness
-	jitter := mrand.Intn(int(max))
-	jitter = jitter - (jitter / 2)
+	jitter := mrand.Intn(int(maxVal))
+	jitter -= (jitter / 2)
 	return time.Duration(int(d) + jitter)
 }
 
@@ -479,49 +482,6 @@ func NewRedialBackoff() backoff.Backoff {
 		Max:    15 * time.Second,
 		Jitter: true,
 	}
-
-}
-
-// KeyedMutex allows to lock based on particular values
-type KeyedMutex struct {
-	mutexes sync.Map
-}
-
-// LockInt64 locks the value for read/write
-func (m *KeyedMutex) LockInt64(key int64) func() {
-	value, _ := m.mutexes.LoadOrStore(key, new(sync.Mutex))
-	mtx := value.(*sync.Mutex)
-	mtx.Lock()
-
-	return mtx.Unlock
-}
-
-// BoxOutput formats its arguments as fmt.Printf, and encloses them in a box of
-// arrows pointing at their content, in order to better highlight it. See
-// ExampleBoxOutput
-func BoxOutput(errorMsgTemplate string, errorMsgValues ...interface{}) string {
-	errorMsgTemplate = fmt.Sprintf(errorMsgTemplate, errorMsgValues...)
-	lines := strings.Split(errorMsgTemplate, "\n")
-	maxlen := 0
-	for _, line := range lines {
-		if len(line) > maxlen {
-			maxlen = len(line)
-		}
-	}
-	internalLength := maxlen + 4
-	output := "↘" + strings.Repeat("↓", internalLength) + "↙\n" // top line
-	output += "→  " + strings.Repeat(" ", maxlen) + "  ←\n"
-	readme := strings.Repeat("README ", maxlen/7)
-	output += "→  " + readme + strings.Repeat(" ", maxlen-len(readme)) + "  ←\n"
-	output += "→  " + strings.Repeat(" ", maxlen) + "  ←\n"
-	for _, line := range lines {
-		output += "→  " + line + strings.Repeat(" ", maxlen-len(line)) + "  ←\n"
-	}
-	output += "→  " + strings.Repeat(" ", maxlen) + "  ←\n"
-	output += "→  " + readme + strings.Repeat(" ", maxlen-len(readme)) + "  ←\n"
-	output += "→  " + strings.Repeat(" ", maxlen) + "  ←\n"
-	return "\n" + output + "↗" + strings.Repeat("↑", internalLength) + "↖" + // bottom line
-		"\n\n"
 }
 
 // ConcatBytes appends a bunch of byte arrays into a single byte array
@@ -568,30 +528,20 @@ func (eb *ErrorBuffer) Append(incoming error) {
 	eb.buffer = append(eb.buffer, incoming)
 }
 
-func (eb *ErrorBuffer) SetCap(cap int) {
+func (eb *ErrorBuffer) SetCap(capacity int) {
 	eb.mu.Lock()
 	defer eb.mu.Unlock()
-	if len(eb.buffer) > cap {
-		eb.buffer = eb.buffer[len(eb.buffer)-cap:]
+	if len(eb.buffer) > capacity {
+		eb.buffer = eb.buffer[len(eb.buffer)-capacity:]
 	}
-	eb.cap = cap
+	eb.cap = capacity
 }
 
 // UnwrapError returns a list of underlying errors if passed error implements joinedError or return the err in a single-element list otherwise.
-//
-//nolint:errorlint // error type checks will fail on wrapped errors. Disabled since we are not doing checks on error types.
 func UnwrapError(err error) []error {
 	joined, ok := err.(interface{ Unwrap() []error })
 	if !ok {
 		return []error{err}
 	}
 	return joined.Unwrap()
-}
-
-// DeleteUnstable destructively removes slice element at index i
-// It does no bounds checking and may re-order the slice
-func DeleteUnstable[T any](s []T, i int) []T {
-	s[i] = s[len(s)-1]
-	s = s[:len(s)-1]
-	return s
 }

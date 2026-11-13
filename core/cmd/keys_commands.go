@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,7 +11,6 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
-	"go.uber.org/multierr"
 
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
@@ -111,7 +111,7 @@ func (cli *keysClient[K, P, P2]) ListKeys(_ *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -127,7 +127,7 @@ func (cli *keysClient[K, P, P2]) CreateKey(_ *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -158,7 +158,7 @@ func (cli *keysClient[K, P, P2]) DeleteKey(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -195,7 +195,7 @@ func (cli *keysClient[K, P, P2]) ImportKey(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -233,7 +233,7 @@ func (cli *keysClient[K, P, P2]) ExportKey(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -251,7 +251,7 @@ func (cli *keysClient[K, P, P2]) ExportKey(c *cli.Context) (err error) {
 		return cli.errorOut(errors.Wrapf(err, "Could not write %v", filepath))
 	}
 
-	_, err = os.Stderr.WriteString(fmt.Sprintf("🔑 Exported %s key %s to %s\n", cli.typ, ID, filepath))
+	_, err = fmt.Fprintf(os.Stderr, "🔑 Exported %s key %s to %s\n", cli.typ, ID, filepath)
 	if err != nil {
 		return cli.errorOut(err)
 	}

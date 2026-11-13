@@ -1,0 +1,492 @@
+package v2
+
+import (
+	"database/sql"
+	"maps"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
+	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink/v2/core/services/job"
+)
+
+func Test_UpsertWorkflowSpec(t *testing.T) {
+	t.Parallel()
+	t.Run("inserts new spec", func(t *testing.T) {
+		t.Parallel()
+		db := pgtest.NewSqlxDB(t)
+		ctx := t.Context()
+		lggr := logger.TestLogger(t)
+		orm := &orm{ds: db, lggr: lggr}
+
+		spec := &job.WorkflowSpec{
+			Workflow:      "test_workflow",
+			Config:        "test_config",
+			WorkflowID:    "cid-upsert-insert",
+			WorkflowOwner: "owner-123",
+			WorkflowName:  "Test Workflow",
+			WorkflowTag:   "workflowTag",
+			Status:        job.WorkflowSpecStatusActive,
+			BinaryURL:     "http://example.com/binary",
+			ConfigURL:     "http://example.com/config",
+			CreatedAt:     time.Now(),
+			SpecType:      job.WASMFile,
+			StorageBytes:  12,
+		}
+
+		_, err := orm.UpsertWorkflowSpec(ctx, spec)
+		require.NoError(t, err)
+
+		// Verify the record exists in the database
+		var dbSpec job.WorkflowSpec
+		err = db.Get(&dbSpec, `SELECT * FROM workflow_specs_v2 WHERE workflow_owner = $1 AND workflow_name = $2 AND workflow_tag = $3`, spec.WorkflowOwner, spec.WorkflowName, spec.WorkflowTag)
+		require.NoError(t, err)
+		require.Equal(t, spec.Workflow, dbSpec.Workflow)
+		require.Equal(t, int64(12), dbSpec.StorageBytes, "storage_bytes must round-trip on insert")
+	})
+
+	t.Run("updates existing spec", func(t *testing.T) {
+		t.Parallel()
+		db := pgtest.NewSqlxDB(t)
+		ctx := t.Context()
+		lggr := logger.TestLogger(t)
+		orm := &orm{ds: db, lggr: lggr}
+
+		spec := &job.WorkflowSpec{
+			Workflow:      "test_workflow",
+			Config:        "test_config",
+			WorkflowID:    "cid-upsert-update",
+			WorkflowOwner: "owner-123",
+			WorkflowName:  "Test Workflow",
+			WorkflowTag:   "workflowTag",
+			Status:        job.WorkflowSpecStatusActive,
+			BinaryURL:     "http://example.com/binary",
+			ConfigURL:     "http://example.com/config",
+			CreatedAt:     time.Now(),
+			SpecType:      job.WASMFile,
+			StorageBytes:  12,
+		}
+
+		_, err := orm.UpsertWorkflowSpec(ctx, spec)
+		require.NoError(t, err)
+
+		// Update the status and the storage footprint
+		spec.Status = job.WorkflowSpecStatusPaused
+		spec.StorageBytes = 24
+
+		_, err = orm.UpsertWorkflowSpec(ctx, spec)
+		require.NoError(t, err)
+
+		// Verify the record is updated in the database
+		var dbSpec job.WorkflowSpec
+		err = db.Get(&dbSpec, `SELECT * FROM workflow_specs_v2 WHERE workflow_owner = $1 AND workflow_name = $2 AND workflow_tag = $3`, spec.WorkflowOwner, spec.WorkflowName, spec.WorkflowTag)
+		require.NoError(t, err)
+		require.Equal(t, spec.Config, dbSpec.Config)
+		require.Equal(t, spec.Status, dbSpec.Status)
+		require.Equal(t, int64(24), dbSpec.StorageBytes, "storage_bytes must round-trip on conflict-update")
+	})
+
+	t.Run("sets CreatedAt to current time if zero value is provided", func(t *testing.T) {
+		t.Parallel()
+		db := pgtest.NewSqlxDB(t)
+		ctx := t.Context()
+		lggr := logger.TestLogger(t)
+		orm := &orm{ds: db, lggr: lggr}
+
+		spec := &job.WorkflowSpec{
+			Workflow:      "test_workflow",
+			Config:        "test_config",
+			WorkflowID:    "cid-zero-time",
+			WorkflowOwner: "owner-123",
+			WorkflowName:  "Test Workflow",
+			WorkflowTag:   "workflowTag",
+			Status:        job.WorkflowSpecStatusActive,
+			SpecType:      job.WASMFile,
+			// Intentionally leaving CreatedAt as zero
+		}
+
+		startTime := time.Now().UTC()
+		_, err := orm.UpsertWorkflowSpec(ctx, spec)
+		require.NoError(t, err)
+
+		var dbSpec job.WorkflowSpec
+		err = db.Get(&dbSpec, `SELECT * FROM workflow_specs_v2 WHERE workflow_id = $1`, spec.WorkflowID)
+		require.NoError(t, err)
+
+		// Assert CreatedAt was populated correctly in the DB
+		require.False(t, dbSpec.CreatedAt.IsZero(), "CreatedAt should not be the zero time")
+		require.True(t, dbSpec.CreatedAt.After(startTime) || dbSpec.CreatedAt.Equal(startTime), "CreatedAt should be >= start time")
+		require.True(t, dbSpec.CreatedAt.Before(time.Now().UTC()), "CreatedAt should be <= current time")
+	})
+
+	t.Run("workflow is unique by workflow ID", func(t *testing.T) {
+		t.Parallel()
+		db := pgtest.NewSqlxDB(t)
+		ctx := t.Context()
+		lggr := logger.TestLogger(t)
+		orm := &orm{ds: db, lggr: lggr}
+
+		WFID1 := "cid-unique-1"
+		WFID2 := "cid-unique-2"
+		spec := &job.WorkflowSpec{
+			Workflow:      "test_workflow",
+			Config:        "test_config",
+			WorkflowID:    WFID1,
+			WorkflowOwner: "owner-123",
+			WorkflowName:  "Test Workflow",
+			WorkflowTag:   "workflowTag",
+			Status:        job.WorkflowSpecStatusActive,
+			BinaryURL:     "http://example.com/binary",
+			ConfigURL:     "http://example.com/config",
+			CreatedAt:     time.Now(),
+			SpecType:      job.WASMFile,
+		}
+
+		_, err := orm.UpsertWorkflowSpec(ctx, spec)
+		require.NoError(t, err)
+
+		// Verify the record exists in the database
+		var dbSpec job.WorkflowSpec
+		err = db.Get(&dbSpec, `SELECT * FROM workflow_specs_v2 WHERE workflow_owner = $1 AND workflow_name = $2 AND workflow_id = $3 AND workflow_tag = $4`, spec.WorkflowOwner, spec.WorkflowName, WFID1, spec.WorkflowTag)
+		require.NoError(t, err)
+		require.Equal(t, WFID1, dbSpec.WorkflowID)
+
+		// Create another entry with a different ID
+		spec.WorkflowID = WFID2
+		_, err = orm.UpsertWorkflowSpec(ctx, spec)
+		require.NoError(t, err)
+
+		// Verify the original record is still there
+		var dbSpec2 job.WorkflowSpec
+		err = db.Get(&dbSpec2, `SELECT * FROM workflow_specs_v2 WHERE workflow_owner = $1 AND workflow_name = $2 AND workflow_id = $3 AND workflow_tag = $4`, spec.WorkflowOwner, spec.WorkflowName, WFID1, spec.WorkflowTag)
+		require.NoError(t, err)
+		require.Equal(t, WFID1, dbSpec2.WorkflowID)
+
+		// Verify the new record is there
+		var dbSpec3 job.WorkflowSpec
+		err = db.Get(&dbSpec3, `SELECT * FROM workflow_specs_v2 WHERE workflow_owner = $1 AND workflow_name = $2 AND workflow_id = $3 AND workflow_tag = $4`, spec.WorkflowOwner, spec.WorkflowName, WFID2, spec.WorkflowTag)
+		require.NoError(t, err)
+		require.Equal(t, WFID2, dbSpec3.WorkflowID)
+	})
+}
+
+func Test_DeleteWorkflowSpec(t *testing.T) {
+	t.Parallel()
+	t.Run("deletes a workflow spec by ID", func(t *testing.T) {
+		t.Parallel()
+		db := pgtest.NewSqlxDB(t)
+		ctx := t.Context()
+		lggr := logger.TestLogger(t)
+		orm := &orm{ds: db, lggr: lggr}
+
+		spec := &job.WorkflowSpec{
+			Workflow:      "test_workflow",
+			Config:        "test_config",
+			WorkflowID:    "cid-delete",
+			WorkflowOwner: "owner-123",
+			WorkflowName:  "Test Workflow",
+			WorkflowTag:   "workflowTag",
+			Status:        job.WorkflowSpecStatusActive,
+			BinaryURL:     "http://example.com/binary",
+			ConfigURL:     "http://example.com/config",
+			CreatedAt:     time.Now(),
+			SpecType:      job.WASMFile,
+			RegisteredAt:  1717171717,
+			Source:        "ContractWorkflowSource",
+			StorageBytes:  12,
+		}
+
+		id, err := orm.UpsertWorkflowSpec(ctx, spec)
+		require.NoError(t, err)
+		require.NotZero(t, id)
+
+		deletedSpec, err := orm.DeleteWorkflowSpec(ctx, spec.WorkflowID)
+		require.NoError(t, err)
+		require.NotNil(t, deletedSpec)
+
+		// The RETURNING clause must scan the full row back: the caller derives
+		// the metering delete event_id from the row's persisted registered_at
+		// and releases the row's durable storage bytes.
+		assert.Equal(t, spec.WorkflowID, deletedSpec.WorkflowID)
+		assert.Equal(t, spec.WorkflowOwner, deletedSpec.WorkflowOwner)
+		assert.Equal(t, spec.WorkflowName, deletedSpec.WorkflowName)
+		assert.Equal(t, spec.WorkflowTag, deletedSpec.WorkflowTag)
+		assert.Equal(t, spec.Workflow, deletedSpec.Workflow)
+		assert.Equal(t, spec.Config, deletedSpec.Config)
+		assert.Equal(t, spec.Status, deletedSpec.Status)
+		assert.Equal(t, spec.BinaryURL, deletedSpec.BinaryURL)
+		assert.Equal(t, spec.ConfigURL, deletedSpec.ConfigURL)
+		assert.Equal(t, spec.SpecType, deletedSpec.SpecType)
+		assert.Equal(t, int64(1717171717), deletedSpec.RegisteredAt)
+		assert.Equal(t, "ContractWorkflowSource", deletedSpec.Source)
+		assert.Equal(t, int64(12), deletedSpec.StorageBytes)
+
+		// Verify the record is deleted from the database
+		var dbSpec job.WorkflowSpec
+		err = db.Get(&dbSpec, `SELECT * FROM workflow_specs_v2 WHERE id = $1`, id)
+		require.Error(t, err)
+		require.Equal(t, sql.ErrNoRows, err)
+	})
+
+	t.Run("returns false for non-existent workflow spec", func(t *testing.T) {
+		t.Parallel()
+		db := pgtest.NewSqlxDB(t)
+		ctx := t.Context()
+		lggr := logger.TestLogger(t)
+		orm := &orm{ds: db, lggr: lggr}
+
+		deletedSpec, err := orm.DeleteWorkflowSpec(ctx, "non-existent-workflow-id")
+		require.NoError(t, err)
+		assert.Nil(t, deletedSpec)
+	})
+}
+
+func Test_DeleteWorkflowSpecs(t *testing.T) {
+	t.Parallel()
+	db := pgtest.NewSqlxDB(t)
+	ctx := t.Context()
+	lggr := logger.TestLogger(t)
+	orm := &orm{ds: db, lggr: lggr}
+
+	specs := []struct {
+		id   string
+		name string
+	}{
+		{"del-wf-1", "Workflow 1"},
+		{"del-wf-2", "Workflow 2"},
+		{"del-wf-3", "Workflow 3"},
+	}
+	for _, s := range specs {
+		_, err := orm.UpsertWorkflowSpec(ctx, &job.WorkflowSpec{
+			Workflow:      "binary",
+			Config:        "config",
+			WorkflowID:    s.id,
+			WorkflowOwner: "owner",
+			WorkflowName:  s.name,
+			Status:        job.WorkflowSpecStatusActive,
+			CreatedAt:     time.Now(),
+			SpecType:      job.WASMFile,
+		})
+		require.NoError(t, err)
+	}
+
+	err := orm.DeleteWorkflowSpecs(ctx, []string{"del-wf-1", "del-wf-2"})
+	require.NoError(t, err)
+
+	_, err = orm.GetWorkflowSpec(ctx, "del-wf-1")
+	require.ErrorIs(t, err, sql.ErrNoRows)
+	_, err = orm.GetWorkflowSpec(ctx, "del-wf-2")
+	require.ErrorIs(t, err, sql.ErrNoRows)
+
+	got, err := orm.GetWorkflowSpec(ctx, "del-wf-3")
+	require.NoError(t, err)
+	require.Equal(t, "Workflow 3", got.WorkflowName)
+
+	// empty slice is a no-op
+	require.NoError(t, orm.DeleteWorkflowSpecs(ctx, []string{}))
+}
+
+func Test_PauseWorkflowSpec(t *testing.T) {
+	t.Parallel()
+	t.Run("tombstones the row: status paused, artifacts cleared, registered_at preserved", func(t *testing.T) {
+		t.Parallel()
+		db := pgtest.NewSqlxDB(t)
+		ctx := t.Context()
+		lggr := logger.TestLogger(t)
+		orm := &orm{ds: db, lggr: lggr}
+
+		_, err := orm.UpsertWorkflowSpec(ctx, &job.WorkflowSpec{
+			Workflow:      "test_workflow",
+			Config:        "test_config",
+			WorkflowID:    "cid-pause",
+			WorkflowOwner: "owner-123",
+			WorkflowName:  "Test Workflow",
+			Status:        job.WorkflowSpecStatusActive,
+			CreatedAt:     time.Now(),
+			SpecType:      job.WASMFile,
+			RegisteredAt:  1717171717,
+			StorageBytes:  12,
+		})
+		require.NoError(t, err)
+
+		require.NoError(t, orm.PauseWorkflowSpec(ctx, "cid-pause"))
+
+		paused, err := orm.GetWorkflowSpec(ctx, "cid-pause")
+		require.NoError(t, err)
+		assert.Equal(t, job.WorkflowSpecStatusPaused, paused.Status)
+		assert.Empty(t, paused.Workflow, "artifact payload must be cleared")
+		assert.Empty(t, paused.Config, "config payload must be cleared")
+		assert.Equal(t, int64(1717171717), paused.RegisteredAt, "registration generation must survive the tombstone")
+		assert.Equal(t, int64(12), paused.StorageBytes, "storage_bytes must survive the tombstone so the delete-time metering delta releases the registered footprint")
+		assert.Equal(t, "owner-123", paused.WorkflowOwner)
+
+		// Idempotent: pausing again is a no-op.
+		require.NoError(t, orm.PauseWorkflowSpec(ctx, "cid-pause"))
+	})
+
+	t.Run("pausing an absent row is a no-op", func(t *testing.T) {
+		t.Parallel()
+		db := pgtest.NewSqlxDB(t)
+		lggr := logger.TestLogger(t)
+		orm := &orm{ds: db, lggr: lggr}
+
+		require.NoError(t, orm.PauseWorkflowSpec(t.Context(), "non-existent-workflow-id"))
+	})
+}
+
+func Test_ListWorkflowSpecs(t *testing.T) {
+	t.Parallel()
+	db := pgtest.NewSqlxDB(t)
+	ctx := t.Context()
+	lggr := logger.TestLogger(t)
+	orm := &orm{ds: db, lggr: lggr}
+
+	want := map[string]struct {
+		owner        string
+		registeredAt int64
+		source       string
+		storageBytes int64
+	}{
+		"list-wf-1": {"owner-1", 100, "ContractWorkflowSource", 12},
+		"list-wf-2": {"owner-2", 200, "GRPCWorkflowSource", 34},
+		"list-wf-3": {"owner-3", 0, "", 0}, // pre-migration row: registered_at, source and storage_bytes defaulted
+	}
+	for _, id := range slices.Sorted(maps.Keys(want)) { // fixed order avoids unique-index deadlocks
+		w := want[id]
+		_, err := orm.UpsertWorkflowSpec(ctx, &job.WorkflowSpec{
+			Workflow:      "binary",
+			Config:        "config",
+			WorkflowID:    id,
+			WorkflowOwner: w.owner,
+			WorkflowName:  "wf",
+			Status:        job.WorkflowSpecStatusActive,
+			CreatedAt:     time.Now(),
+			SpecType:      job.WASMFile,
+			RegisteredAt:  w.registeredAt,
+			Source:        w.source,
+			StorageBytes:  w.storageBytes,
+		})
+		require.NoError(t, err)
+	}
+
+	specs, err := orm.ListWorkflowSpecs(ctx)
+	require.NoError(t, err)
+	require.Len(t, specs, len(want))
+	for _, spec := range specs {
+		w, ok := want[spec.WorkflowID]
+		require.True(t, ok, "unexpected workflow_id %q", spec.WorkflowID)
+		assert.Equal(t, w.owner, spec.WorkflowOwner)
+		assert.Equal(t, w.registeredAt, spec.RegisteredAt)
+		assert.Equal(t, w.source, spec.Source)
+		assert.Equal(t, w.storageBytes, spec.StorageBytes, "the metering snapshot projection must include storage_bytes")
+		// The projection deliberately omits the heavy artifact columns.
+		assert.Empty(t, spec.Workflow)
+		assert.Empty(t, spec.Config)
+	}
+}
+
+func Test_GetWorkflowSpec(t *testing.T) {
+	t.Parallel()
+	t.Run("gets a workflow spec by ID", func(t *testing.T) {
+		t.Parallel()
+		db := pgtest.NewSqlxDB(t)
+		ctx := t.Context()
+		lggr := logger.TestLogger(t)
+		orm := &orm{ds: db, lggr: lggr}
+
+		spec := &job.WorkflowSpec{
+			Workflow:      "test_workflow",
+			Config:        "test_config",
+			WorkflowID:    "cid-get",
+			WorkflowOwner: "owner-123",
+			WorkflowName:  "Test Workflow",
+			WorkflowTag:   "workflowTag",
+			Status:        job.WorkflowSpecStatusActive,
+			BinaryURL:     "http://example.com/binary",
+			ConfigURL:     "http://example.com/config",
+			CreatedAt:     time.Now(),
+			SpecType:      job.WASMFile,
+		}
+
+		id, err := orm.UpsertWorkflowSpec(ctx, spec)
+		require.NoError(t, err)
+		require.NotZero(t, id)
+
+		dbSpec, err := orm.GetWorkflowSpec(ctx, spec.WorkflowID)
+		require.NoError(t, err)
+		require.Equal(t, spec.Workflow, dbSpec.Workflow)
+
+		_, err = orm.DeleteWorkflowSpec(ctx, spec.WorkflowID)
+		require.NoError(t, err)
+	})
+
+	t.Run("fails if no workflow spec exists", func(t *testing.T) {
+		t.Parallel()
+		db := pgtest.NewSqlxDB(t)
+		ctx := t.Context()
+		lggr := logger.TestLogger(t)
+		orm := &orm{ds: db, lggr: lggr}
+
+		dbSpec, err := orm.GetWorkflowSpec(ctx, "inexistent-workflow-id")
+		require.Error(t, err)
+		require.Nil(t, dbSpec)
+	})
+}
+
+func Test_SaveTriggerSubscriptions(t *testing.T) {
+	t.Parallel()
+
+	t.Run("persists and round-trips the payload", func(t *testing.T) {
+		t.Parallel()
+		db := pgtest.NewSqlxDB(t)
+		ctx := t.Context()
+		lggr := logger.TestLogger(t)
+		orm := &orm{ds: db, lggr: lggr}
+
+		spec := &job.WorkflowSpec{
+			Workflow:      "test_workflow",
+			Config:        "test_config",
+			WorkflowID:    "cid-trigger-subs",
+			WorkflowOwner: "owner-123",
+			WorkflowName:  "Test Workflow",
+			WorkflowTag:   "workflowTag",
+			Status:        job.WorkflowSpecStatusActive,
+			CreatedAt:     time.Now(),
+			SpecType:      job.WASMFile,
+		}
+		_, err := orm.UpsertWorkflowSpec(ctx, spec)
+		require.NoError(t, err)
+
+		payload := []byte("marshaled-trigger-subscriptions")
+		require.NoError(t, orm.SaveTriggerSubscriptions(ctx, spec.WorkflowID, payload))
+
+		dbSpec, err := orm.GetWorkflowSpec(ctx, spec.WorkflowID)
+		require.NoError(t, err)
+		require.Equal(t, payload, dbSpec.TriggerSubscriptions)
+
+		// A subsequent UpsertWorkflowSpec (e.g. a status flip) must not clobber
+		// the cached payload: it isn't in the upsert's column list.
+		spec.Status = job.WorkflowSpecStatusPaused
+		_, err = orm.UpsertWorkflowSpec(ctx, spec)
+		require.NoError(t, err)
+
+		dbSpec, err = orm.GetWorkflowSpec(ctx, spec.WorkflowID)
+		require.NoError(t, err)
+		require.Equal(t, payload, dbSpec.TriggerSubscriptions, "trigger_subscriptions must survive an unrelated upsert")
+	})
+
+	t.Run("no-op when the workflow ID doesn't exist", func(t *testing.T) {
+		t.Parallel()
+		db := pgtest.NewSqlxDB(t)
+		ctx := t.Context()
+		lggr := logger.TestLogger(t)
+		orm := &orm{ds: db, lggr: lggr}
+
+		require.NoError(t, orm.SaveTriggerSubscriptions(ctx, "inexistent-workflow-id", []byte("payload")))
+	})
+}

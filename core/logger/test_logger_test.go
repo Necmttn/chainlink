@@ -27,7 +27,7 @@ func TestTestLogger(t *testing.T) {
 	log := logs[0]
 	assert.Equal(t, zap.WarnLevel, log.Level)
 	assert.Equal(t, testMessage, log.Message)
-	assert.Equal(t, "", log.LoggerName)
+	assert.Empty(t, log.LoggerName)
 	ver := log.ContextMap()["version"]
 	assert.Contains(t, ver, "@")
 
@@ -48,16 +48,16 @@ func TestTestLogger(t *testing.T) {
 	assert.Equal(t, serviceName, log.LoggerName)
 	assert.Equal(t, value, log.ContextMap()[key])
 	assert.Contains(t, log.Caller.String(), "core/logger/test_logger_test.go")
-	assert.Equal(t, log.Caller.Line, 41)
+	assert.Equal(t, 41, log.Caller.Line)
 
 	const (
 		workerName           = "WorkerName"
 		workerMessage        = "Did some work"
-		idKey, workerId      = "workerId", "42"
+		idKey, workerID      = "workerId", "42"
 		resultKey, resultVal = "result", "success"
 	)
-	wrkLgr := srvLgr.Named(workerName).With(idKey, workerId)
-	wrkLgr.Infow(workerMessage, resultKey, resultVal)
+	workLgr := srvLgr.Named(workerName).With(idKey, workerID)
+	workLgr.Infow(workerMessage, resultKey, resultVal)
 	// [INFO]	Did some work		logger/test_logger_test.go:49 version=unset@unset logger=ServiceName.WorkerName result=success workerId=42
 	logs = observed.TakeAll()
 	require.Len(t, logs, 1)
@@ -65,7 +65,7 @@ func TestTestLogger(t *testing.T) {
 	assert.Equal(t, zap.InfoLevel, log.Level)
 	assert.Equal(t, workerMessage, log.Message)
 	assert.Equal(t, fmt.Sprintf("%s.%s", serviceName, workerName), log.LoggerName)
-	assert.Equal(t, workerId, log.ContextMap()[idKey])
+	assert.Equal(t, workerID, log.ContextMap()[idKey])
 	assert.Equal(t, resultVal, log.ContextMap()[resultKey])
 
 	const (
@@ -77,5 +77,5 @@ func TestTestLogger(t *testing.T) {
 	log = logs[0]
 	assert.Equal(t, zap.DPanicLevel, log.Level)
 	assert.Equal(t, critMsg, log.Message)
-	assert.Equal(t, "", log.LoggerName)
+	assert.Empty(t, log.LoggerName)
 }

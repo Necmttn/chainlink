@@ -6,14 +6,12 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
+	"github.com/smartcontractkit/chainlink-evm/pkg/keys/keystest"
+	"github.com/smartcontractkit/chainlink-evm/pkg/types"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/blockhashstore"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
-	keystoremocks "github.com/smartcontractkit/chainlink/v2/core/services/keystore/mocks"
 )
 
 type testCase struct {
@@ -200,9 +198,8 @@ func (test testCase) testFeeder(t *testing.T) {
 
 	blockHeaderProvider := &blockhashstore.TestBlockHeaderProvider{}
 	fromAddress := "0x469aA2CD13e037DC5236320783dCfd0e641c0559"
-	fromAddresses := []ethkey.EIP55Address{ethkey.EIP55Address(fromAddress)}
-	ks := keystoremocks.NewEth(t)
-	ks.On("GetRoundRobinAddress", testutils.FixtureChainID, mock.Anything).Maybe().Return(common.HexToAddress(fromAddress), nil)
+	fromAddresses := []types.EIP55Address{types.EIP55Address(fromAddress)}
+	ks := keystest.Addresses{common.HexToAddress(fromAddress)}
 
 	feeder := NewBlockHeaderFeeder(
 		lggr,
@@ -219,10 +216,9 @@ func (test testCase) testFeeder(t *testing.T) {
 		test.getBatchSize,
 		test.storeBatchSize,
 		fromAddresses,
-		testutils.FixtureChainID,
 	)
 
-	err := feeder.Run(testutils.Context(t))
+	err := feeder.Run(t.Context())
 	if test.expectedErrMsg == "" {
 		require.NoError(t, err)
 	} else {
@@ -244,9 +240,8 @@ func TestFeeder_CachesStoredBlocks(t *testing.T) {
 	batchBHS := &blockhashstore.TestBatchBHS{Stored: []uint64{75}}
 	blockHeaderProvider := &blockhashstore.TestBlockHeaderProvider{}
 	fromAddress := "0x469aA2CD13e037DC5236320783dCfd0e641c0559"
-	fromAddresses := []ethkey.EIP55Address{ethkey.EIP55Address(fromAddress)}
-	ks := keystoremocks.NewEth(t)
-	ks.On("GetRoundRobinAddress", testutils.FixtureChainID, mock.Anything).Maybe().Return(common.HexToAddress(fromAddress), nil)
+	fromAddresses := []types.EIP55Address{types.EIP55Address(fromAddress)}
+	ks := keystest.Addresses{common.HexToAddress(fromAddress)}
 
 	feeder := NewBlockHeaderFeeder(
 		logger.TestLogger(t),
@@ -263,11 +258,10 @@ func TestFeeder_CachesStoredBlocks(t *testing.T) {
 		1,
 		1,
 		fromAddresses,
-		testutils.FixtureChainID,
 	)
 
 	// Should store block 74. block 75 was already stored from above
-	require.NoError(t, feeder.Run(testutils.Context(t)))
+	require.NoError(t, feeder.Run(t.Context()))
 	require.ElementsMatch(t, []uint64{74, 75}, batchBHS.Stored)
 
 	// Run the feeder at a later block
@@ -281,7 +275,7 @@ func TestFeeder_CachesStoredBlocks(t *testing.T) {
 	}
 	// remove stored blocks
 	batchBHS.Stored = nil
-	require.NoError(t, feeder.Run(testutils.Context(t)))
+	require.NoError(t, feeder.Run(t.Context()))
 	// nothing should be stored because of the feeder cache
 	require.Empty(t, batchBHS.Stored)
 
@@ -295,7 +289,7 @@ func TestFeeder_CachesStoredBlocks(t *testing.T) {
 		},
 	}
 	batchBHS.Stored = nil
-	require.NoError(t, feeder.Run(testutils.Context(t)))
+	require.NoError(t, feeder.Run(t.Context()))
 	require.Empty(t, batchBHS.Stored)
 
 	// Run the feeder at a later block. this time, the feeder cache will be pruned
@@ -304,7 +298,7 @@ func TestFeeder_CachesStoredBlocks(t *testing.T) {
 	}
 	batchBHS.Stored = []uint64{175}
 	feeder.coordinator = &blockhashstore.TestCoordinator{RequestEvents: []blockhashstore.Event{{Block: 174, ID: "request"}}}
-	require.NoError(t, feeder.Run(testutils.Context(t)))
+	require.NoError(t, feeder.Run(t.Context()))
 	// nothing should be stored in this run because the cache will be pruned at the end of the current iteration.
 	// in the next run, cache should be empty
 	require.ElementsMatch(t, []uint64{174, 175}, batchBHS.Stored)
@@ -315,6 +309,6 @@ func TestFeeder_CachesStoredBlocks(t *testing.T) {
 		return 100, nil
 	}
 	batchBHS.Stored = []uint64{75}
-	require.NoError(t, feeder.Run(testutils.Context(t)))
+	require.NoError(t, feeder.Run(t.Context()))
 	require.ElementsMatch(t, []uint64{74, 75}, batchBHS.Stored)
 }

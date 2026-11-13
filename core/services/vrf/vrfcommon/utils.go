@@ -7,9 +7,9 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/pkg/errors"
 
-	txmgrcommon "github.com/smartcontractkit/chainlink/v2/common/txmgr"
-	txmgrtypes "github.com/smartcontractkit/chainlink/v2/common/txmgr/types"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/txmgr"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr"
+	txmgrcommon "github.com/smartcontractkit/chainlink-framework/chains/txmgr"
+	txmgrtypes "github.com/smartcontractkit/chainlink-framework/chains/txmgr/types"
 )
 
 type RespCountEntry struct {
@@ -46,11 +46,11 @@ func GetRespCounts(ctx context.Context, txm txmgr.TxManager, chainID *big.Int, c
 			return nil, errors.Wrap(err, "getRespCounts failed parsing tx meta field")
 		}
 		if meta != nil && meta.RequestID != nil {
-			requestId := meta.RequestID.String()
-			if _, exists := respCountMap[requestId]; !exists {
-				respCountMap[requestId] = 0
+			requestID := meta.RequestID.String()
+			if _, exists := respCountMap[requestID]; !exists {
+				respCountMap[requestID] = 0
 			}
-			respCountMap[requestId]++
+			respCountMap[requestID]++
 		}
 	}
 
@@ -66,11 +66,11 @@ func GetRespCounts(ctx context.Context, txm txmgr.TxManager, chainID *big.Int, c
 }
 
 func DedupeTxList(txes []*txmgr.Tx) []*txmgr.Tx {
-	txIdMap := make(map[string]bool)
+	txIDMap := make(map[string]bool)
 	dedupedTxes := []*txmgr.Tx{}
 	for _, tx := range txes {
-		if _, found := txIdMap[tx.GetID()]; !found {
-			txIdMap[tx.GetID()] = true
+		if _, found := txIDMap[tx.GetID()]; !found {
+			txIDMap[tx.GetID()] = true
 			dedupedTxes = append(dedupedTxes, tx)
 		}
 	}

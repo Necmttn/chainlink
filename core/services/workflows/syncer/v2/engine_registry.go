@@ -1,0 +1,192 @@
+package v2
+
+import (
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"sync"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/hashutil"
+	"github.com/smartcontractkit/chainlink-common/pkg/services"
+	"github.com/smartcontractkit/chainlink/v2/core/services/workflows/types"
+	v2 "github.com/smartcontractkit/chainlink/v2/core/services/workflows/v2"
+	"github.com/smartcontractkit/chainlink/v2/core/services/workflows/v2/triggers"
+)
+
+var (
+	ErrNotFound      = errors.New("engine not found")
+	ErrAlreadyExists = errors.New("attempting to register duplicate engine")
+)
+
+type ServiceWithMetadata struct {
+	WorkflowID types.WorkflowID
+	Source     string // Which source this workflow came from (e.g., "ContractWorkflowSource", "GRPCWorkflowSource")
+	// ReconcileKey fingerprints the on-chain record (owner/name) the engine was started for.
+	// Empty when the engine was registered without identity metadata (e.g. via Add).
+	ReconcileKey string
+	services.Service
+}
+
+// Coordinated is true for an engine that leaves trigger registration,
+// dequeuing and acknowledgement to the TriggerCoordinator.
+func (e ServiceWithMetadata) Coordinated() bool {
+	engine, ok := e.Service.(v2.WorkflowEngine)
+	return ok && engine.IsCoordinated()
+}
+
+// engineEntry holds the engine and its associated source for internal storage.
+type engineEntry struct {
+	engine       services.Service
+	source       string
+	reconcileKey string
+}
+
+// ReconcileKey fingerprints the workflow record identity that a WorkflowID is expected to map to.
+func ReconcileKey(owner []byte, name string) (string, error) {
+	h, err := hashutil.BytesOfBytesKeccak([][]byte{owner, []byte(name)})
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h[:]), nil
+}
+
+type EngineRegistry struct {
+	engines map[[32]byte]engineEntry
+	mu      sync.RWMutex
+}
+
+func NewEngineRegistry() *EngineRegistry {
+	return &EngineRegistry{
+		engines: make(map[[32]byte]engineEntry),
+	}
+}
+
+// Add adds an engine to the registry with its source.
+func (r *EngineRegistry) Add(workflowID types.WorkflowID, source string, engine services.Service) error {
+	return r.AddWithReconcileKey(workflowID, source, "", engine)
+}
+
+// AddWithReconcileKey adds an engine to the registry with its source and identity fingerprint.
+func (r *EngineRegistry) AddWithReconcileKey(workflowID types.WorkflowID, source, reconcileKey string, engine services.Service) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, found := r.engines[workflowID]; found {
+		return ErrAlreadyExists
+	}
+	r.engines[workflowID] = engineEntry{
+		engine:       engine,
+		source:       source,
+		reconcileKey: reconcileKey,
+	}
+	return nil
+}
+
+// Get retrieves an engine from the registry. The second return value indicates whether an engine was found or not.
+func (r *EngineRegistry) Get(workflowID types.WorkflowID) (ServiceWithMetadata, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	entry, found := r.engines[workflowID]
+	if !found {
+		return ServiceWithMetadata{}, false
+	}
+	return ServiceWithMetadata{
+		WorkflowID:   workflowID,
+		Source:       entry.source,
+		ReconcileKey: entry.reconcileKey,
+		Service:      entry.engine,
+	}, true
+}
+
+// GetAll retrieves all engines from the engine registry.
+func (r *EngineRegistry) GetAll() []ServiceWithMetadata {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	engines := make([]ServiceWithMetadata, 0, len(r.engines))
+	for workflowID, entry := range r.engines {
+		engines = append(engines, ServiceWithMetadata{
+			WorkflowID: workflowID,
+			Source:     entry.source,
+			Service:    entry.engine,
+		})
+	}
+	return engines
+}
+
+// GetBySource retrieves all engines from a specific source.
+func (r *EngineRegistry) GetBySource(source string) []ServiceWithMetadata {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var result []ServiceWithMetadata
+	for workflowID, entry := range r.engines {
+		if entry.source == source {
+			result = append(result, ServiceWithMetadata{
+				WorkflowID: workflowID,
+				Source:     entry.source,
+				Service:    entry.engine,
+			})
+		}
+	}
+	return result
+}
+
+// Contains is true if the engine exists.
+func (r *EngineRegistry) Contains(workflowID types.WorkflowID) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, found := r.engines[workflowID]
+	return found
+}
+
+// Pop removes an engine from the registry and returns the engine if found.
+func (r *EngineRegistry) Pop(workflowID types.WorkflowID) (ServiceWithMetadata, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.engines[workflowID]
+	if !ok {
+		return ServiceWithMetadata{}, fmt.Errorf("pop failed: %w", ErrNotFound)
+	}
+	delete(r.engines, workflowID)
+	return ServiceWithMetadata{
+		WorkflowID: workflowID,
+		Source:     entry.source,
+		Service:    entry.engine,
+	}, nil
+}
+
+// PopAll removes and returns all engines.
+func (r *EngineRegistry) PopAll() []ServiceWithMetadata {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	engines := make([]ServiceWithMetadata, 0, len(r.engines))
+	for workflowID, entry := range r.engines {
+		engines = append(engines, ServiceWithMetadata{
+			WorkflowID: workflowID,
+			Source:     entry.source,
+			Service:    entry.engine,
+		})
+	}
+	r.engines = make(map[[32]byte]engineEntry)
+	return engines
+}
+
+// triggerEngineRegistry adapts EngineRegistry to triggers.EngineRegistry.
+type triggerEngineRegistry struct {
+	registry *EngineRegistry
+}
+
+var _ triggers.EngineRegistry = (*triggerEngineRegistry)(nil)
+
+func NewTriggerEngineRegistry(r *EngineRegistry) triggers.EngineRegistry {
+	return &triggerEngineRegistry{registry: r}
+}
+
+// Get reports false for engines that are not registered or do not satisfy
+// triggers.RegisteredEngine.
+func (a *triggerEngineRegistry) Get(workflowID types.WorkflowID) (triggers.RegisteredEngine, bool) {
+	e, ok := a.registry.Get(workflowID)
+	if !ok {
+		return nil, false
+	}
+	engine, ok := e.Service.(triggers.RegisteredEngine)
+	return engine, ok
+}

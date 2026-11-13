@@ -1,31 +1,34 @@
 package resolver
 
 import (
+	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/lib/pq"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/guregu/null.v4"
 
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/vrfkey/secp256k1"
 	commonassets "github.com/smartcontractkit/chainlink-common/pkg/assets"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
 	"github.com/smartcontractkit/chainlink-common/pkg/types"
-
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/assets"
-	ubig "github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
-	clnull "github.com/smartcontractkit/chainlink/v2/core/null"
+	clnull "github.com/smartcontractkit/chainlink-common/pkg/utils/null"
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
+	evmtypes "github.com/smartcontractkit/chainlink-evm/pkg/types"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
 	"github.com/smartcontractkit/chainlink/v2/core/services/relay"
-	"github.com/smartcontractkit/chainlink/v2/core/services/signatures/secp256k1"
 	"github.com/smartcontractkit/chainlink/v2/core/store/models"
 )
 
-// Specs are only embedded on the job and are not fetchable by it's own id, so
+// Specs are only embedded on the job and are not fetchable by its own id, so
 // we test the spec resolvers by fetching a job by id.
-
 func TestResolver_CronSpec(t *testing.T) {
+	t.Parallel()
 	var (
 		id = int32(1)
 	)
@@ -34,12 +37,13 @@ func TestResolver_CronSpec(t *testing.T) {
 		{
 			name:          "cron spec success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
-				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", id).Return(job.Job{
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id).Return(job.Job{
 					Type: job.Cron,
 					CronSpec: &job.CronSpec{
 						CronSchedule: "CRON_TZ=UTC 0 0 1 1 *",
+						EVMChainID:   sqlutil.NewI(42),
 						CreatedAt:    f.Timestamp(),
 					},
 				}, nil)
@@ -52,6 +56,7 @@ func TestResolver_CronSpec(t *testing.T) {
 								__typename
 								... on CronSpec {
 									schedule
+									evmChainID
 									createdAt
 								}
 							}
@@ -65,6 +70,7 @@ func TestResolver_CronSpec(t *testing.T) {
 						"spec": {
 							"__typename": "CronSpec",
 							"schedule": "CRON_TZ=UTC 0 0 1 1 *",
+							"evmChainID": "42",
 							"createdAt": "2021-01-01T00:00:00Z"
 						}
 					}
@@ -77,25 +83,26 @@ func TestResolver_CronSpec(t *testing.T) {
 }
 
 func TestResolver_DirectRequestSpec(t *testing.T) {
+	t.Parallel()
 	var (
 		id               = int32(1)
 		requesterAddress = common.HexToAddress("0x3cCad4715152693fE3BC4460591e3D3Fbd071b42")
 	)
-	contractAddress, err := ethkey.NewEIP55Address("0x613a38AC1659769640aaE063C651F48E0250454C")
+	contractAddress, err := evmtypes.NewEIP55Address("0x613a38AC1659769640aaE063C651F48E0250454C")
 	require.NoError(t, err)
 
 	testCases := []GQLTestCase{
 		{
 			name:          "direct request spec success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
-				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", id).Return(job.Job{
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id).Return(job.Job{
 					Type: job.DirectRequest,
 					DirectRequestSpec: &job.DirectRequestSpec{
 						ContractAddress:          contractAddress,
 						CreatedAt:                f.Timestamp(),
-						EVMChainID:               ubig.NewI(42),
+						EVMChainID:               sqlutil.NewI(42),
 						MinIncomingConfirmations: clnull.NewUint32(1, true),
 						MinContractPayment:       commonassets.NewLinkFromJuels(1000),
 						Requesters:               models.AddressCollection{requesterAddress},
@@ -143,24 +150,25 @@ func TestResolver_DirectRequestSpec(t *testing.T) {
 }
 
 func TestResolver_FluxMonitorSpec(t *testing.T) {
+	t.Parallel()
 	var (
 		id = int32(1)
 	)
-	contractAddress, err := ethkey.NewEIP55Address("0x613a38AC1659769640aaE063C651F48E0250454C")
+	contractAddress, err := evmtypes.NewEIP55Address("0x613a38AC1659769640aaE063C651F48E0250454C")
 	require.NoError(t, err)
 
 	testCases := []GQLTestCase{
 		{
 			name:          "flux monitor spec with standard timers",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
-				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", id).Return(job.Job{
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id).Return(job.Job{
 					Type: job.FluxMonitor,
 					FluxMonitorSpec: &job.FluxMonitorSpec{
 						ContractAddress:   contractAddress,
 						CreatedAt:         f.Timestamp(),
-						EVMChainID:        ubig.NewI(42),
+						EVMChainID:        sqlutil.NewI(42),
 						DrumbeatEnabled:   false,
 						IdleTimerDisabled: false,
 						IdleTimerPeriod:   1 * time.Hour,
@@ -220,14 +228,14 @@ func TestResolver_FluxMonitorSpec(t *testing.T) {
 		{
 			name:          "flux monitor spec with drumbeat",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
-				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", id).Return(job.Job{
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id).Return(job.Job{
 					Type: job.FluxMonitor,
 					FluxMonitorSpec: &job.FluxMonitorSpec{
 						ContractAddress:     contractAddress,
 						CreatedAt:           f.Timestamp(),
-						EVMChainID:          ubig.NewI(42),
+						EVMChainID:          sqlutil.NewI(42),
 						DrumbeatEnabled:     true,
 						DrumbeatRandomDelay: 1 * time.Second,
 						DrumbeatSchedule:    "CRON_TZ=UTC 0 0 1 1 *",
@@ -291,100 +299,41 @@ func TestResolver_FluxMonitorSpec(t *testing.T) {
 	RunGQLTests(t, testCases)
 }
 
-func TestResolver_KeeperSpec(t *testing.T) {
-	var (
-		id          = int32(1)
-		fromAddress = common.HexToAddress("0x3cCad4715152693fE3BC4460591e3D3Fbd071b42")
-	)
-	contractAddress, err := ethkey.NewEIP55Address("0x613a38AC1659769640aaE063C651F48E0250454C")
-	require.NoError(t, err)
-
-	testCases := []GQLTestCase{
-		{
-			name:          "keeper spec",
-			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.App.On("JobORM").Return(f.Mocks.jobORM)
-				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", id).Return(job.Job{
-					Type: job.Keeper,
-					KeeperSpec: &job.KeeperSpec{
-						ContractAddress: contractAddress,
-						CreatedAt:       f.Timestamp(),
-						EVMChainID:      ubig.NewI(42),
-						FromAddress:     ethkey.EIP55AddressFromAddress(fromAddress),
-					},
-				}, nil)
-			},
-			query: `
-				query GetJob {
-					job(id: "1") {
-						... on Job {
-							spec {
-								__typename
-								... on KeeperSpec {
-									contractAddress
-									createdAt
-									evmChainID
-									fromAddress
-								}
-							}
-						}
-					}
-				}
-			`,
-			result: `
-				{
-					"job": {
-						"spec": {
-							"__typename": "KeeperSpec",
-							"contractAddress": "0x613a38AC1659769640aaE063C651F48E0250454C",
-							"createdAt": "2021-01-01T00:00:00Z",
-							"evmChainID": "42",
-							"fromAddress": "0x3cCad4715152693fE3BC4460591e3D3Fbd071b42"
-						}
-					}
-				}
-			`,
-		},
-	}
-
-	RunGQLTests(t, testCases)
-}
-
 func TestResolver_OCRSpec(t *testing.T) {
+	t.Parallel()
 	var (
 		id = int32(1)
 	)
-	contractAddress, err := ethkey.NewEIP55Address("0x613a38AC1659769640aaE063C651F48E0250454C")
+	contractAddress, err := evmtypes.NewEIP55Address("0x613a38AC1659769640aaE063C651F48E0250454C")
 	require.NoError(t, err)
 
-	transmitterAddress, err := ethkey.NewEIP55Address("0x3cCad4715152693fE3BC4460591e3D3Fbd071b42")
+	transmitterAddress, err := evmtypes.NewEIP55Address("0x3cCad4715152693fE3BC4460591e3D3Fbd071b42")
 	require.NoError(t, err)
 
-	keyBundleID := models.MustSha256HashFromHex("f5bf259689b26f1374efb3c9a9868796953a0f814bb2d39b968d0e61b58620a5")
+	keyBundleID := corekeys.MustSha256HashFromHex("f5bf259689b26f1374efb3c9a9868796953a0f814bb2d39b968d0e61b58620a5")
 
 	testCases := []GQLTestCase{
 		{
 			name:          "OCR spec",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
-				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", id).Return(job.Job{
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id).Return(job.Job{
 					Type: job.OffchainReporting,
 					OCROracleSpec: &job.OCROracleSpec{
-						BlockchainTimeout:                      models.Interval(1 * time.Minute),
+						BlockchainTimeout:                      sqlutil.Interval(1 * time.Minute),
 						ContractAddress:                        contractAddress,
 						ContractConfigConfirmations:            1,
-						ContractConfigTrackerPollInterval:      models.Interval(1 * time.Minute),
-						ContractConfigTrackerSubscribeInterval: models.Interval(2 * time.Minute),
-						DatabaseTimeout:                        models.NewInterval(3 * time.Second),
-						ObservationGracePeriod:                 models.NewInterval(4 * time.Second),
-						ContractTransmitterTransmitTimeout:     models.NewInterval(555 * time.Millisecond),
+						ContractConfigTrackerPollInterval:      sqlutil.Interval(1 * time.Minute),
+						ContractConfigTrackerSubscribeInterval: sqlutil.Interval(2 * time.Minute),
+						DatabaseTimeout:                        sqlutil.NewInterval(3 * time.Second),
+						ObservationGracePeriod:                 sqlutil.NewInterval(4 * time.Second),
+						ContractTransmitterTransmitTimeout:     sqlutil.NewInterval(555 * time.Millisecond),
 						CreatedAt:                              f.Timestamp(),
-						EVMChainID:                             ubig.NewI(42),
+						EVMChainID:                             sqlutil.NewI(42),
 						IsBootstrapPeer:                        false,
 						EncryptedOCRKeyBundleID:                &keyBundleID,
-						ObservationTimeout:                     models.Interval(2 * time.Minute),
+						ObservationTimeout:                     sqlutil.Interval(2 * time.Minute),
 						P2PV2Bootstrappers:                     pq.StringArray{"12D3KooWL3XJ9EMCyZvmmGXL2LMiVBtrVa2BuESsJiXkSj7333Jw@localhost:5001"},
 						TransmitterAddress:                     &transmitterAddress,
 					},
@@ -449,22 +398,29 @@ func TestResolver_OCRSpec(t *testing.T) {
 }
 
 func TestResolver_OCR2Spec(t *testing.T) {
+	t.Parallel()
 	var (
 		id = int32(1)
 	)
-	contractAddress, err := ethkey.NewEIP55Address("0x613a38AC1659769640aaE063C651F48E0250454C")
+	contractAddress, err := evmtypes.NewEIP55Address("0x613a38AC1659769640aaE063C651F48E0250454C")
 	require.NoError(t, err)
 
-	transmitterAddress, err := ethkey.NewEIP55Address("0x3cCad4715152693fE3BC4460591e3D3Fbd071b42")
+	transmitterAddress, err := evmtypes.NewEIP55Address("0x3cCad4715152693fE3BC4460591e3D3Fbd071b42")
 	require.NoError(t, err)
 
-	keyBundleID := models.MustSha256HashFromHex("f5bf259689b26f1374efb3c9a9868796953a0f814bb2d39b968d0e61b58620a5")
+	keyBundleID := corekeys.MustSha256HashFromHex("f5bf259689b26f1374efb3c9a9868796953a0f814bb2d39b968d0e61b58620a5")
 
-	relayConfig := map[string]interface{}{
+	relayConfig := map[string]any{
 		"chainID": 1337,
 	}
-	pluginConfig := map[string]interface{}{
+	pluginConfig := map[string]any{
 		"juelsPerFeeCoinSource": 100000000,
+	}
+	onchainSigningStrategy := map[string]any{
+		"strategyName": "multi-chain",
+		"config": map[string]any{
+			"evm": "b3df4d8748b67731a1112e8b45a764941974f5590c93672eebbc4f3504dd10ed",
+		},
 	}
 	require.NoError(t, err)
 
@@ -472,24 +428,26 @@ func TestResolver_OCR2Spec(t *testing.T) {
 		{
 			name:          "OCR 2 spec",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
-				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", id).Return(job.Job{
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id).Return(job.Job{
 					Type: job.OffchainReporting2,
 					OCR2OracleSpec: &job.OCR2OracleSpec{
-						BlockchainTimeout:                 models.Interval(1 * time.Minute),
+						BlockchainTimeout:                 sqlutil.Interval(1 * time.Minute),
 						ContractID:                        contractAddress.String(),
 						ContractConfigConfirmations:       1,
-						ContractConfigTrackerPollInterval: models.Interval(1 * time.Minute),
+						ContractConfigTrackerPollInterval: sqlutil.Interval(1 * time.Minute),
+						OnchainSigningStrategy:            onchainSigningStrategy,
 						CreatedAt:                         f.Timestamp(),
 						OCRKeyBundleID:                    null.StringFrom(keyBundleID.String()),
 						MonitoringEndpoint:                null.StringFrom("https://monitor.endpoint"),
 						P2PV2Bootstrappers:                pq.StringArray{"12D3KooWL3XJ9EMCyZvmmGXL2LMiVBtrVa2BuESsJiXkSj7333Jw@localhost:5001"},
-						Relay:                             relay.EVM,
+						Relay:                             relay.NetworkEVM,
 						RelayConfig:                       relayConfig,
 						TransmitterID:                     null.StringFrom(transmitterAddress.String()),
 						PluginType:                        types.Median,
 						PluginConfig:                      pluginConfig,
+						AllowNoBootstrappers:              true,
 					},
 				}, nil)
 			},
@@ -504,6 +462,7 @@ func TestResolver_OCR2Spec(t *testing.T) {
 									contractID
 									contractConfigConfirmations
 									contractConfigTrackerPollInterval
+									onchainSigningStrategy
 									createdAt
 									ocrKeyBundleID
 									monitoringEndpoint
@@ -513,6 +472,7 @@ func TestResolver_OCR2Spec(t *testing.T) {
 									transmitterID
 									pluginType
 									pluginConfig
+									allowNoBootstrappers
 								}
 							}
 						}
@@ -528,6 +488,12 @@ func TestResolver_OCR2Spec(t *testing.T) {
 							"contractID": "0x613a38AC1659769640aaE063C651F48E0250454C",
 							"contractConfigConfirmations": 1,
 							"contractConfigTrackerPollInterval": "1m0s",
+							"onchainSigningStrategy": {
+								"strategyName": "multi-chain",
+								"config": {
+									"evm": "b3df4d8748b67731a1112e8b45a764941974f5590c93672eebbc4f3504dd10ed"
+								}
+							},
 							"createdAt": "2021-01-01T00:00:00Z",
 							"ocrKeyBundleID": "f5bf259689b26f1374efb3c9a9868796953a0f814bb2d39b968d0e61b58620a5",
 							"monitoringEndpoint": "https://monitor.endpoint",
@@ -540,7 +506,8 @@ func TestResolver_OCR2Spec(t *testing.T) {
 							"pluginType": "median",
 							"pluginConfig": {
 								"juelsPerFeeCoinSource": 100000000
-							}
+							},
+							"allowNoBootstrappers": true
 						}
 					}
 				}
@@ -552,19 +519,21 @@ func TestResolver_OCR2Spec(t *testing.T) {
 }
 
 func TestResolver_VRFSpec(t *testing.T) {
+	t.Parallel()
+
 	var (
 		id = int32(1)
 	)
-	coordinatorAddress, err := ethkey.NewEIP55Address("0x613a38AC1659769640aaE063C651F48E0250454C")
+	coordinatorAddress, err := evmtypes.NewEIP55Address("0x613a38AC1659769640aaE063C651F48E0250454C")
 	require.NoError(t, err)
 
-	batchCoordinatorAddress, err := ethkey.NewEIP55Address("0x0ad9FE7a58216242a8475ca92F222b0640E26B63")
+	batchCoordinatorAddress, err := evmtypes.NewEIP55Address("0x0ad9FE7a58216242a8475ca92F222b0640E26B63")
 	require.NoError(t, err)
 
-	fromAddress1, err := ethkey.NewEIP55Address("0x3cCad4715152693fE3BC4460591e3D3Fbd071b42")
+	fromAddress1, err := evmtypes.NewEIP55Address("0x3cCad4715152693fE3BC4460591e3D3Fbd071b42")
 	require.NoError(t, err)
 
-	fromAddress2, err := ethkey.NewEIP55Address("0x2301958F1BFbC9A068C2aC9c6166Bf483b95864C")
+	fromAddress2, err := evmtypes.NewEIP55Address("0x2301958F1BFbC9A068C2aC9c6166Bf483b95864C")
 	require.NoError(t, err)
 
 	pubKey, err := secp256k1.NewPublicKeyFromHex("0x9dc09a0f898f3b5e8047204e7ce7e44b587920932f08431e29c9bf6923b8450a01")
@@ -574,9 +543,9 @@ func TestResolver_VRFSpec(t *testing.T) {
 		{
 			name:          "vrf spec",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
-				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", id).Return(job.Job{
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id).Return(job.Job{
 					Type: job.VRF,
 					VRFSpec: &job.VRFSpec{
 						BatchCoordinatorAddress:       &batchCoordinatorAddress,
@@ -585,8 +554,8 @@ func TestResolver_VRFSpec(t *testing.T) {
 						MinIncomingConfirmations:      1,
 						CoordinatorAddress:            coordinatorAddress,
 						CreatedAt:                     f.Timestamp(),
-						EVMChainID:                    ubig.NewI(42),
-						FromAddresses:                 []ethkey.EIP55Address{fromAddress1, fromAddress2},
+						EVMChainID:                    sqlutil.NewI(42),
+						FromAddresses:                 []evmtypes.EIP55Address{fromAddress1, fromAddress2},
 						PollPeriod:                    1 * time.Minute,
 						PublicKey:                     pubKey,
 						RequestedConfsDelay:           10,
@@ -662,6 +631,8 @@ func TestResolver_VRFSpec(t *testing.T) {
 }
 
 func TestResolver_WebhookSpec(t *testing.T) {
+	t.Parallel()
+
 	var (
 		id = int32(1)
 	)
@@ -670,9 +641,9 @@ func TestResolver_WebhookSpec(t *testing.T) {
 		{
 			name:          "webhook spec",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
-				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", id).Return(job.Job{
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id).Return(job.Job{
 					Type: job.Webhook,
 					WebhookSpec: &job.WebhookSpec{
 						CreatedAt: f.Timestamp(),
@@ -710,28 +681,28 @@ func TestResolver_WebhookSpec(t *testing.T) {
 }
 
 func TestResolver_BlockhashStoreSpec(t *testing.T) {
+	t.Parallel()
+
 	var (
 		id = int32(1)
 	)
-	coordinatorV1Address, err := ethkey.NewEIP55Address("0x613a38AC1659769640aaE063C651F48E0250454C")
+
+	coordinatorV2Address, err := evmtypes.NewEIP55Address("0x2fcA960AF066cAc46085588a66dA2D614c7Cd337")
 	require.NoError(t, err)
 
-	coordinatorV2Address, err := ethkey.NewEIP55Address("0x2fcA960AF066cAc46085588a66dA2D614c7Cd337")
+	coordinatorV2PlusAddress, err := evmtypes.NewEIP55Address("0x92B5e28Ac583812874e4271380c7d070C5FB6E6b")
 	require.NoError(t, err)
 
-	coordinatorV2PlusAddress, err := ethkey.NewEIP55Address("0x92B5e28Ac583812874e4271380c7d070C5FB6E6b")
+	fromAddress1, err := evmtypes.NewEIP55Address("0x3cCad4715152693fE3BC4460591e3D3Fbd071b42")
 	require.NoError(t, err)
 
-	fromAddress1, err := ethkey.NewEIP55Address("0x3cCad4715152693fE3BC4460591e3D3Fbd071b42")
+	fromAddress2, err := evmtypes.NewEIP55Address("0xD479d7c994D298cA05bF270136ED9627b7E684D3")
 	require.NoError(t, err)
 
-	fromAddress2, err := ethkey.NewEIP55Address("0xD479d7c994D298cA05bF270136ED9627b7E684D3")
+	blockhashStoreAddress, err := evmtypes.NewEIP55Address("0xb26A6829D454336818477B946f03Fb21c9706f3A")
 	require.NoError(t, err)
 
-	blockhashStoreAddress, err := ethkey.NewEIP55Address("0xb26A6829D454336818477B946f03Fb21c9706f3A")
-	require.NoError(t, err)
-
-	trustedBlockhashStoreAddress, err := ethkey.NewEIP55Address("0x0ad9FE7a58216242a8475ca92F222b0640E26B63")
+	trustedBlockhashStoreAddress, err := evmtypes.NewEIP55Address("0x0ad9FE7a58216242a8475ca92F222b0640E26B63")
 	require.NoError(t, err)
 	trustedBlockhashStoreBatchSize := int32(20)
 
@@ -739,17 +710,16 @@ func TestResolver_BlockhashStoreSpec(t *testing.T) {
 		{
 			name:          "blockhash store spec",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
-				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", id).Return(job.Job{
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id).Return(job.Job{
 					Type: job.BlockhashStore,
 					BlockhashStoreSpec: &job.BlockhashStoreSpec{
-						CoordinatorV1Address:           &coordinatorV1Address,
 						CoordinatorV2Address:           &coordinatorV2Address,
 						CoordinatorV2PlusAddress:       &coordinatorV2PlusAddress,
 						CreatedAt:                      f.Timestamp(),
-						EVMChainID:                     ubig.NewI(42),
-						FromAddresses:                  []ethkey.EIP55Address{fromAddress1, fromAddress2},
+						EVMChainID:                     sqlutil.NewI(42),
+						FromAddresses:                  []evmtypes.EIP55Address{fromAddress1, fromAddress2},
 						PollPeriod:                     1 * time.Minute,
 						RunTimeout:                     37 * time.Second,
 						WaitBlocks:                     100,
@@ -793,7 +763,7 @@ func TestResolver_BlockhashStoreSpec(t *testing.T) {
 					"job": {
 						"spec": {
 							"__typename": "BlockhashStoreSpec",
-							"coordinatorV1Address": "0x613a38AC1659769640aaE063C651F48E0250454C",
+							"coordinatorV1Address": null,
 							"coordinatorV2Address": "0x2fcA960AF066cAc46085588a66dA2D614c7Cd337",
 							"coordinatorV2PlusAddress": "0x92B5e28Ac583812874e4271380c7d070C5FB6E6b",
 							"createdAt": "2021-01-01T00:00:00Z",
@@ -818,42 +788,41 @@ func TestResolver_BlockhashStoreSpec(t *testing.T) {
 }
 
 func TestResolver_BlockHeaderFeederSpec(t *testing.T) {
+	t.Parallel()
+
 	var (
 		id = int32(1)
 	)
-	coordinatorV1Address, err := ethkey.NewEIP55Address("0x613a38AC1659769640aaE063C651F48E0250454C")
+
+	coordinatorV2Address, err := evmtypes.NewEIP55Address("0x2fcA960AF066cAc46085588a66dA2D614c7Cd337")
 	require.NoError(t, err)
 
-	coordinatorV2Address, err := ethkey.NewEIP55Address("0x2fcA960AF066cAc46085588a66dA2D614c7Cd337")
+	coordinatorV2PlusAddress, err := evmtypes.NewEIP55Address("0x92B5e28Ac583812874e4271380c7d070C5FB6E6b")
 	require.NoError(t, err)
 
-	coordinatorV2PlusAddress, err := ethkey.NewEIP55Address("0x92B5e28Ac583812874e4271380c7d070C5FB6E6b")
+	fromAddress, err := evmtypes.NewEIP55Address("0x3cCad4715152693fE3BC4460591e3D3Fbd071b42")
 	require.NoError(t, err)
 
-	fromAddress, err := ethkey.NewEIP55Address("0x3cCad4715152693fE3BC4460591e3D3Fbd071b42")
+	blockhashStoreAddress, err := evmtypes.NewEIP55Address("0xb26A6829D454336818477B946f03Fb21c9706f3A")
 	require.NoError(t, err)
 
-	blockhashStoreAddress, err := ethkey.NewEIP55Address("0xb26A6829D454336818477B946f03Fb21c9706f3A")
-	require.NoError(t, err)
-
-	batchBHSAddress, err := ethkey.NewEIP55Address("0xd23BAE30019853Caf1D08b4C03291b10AD7743Df")
+	batchBHSAddress, err := evmtypes.NewEIP55Address("0xd23BAE30019853Caf1D08b4C03291b10AD7743Df")
 	require.NoError(t, err)
 
 	testCases := []GQLTestCase{
 		{
 			name:          "block header feeder spec",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
-				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", id).Return(job.Job{
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id).Return(job.Job{
 					Type: job.BlockHeaderFeeder,
 					BlockHeaderFeederSpec: &job.BlockHeaderFeederSpec{
-						CoordinatorV1Address:       &coordinatorV1Address,
 						CoordinatorV2Address:       &coordinatorV2Address,
 						CoordinatorV2PlusAddress:   &coordinatorV2PlusAddress,
 						CreatedAt:                  f.Timestamp(),
-						EVMChainID:                 ubig.NewI(42),
-						FromAddresses:              []ethkey.EIP55Address{fromAddress},
+						EVMChainID:                 sqlutil.NewI(42),
+						FromAddresses:              []evmtypes.EIP55Address{fromAddress},
 						PollPeriod:                 1 * time.Minute,
 						RunTimeout:                 37 * time.Second,
 						WaitBlocks:                 100,
@@ -897,7 +866,7 @@ func TestResolver_BlockHeaderFeederSpec(t *testing.T) {
 					"job": {
 						"spec": {
 							"__typename": "BlockHeaderFeederSpec",
-							"coordinatorV1Address": "0x613a38AC1659769640aaE063C651F48E0250454C",
+							"coordinatorV1Address": null,
 							"coordinatorV2Address": "0x2fcA960AF066cAc46085588a66dA2D614c7Cd337",
 							"coordinatorV2PlusAddress": "0x92B5e28Ac583812874e4271380c7d070C5FB6E6b",
 							"createdAt": "2021-01-01T00:00:00Z",
@@ -922,6 +891,8 @@ func TestResolver_BlockHeaderFeederSpec(t *testing.T) {
 }
 
 func TestResolver_BootstrapSpec(t *testing.T) {
+	t.Parallel()
+
 	var (
 		id = int32(1)
 	)
@@ -930,18 +901,18 @@ func TestResolver_BootstrapSpec(t *testing.T) {
 		{
 			name:          "Bootstrap spec",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
-				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", id).Return(job.Job{
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id).Return(job.Job{
 					Type: job.Bootstrap,
 					BootstrapSpec: &job.BootstrapSpec{
 						ID:                                id,
 						ContractID:                        "0x613a38AC1659769640aaE063C651F48E0250454C",
 						Relay:                             "evm",
-						RelayConfig:                       map[string]interface{}{},
+						RelayConfig:                       map[string]any{},
 						MonitoringEndpoint:                null.String{},
-						BlockchainTimeout:                 models.Interval(2 * time.Minute),
-						ContractConfigTrackerPollInterval: models.Interval(2 * time.Minute),
+						BlockchainTimeout:                 sqlutil.Interval(2 * time.Minute),
+						ContractConfigTrackerPollInterval: sqlutil.Interval(2 * time.Minute),
 						ContractConfigConfirmations:       100,
 						CreatedAt:                         f.Timestamp(),
 					},
@@ -993,22 +964,80 @@ func TestResolver_BootstrapSpec(t *testing.T) {
 	RunGQLTests(t, testCases)
 }
 
-func TestResolver_GatewaySpec(t *testing.T) {
+func TestResolver_WorkflowSpec(t *testing.T) {
+	t.Parallel()
+
 	var (
 		id = int32(1)
 	)
 
-	gatewayConfig := map[string]interface{}{
-		"NodeServerConfig": map[string]interface{}{},
+	testCases := []GQLTestCase{
+		{
+			name:          "Workflow spec",
+			authenticated: true,
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.App.On("JobORM").Return(f.Mocks.jobORM)
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id).Return(job.Job{
+					Type: job.Workflow,
+					WorkflowSpec: &job.WorkflowSpec{
+						ID:         id,
+						WorkflowID: "<test workflow id>",
+						Workflow:   "<test workflow spec>",
+					},
+				}, nil)
+			},
+			query: `
+				query GetJob {
+					job(id: "1") {
+						... on Job {
+							spec {
+								__typename
+								... on WorkflowSpec {
+									id
+									workflowID
+									workflow
+								}
+							}
+						}
+					}
+				}
+			`,
+			result: `
+				{
+					"job": {
+						"spec": {
+							"__typename": "WorkflowSpec",
+							"id": "1",
+							"workflowID": "<test workflow id>",
+							"workflow": "<test workflow spec>"
+						}
+					}
+				}
+			`,
+		},
+	}
+
+	RunGQLTests(t, testCases)
+}
+
+func TestResolver_GatewaySpec(t *testing.T) {
+	t.Parallel()
+
+	var (
+		id = int32(1)
+	)
+
+	gatewayConfig := map[string]any{
+		"NodeServerConfig": map[string]any{},
 	}
 
 	testCases := []GQLTestCase{
 		{
 			name:          "Gateway spec",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
-				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", id).Return(job.Job{
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id).Return(job.Job{
 					Type: job.Gateway,
 					GatewaySpec: &job.GatewaySpec{
 						ID:            id,
@@ -1041,6 +1070,149 @@ func TestResolver_GatewaySpec(t *testing.T) {
 							"id": "1",
 							"gatewayConfig": {"NodeServerConfig": {}},
 							"createdAt": "2021-01-01T00:00:00Z"
+						}
+					}
+				}
+			`,
+		},
+	}
+
+	RunGQLTests(t, testCases)
+}
+
+func TestResolver_StandardCapabilitiesSpec(t *testing.T) {
+	t.Parallel()
+
+	var (
+		id = int32(1)
+	)
+
+	testCases := []GQLTestCase{
+		{
+			name:          "StandardCapabilities spec",
+			authenticated: true,
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.App.On("JobORM").Return(f.Mocks.jobORM)
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id).Return(job.Job{
+					Type: job.StandardCapabilities,
+					StandardCapabilitiesSpec: &job.StandardCapabilitiesSpec{
+						ID:        id,
+						CreatedAt: f.Timestamp(),
+						Command:   "testcommand",
+						Config:    "testconfig",
+					},
+				}, nil)
+			},
+			query: `
+				query GetJob {
+					job(id: "1") {
+						... on Job {
+							spec {
+								__typename
+								... on StandardCapabilitiesSpec {
+									id
+									createdAt
+									command
+									config
+								}
+							}
+						}
+					}
+				}
+			`,
+			result: `
+				{
+					"job": {
+						"spec": {
+							"__typename": "StandardCapabilitiesSpec",
+							"id": "1",
+							"createdAt": "2021-01-01T00:00:00Z",
+							"command": "testcommand",
+							"config": "testconfig"
+						}
+					}
+				}
+			`,
+		},
+	}
+
+	RunGQLTests(t, testCases)
+}
+
+func TestResolver_StreamSpec(t *testing.T) {
+	t.Parallel()
+
+	var (
+		id1      = int32(1)
+		id2      = int32(2)
+		streamID = uint32(3)
+	)
+
+	testCases := []GQLTestCase{
+		{
+			name:          "stream spec with stream ID",
+			authenticated: true,
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.App.On("JobORM").Return(f.Mocks.jobORM)
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id1).Return(job.Job{
+					Type:     job.Stream,
+					StreamID: &streamID,
+				}, nil)
+			},
+			query: fmt.Sprintf(`
+				query GetJob {
+					job(id: "%d") {
+						... on Job {
+							spec {
+								__typename
+								... on StreamSpec {
+									streamID
+								}
+							}
+						}
+					}
+				}
+			`, id1),
+			result: fmt.Sprintf(`
+				{
+					"job": {
+						"spec": {
+							"__typename": "StreamSpec",
+							"streamID": "%d"
+						}
+					}
+				}
+			`, streamID),
+		},
+		{
+			name:          "stream spec without stream ID",
+			authenticated: true,
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.App.On("JobORM").Return(f.Mocks.jobORM)
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id2).Return(job.Job{
+					Type: job.Stream,
+				}, nil)
+			},
+			query: fmt.Sprintf(`
+				query GetJob {
+					job(id: "%d") {
+						... on Job {
+							spec {
+								__typename
+								... on StreamSpec {
+									streamID
+								}
+							}
+						}
+					}
+				}
+			`, id2),
+			result: `
+				{
+					"job": {
+						"spec": {
+							"__typename": "StreamSpec",
+							"streamID": null
 						}
 					}
 				}

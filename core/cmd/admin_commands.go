@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,17 +10,18 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/manyminds/api2go/jsonapi"
 	"github.com/urfave/cli"
-	"go.uber.org/multierr"
 
 	cutils "github.com/smartcontractkit/chainlink-common/pkg/utils"
-
+	"github.com/smartcontractkit/chainlink/v2/core/sessions"
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
+	"github.com/smartcontractkit/chainlink/v2/core/web"
 	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 )
 
@@ -64,6 +66,10 @@ func initAdminSubCmds(s *Shell) []cli.Command {
 					Name:  "output_dir, o",
 					Usage: "output directory of the captured profile",
 					Value: "/tmp/",
+				},
+				cli.StringSliceFlag{
+					Name:  "vitals, v",
+					Usage: "vitals to collect, can be specified multiple times. Options: 'allocs', 'block', 'cmdline', 'goroutine', 'heap', 'mutex', 'profile', 'threadcreate', 'trace'",
 				},
 			},
 		},
@@ -144,7 +150,7 @@ func (p *AdminUsersPresenter) ToRow() []string {
 	row := []string{
 		p.ID,
 		string(p.Role),
-		p.HasActiveApiToken,
+		p.HasActiveAPIToken,
 		p.CreatedAt.String(),
 		p.UpdatedAt.String(),
 	}
@@ -164,7 +170,7 @@ type AdminUsersPresenters []AdminUsersPresenter
 
 // RenderTable implements TableRenderer
 func (ps AdminUsersPresenters) RenderTable(rt RendererTable) error {
-	rows := [][]string{}
+	rows := make([][]string, 0, len(ps))
 
 	for _, p := range ps {
 		rows = append(rows, p.ToRow())
@@ -186,7 +192,7 @@ func (s *Shell) ListUsers(_ *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = errors.Join(err, cerr)
 		}
 	}()
 
@@ -195,13 +201,18 @@ func (s *Shell) ListUsers(_ *cli.Context) (err error) {
 
 // CreateUser creates a new user by prompting for email, password, and role
 func (s *Shell) CreateUser(c *cli.Context) (err error) {
+	// Check user's email validity. Note that it will also be later checked on the server side in the NewUser function.
+	if err = sessions.ValidateEmail(c.String("email")); err != nil {
+		return err
+	}
+
 	resp, err := s.HTTP.Get(s.ctx(), "/v2/users/", nil)
 	if err != nil {
 		return s.errorOut(err)
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = errors.Join(err, cerr)
 		}
 	}()
 	var links jsonapi.Links
@@ -228,7 +239,7 @@ func (s *Shell) CreateUser(c *cli.Context) (err error) {
 		Password: pwd,
 	}
 
-	requestData, err := json.Marshal(request)
+	requestData, err := json.Marshal(request) //nolint:gosec // Password is the intended API user credential payload
 	if err != nil {
 		return s.errorOut(err)
 	}
@@ -240,7 +251,7 @@ func (s *Shell) CreateUser(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := response.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = errors.Join(err, cerr)
 		}
 	}()
 
@@ -269,7 +280,7 @@ func (s *Shell) ChangeRole(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := response.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = errors.Join(err, cerr)
 		}
 	}()
 
@@ -283,13 +294,13 @@ func (s *Shell) DeleteUser(c *cli.Context) (err error) {
 		return s.errorOut(errors.New("email flag is empty, must specify an email"))
 	}
 
-	response, err := s.HTTP.Delete(s.ctx(), fmt.Sprintf("/v2/users/%s", email))
+	response, err := s.HTTP.Delete(s.ctx(), "/v2/users/"+email)
 	if err != nil {
 		return s.errorOut(err)
 	}
 	defer func() {
 		if cerr := response.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = errors.Join(err, cerr)
 		}
 	}()
 
@@ -304,7 +315,7 @@ func (s *Shell) Status(c *cli.Context) error {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = errors.Join(err, cerr)
 		}
 	}()
 
@@ -314,38 +325,135 @@ func (s *Shell) Status(c *cli.Context) error {
 // Profile will collect pprof metrics and store them in a folder.
 func (s *Shell) Profile(c *cli.Context) error {
 	ctx := s.ctx()
-	seconds := c.Uint("seconds")
+	seconds := c.Int("seconds")
 	baseDir := c.String("output_dir")
 
-	genDir := filepath.Join(baseDir, fmt.Sprintf("debuginfo-%s", time.Now().Format(time.RFC3339)))
+	genDir := filepath.Join(baseDir, "debuginfo-"+time.Now().Format(time.RFC3339))
 
-	if err := os.Mkdir(genDir, 0o755); err != nil {
-		return s.errorOut(err)
-	}
-	var wgPprof sync.WaitGroup
-	vitals := []string{
+	vitals := c.StringSlice("vitals")
+	// supportsDeltaVitals contains profiles that can be run with or without seconds param.
+	// (see https://pkg.go.dev/net/http/pprof#hdr-Parameters)
+	supportsDeltaVitals := []string{
 		"allocs",       // A sampling of all past memory allocations
 		"block",        // Stack traces that led to blocking on synchronization primitives
 		"cmdline",      // The command line invocation of the current program
 		"goroutine",    // Stack traces of all current goroutines
 		"heap",         // A sampling of memory allocations of live objects.
 		"mutex",        // Stack traces of holders of contended mutexes
-		"profile",      // CPU profile.
 		"threadcreate", // Stack traces that led to the creation of new OS threads
-		"trace",        // A trace of execution of the current program.
 	}
-	wgPprof.Add(len(vitals))
-	s.Logger.Infof("Collecting profiles: %v", vitals)
+	// durationOnlyVitals contains profiles that can be run only with the seconds param.
+	durationOnlyVitals := []string{
+		"profile", // CPU profile.
+		"trace",   // A trace of execution of the current program.
+	}
+	allVitals := supportsDeltaVitals
+	if seconds > 0 {
+		allVitals = append(allVitals, durationOnlyVitals...)
+	}
+	if len(vitals) == 0 {
+		vitals = slices.Clone(allVitals)
+	} else if slices.ContainsFunc(vitals, func(s string) bool { return !slices.Contains(allVitals, s) }) {
+		return fmt.Errorf("invalid vitals: must be from the set: %v", allVitals)
+	}
+
+	plugins, err := s.discoverPlugins(ctx)
+	if err != nil {
+		return s.errorOut(err)
+	}
+	var names []string
+	for _, group := range plugins {
+		if name := group.Labels[web.LabelMetaPluginName]; name != "" {
+			names = append(names, name)
+		}
+	}
+
+	if len(names) == 0 {
+		s.Logger.Infof("Collecting profiles: %v", vitals)
+	} else {
+		s.Logger.Infof("Collecting profiles from host and %d plugins: %v", len(names), vitals)
+	}
 	s.Logger.Infof("writing debug info to %s", genDir)
 
+	var wg sync.WaitGroup
+	errs := make([]error, len(names)+1)
+	wg.Add(len(names) + 1)
+	go func() {
+		defer wg.Done()
+		errs[0] = s.profile(ctx, genDir, "", vitals, seconds)
+	}()
+	for i, name := range names {
+		go func() {
+			defer wg.Done()
+			errs[i] = s.profile(ctx, genDir, name, vitals, seconds)
+		}()
+	}
+	wg.Wait()
+
+	err = errors.Join(errs...)
+	if err != nil {
+		return s.errorOut(err)
+	}
+	return nil
+}
+
+func (s *Shell) discoverPlugins(ctx context.Context) ([]struct {
+	Targets []string          `yaml:"targets"`
+	Labels  map[string]string `yaml:"labels"`
+}, error,
+) {
+	resp, err := s.HTTP.Get(ctx, "/discovery")
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if resp.Body != nil {
+			resp.Body.Close()
+		}
+	}()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var got []struct {
+		Targets []string          `yaml:"targets"`
+		Labels  map[string]string `yaml:"labels"`
+	}
+	if err = json.Unmarshal(data, &got); err != nil {
+		s.Logger.Errorf("failed to unmarshal discovery response: %s", string(data))
+		return nil, err
+	}
+	return got, nil
+}
+
+func (s *Shell) profile(ctx context.Context, genDir, name string, vitals []string, seconds int) error {
+	lggr := s.Logger
+	path := "/v2"
+	if name != "" {
+		genDir = filepath.Join(genDir, "plugins", name)
+		path = "/plugins/" + name
+		lggr = lggr.With("plugin", name)
+	}
+	if err := os.MkdirAll(genDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
 	errs := make(chan error, len(vitals))
+	var wgPprof sync.WaitGroup
+	wgPprof.Add(len(vitals))
 	for _, vt := range vitals {
-		go func(vt string) {
+		go func(ctx context.Context, vt string) {
 			defer wgPprof.Done()
-			uri := fmt.Sprintf("/v2/debug/pprof/%s?seconds=%d", vt, seconds)
+			ctx, cancel := context.WithTimeout(ctx, time.Duration(max(seconds, 0)+web.PPROFOverheadSeconds)*time.Second)
+			defer cancel()
+			uri := fmt.Sprintf(path+"/debug/pprof/%s", vt)
+			if seconds > 0 {
+				uri += fmt.Sprintf("?seconds=%d", seconds)
+			}
 			resp, err := s.HTTP.Get(ctx, uri)
 			if err != nil {
-				errs <- fmt.Errorf("error collecting %s: %w", vt, err)
+				errs <- fmt.Errorf("error collecting %s: %w", uri, err)
 				return
 			}
 			defer func() {
@@ -353,35 +461,43 @@ func (s *Shell) Profile(c *cli.Context) error {
 					resp.Body.Close()
 				}
 			}()
-			if resp.StatusCode == http.StatusUnauthorized {
-				errs <- fmt.Errorf("error collecting %s: %w", vt, errUnauthorized)
+			switch {
+			case resp.StatusCode == http.StatusUnauthorized:
+				errs <- fmt.Errorf("error collecting %s: %w", uri, errUnauthorized)
 				return
-			}
-			if resp.StatusCode == http.StatusBadRequest {
-				// best effort to interpret the underlying problem
+			case resp.StatusCode == http.StatusBadRequest:
 				pprofVersion := resp.Header.Get("X-Go-Pprof")
 				if pprofVersion == "1" {
 					b, err2 := io.ReadAll(resp.Body)
 					if err2 != nil {
-						errs <- fmt.Errorf("error collecting %s: %w", vt, err2)
+						errs <- fmt.Errorf("error collecting %s: %w", uri, err2)
 						return
 					}
 					respContent := string(b)
 					// taken from pprof.Profile https://github.com/golang/go/blob/release-branch.go1.20/src/net/http/pprof/pprof.go#L133
+					// note: no longer triggers as of 1.23
 					if strings.Contains(respContent, "profile duration exceeds server's WriteTimeout") {
 						errs <- fmt.Errorf("%w: %s", ErrProfileTooLong, respContent)
 					} else {
-						errs <- fmt.Errorf("error collecting %s: %w: %s", vt, errBadRequest, respContent)
+						errs <- fmt.Errorf("error collecting %s: %w: %s", uri, errBadRequest, respContent)
 					}
 				} else {
-					errs <- fmt.Errorf("error collecting %s: %w", vt, errBadRequest)
+					errs <- fmt.Errorf("error collecting %s: %w", uri, errBadRequest)
+				}
+				return
+			case resp.StatusCode < 200 || resp.StatusCode > 299:
+				body, rerr := io.ReadAll(resp.Body)
+				if rerr != nil {
+					errs <- fmt.Errorf("error collecting %s: status %d: error reading response: %w", uri, resp.StatusCode, rerr)
+				} else {
+					errs <- fmt.Errorf("error collecting %s: status %d: %s", uri, resp.StatusCode, string(body))
 				}
 				return
 			}
 			// write to file
 			f, err := os.Create(filepath.Join(genDir, vt))
 			if err != nil {
-				errs <- fmt.Errorf("error creating file for %s: %w", vt, err)
+				errs <- fmt.Errorf("error creating file for %s: %w", uri, err)
 				return
 			}
 			wc := utils.NewDeferableWriteCloser(f)
@@ -389,26 +505,26 @@ func (s *Shell) Profile(c *cli.Context) error {
 
 			_, err = io.Copy(wc, resp.Body)
 			if err != nil {
-				errs <- fmt.Errorf("error writing to file for %s: %w", vt, err)
+				errs <- fmt.Errorf("error writing to file for %s: %w", uri, err)
 				return
 			}
 			err = wc.Close()
 			if err != nil {
-				errs <- fmt.Errorf("error closing file for %s: %w", vt, err)
+				errs <- fmt.Errorf("error closing file for %s: %w", uri, err)
 				return
 			}
-		}(vt)
+		}(ctx, vt)
 	}
 	wgPprof.Wait()
 	close(errs)
-	// Atmost one err is emitted per vital.
-	s.Logger.Infof("collected %d/%d profiles", len(vitals)-len(errs), len(vitals))
+	// At most one err is emitted per vital.
+	lggr.Infof("collected %d/%d profiles", len(vitals)-len(errs), len(vitals))
 	if len(errs) > 0 {
 		var merr error
 		for err := range errs {
 			merr = errors.Join(merr, err)
 		}
-		return s.errorOut(fmt.Errorf("profile collection failed:\n%v", merr))
+		return s.errorOut(fmt.Errorf("profile collection failed:\n%w", merr))
 	}
 	return nil
 }

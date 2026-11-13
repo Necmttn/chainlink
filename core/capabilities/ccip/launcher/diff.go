@@ -1,0 +1,122 @@
+package launcher
+
+import (
+	"fmt"
+	"slices"
+
+	ragep2ptypes "github.com/smartcontractkit/libocr/ragep2p/types"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities/registry"
+)
+
+// diffResult contains the added, removed and updated CCIP DONs.
+// It is determined by using the `diff` function below.
+type diffResult struct {
+	added   map[registry.DonID]registry.DON
+	removed map[registry.DonID]registry.DON
+	updated map[registry.DonID]registry.DON
+}
+
+// diff compares the old and new state and returns the added, removed and updated CCIP DONs.
+func diff(
+	capabilityID string,
+	oldState,
+	newState *registry.RegistryMetadata,
+) (diffResult, error) {
+	ccipCapability, err := checkCapabilityPresence(capabilityID, newState)
+	if err != nil {
+		return diffResult{}, fmt.Errorf("failed to check capability presence: %w", err)
+	}
+
+	newCCIPDONs, err := filterCCIPDONs(ccipCapability, newState)
+	if err != nil {
+		return diffResult{}, fmt.Errorf("failed to filter CCIP DONs from new state: %w", err)
+	}
+
+	currCCIPDONs, err := filterCCIPDONs(ccipCapability, oldState)
+	if err != nil {
+		return diffResult{}, fmt.Errorf("failed to filter CCIP DONs from old state: %w", err)
+	}
+
+	// compare curr with new and launch or update OCR instances as needed
+	diffRes, err := compareDONs(currCCIPDONs, newCCIPDONs)
+	if err != nil {
+		return diffResult{}, fmt.Errorf("failed to compare CCIP DONs: %w", err)
+	}
+
+	return diffRes, nil
+}
+
+// compareDONs compares the current and new CCIP DONs and returns the added, removed and updated DONs.
+func compareDONs(
+	currCCIPDONs,
+	newCCIPDONs map[registry.DonID]registry.DON,
+) (
+	dr diffResult,
+	err error,
+) {
+	added := make(map[registry.DonID]registry.DON)
+	removed := make(map[registry.DonID]registry.DON)
+	updated := make(map[registry.DonID]registry.DON)
+
+	for id, don := range newCCIPDONs {
+		if currDONState, ok := currCCIPDONs[id]; !ok {
+			// Not in current state, so mark as added.
+			added[id] = don
+		} else if don.ConfigVersion > currDONState.ConfigVersion {
+			// If its in the current state and the config count for the DON has changed, mark as updated.
+			// Since the registry returns the full state we need to compare the config count.
+			updated[id] = don
+		}
+	}
+
+	for id, don := range currCCIPDONs {
+		if _, ok := newCCIPDONs[id]; !ok {
+			// In current state but not in latest registry state, so should remove.
+			removed[id] = don
+		}
+	}
+
+	return diffResult{
+		added:   added,
+		removed: removed,
+		updated: updated,
+	}, nil
+}
+
+// filterCCIPDONs filters the CCIP DONs from the given state.
+func filterCCIPDONs(
+	ccipCapability registry.Capability,
+	state *registry.RegistryMetadata,
+) (map[registry.DonID]registry.DON, error) {
+	ccipDONs := make(map[registry.DonID]registry.DON)
+	for _, don := range state.IDsToDONs {
+		_, ok := don.CapabilityConfigurations[ccipCapability.ID]
+		if ok {
+			ccipDONs[registry.DonID(don.ID)] = don
+		}
+	}
+
+	return ccipDONs, nil
+}
+
+// checkCapabilityPresence checks if the capability with the given capabilityID
+// is present in the given capability registry state.
+func checkCapabilityPresence(
+	capabilityID string,
+	state *registry.RegistryMetadata,
+) (registry.Capability, error) {
+	// Sanity check to make sure the capability registry has the capability we are looking for.
+	ccipCapability, ok := state.IDsToCapabilities[capabilityID]
+	if !ok {
+		return registry.Capability{},
+			fmt.Errorf("failed to find capability with capabilityID %s in capability registry state", capabilityID)
+	}
+
+	return ccipCapability, nil
+}
+
+// isMemberOfDON returns true if and only if the given p2pID is a member of the given DON.
+func isMemberOfDON(don registry.DON, p2pID ragep2ptypes.PeerID) bool {
+	return slices.Contains(don.Members, p2pID)
+}

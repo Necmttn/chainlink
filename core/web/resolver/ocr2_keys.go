@@ -8,8 +8,8 @@ import (
 	"github.com/graph-gophers/graphql-go"
 	"github.com/pkg/errors"
 
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/chaintype"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ocr2key"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ocr2key"
 )
 
 // OCR2ChainType defines OCR2 Chain Types accepted on this resolver
@@ -19,25 +19,37 @@ type OCR2ChainType string
 const (
 	// OCR2ChainTypeEVM defines OCR2 EVM Chain Type
 	OCR2ChainTypeEVM = "EVM"
-	// OCR2ChainTypeCosmos defines OCR2 Cosmos Chain Type
-	OCR2ChainTypeCosmos = "COSMOS"
 	// OCR2ChainTypeSolana defines OCR2 Solana Chain Type
 	OCR2ChainTypeSolana = "SOLANA"
 	// OCR2ChainTypeStarkNet defines OCR2 StarkNet Chain Type
 	OCR2ChainTypeStarkNet = "STARKNET"
+	// OCRChainTypeAptos defines OCR Aptos Chain Type
+	OCRChainTypeAptos = "APTOS"
+	// OCRChainTypeTron defines OCR2 Tron Chain Type
+	OCRChainTypeTron = "TRON"
+	// OCRChainTypeTON defines OCR2 TON Chain Type
+	OCRChainTypeTON = "TON"
+	// OCR2ChainTypeStellar defines OCR2 Stellar Chain Type
+	OCR2ChainTypeStellar = "STELLAR"
 )
 
 // ToOCR2ChainType turns a valid string into a OCR2ChainType
 func ToOCR2ChainType(s string) (OCR2ChainType, error) {
 	switch s {
-	case string(chaintype.EVM):
+	case string(corekeys.EVM):
 		return OCR2ChainTypeEVM, nil
-	case string(chaintype.Cosmos):
-		return OCR2ChainTypeCosmos, nil
-	case string(chaintype.Solana):
+	case string(corekeys.Solana):
 		return OCR2ChainTypeSolana, nil
-	case string(chaintype.StarkNet):
+	case string(corekeys.StarkNet):
 		return OCR2ChainTypeStarkNet, nil
+	case string(corekeys.Aptos):
+		return OCRChainTypeAptos, nil
+	case string(corekeys.Tron):
+		return OCRChainTypeTron, nil
+	case string(corekeys.TON):
+		return OCRChainTypeTON, nil
+	case string(corekeys.Stellar):
+		return OCR2ChainTypeStellar, nil
 	default:
 		return "", errors.New("unknown ocr2 chain type")
 	}
@@ -47,13 +59,19 @@ func ToOCR2ChainType(s string) (OCR2ChainType, error) {
 func FromOCR2ChainType(ct OCR2ChainType) string {
 	switch ct {
 	case OCR2ChainTypeEVM:
-		return string(chaintype.EVM)
-	case OCR2ChainTypeCosmos:
-		return string(chaintype.Cosmos)
+		return string(corekeys.EVM)
 	case OCR2ChainTypeSolana:
-		return string(chaintype.Solana)
+		return string(corekeys.Solana)
 	case OCR2ChainTypeStarkNet:
-		return string(chaintype.StarkNet)
+		return string(corekeys.StarkNet)
+	case OCRChainTypeAptos:
+		return string(corekeys.Aptos)
+	case OCRChainTypeTron:
+		return string(corekeys.Tron)
+	case OCRChainTypeTON:
+		return string(corekeys.TON)
+	case OCR2ChainTypeStellar:
+		return string(corekeys.Stellar)
 	default:
 		return strings.ToLower(string(ct))
 	}
@@ -115,7 +133,7 @@ func NewOCR2KeyBundlesPayload(keys []ocr2key.KeyBundle) *OCR2KeyBundlesPayloadRe
 
 // Results resolves the list of OCR2 key bundles
 func (r *OCR2KeyBundlesPayloadResolver) Results() []OCR2KeyBundleResolver {
-	var results []OCR2KeyBundleResolver
+	results := make([]OCR2KeyBundleResolver, 0, len(r.keys))
 
 	for _, k := range r.keys {
 		results = append(results, *NewOCR2KeyBundle(k))

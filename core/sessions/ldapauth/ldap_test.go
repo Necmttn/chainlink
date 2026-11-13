@@ -7,15 +7,14 @@ import (
 	"time"
 
 	"github.com/go-ldap/ldap/v3"
+	"github.com/jmoiron/sqlx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jmoiron/sqlx"
-
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/logger/audit"
 	"github.com/smartcontractkit/chainlink/v2/core/sessions"
 	"github.com/smartcontractkit/chainlink/v2/core/sessions/ldapauth"
@@ -28,7 +27,7 @@ func setupAuthenticationProvider(t *testing.T, ldapClient ldapauth.LDAPClient) (
 
 	cfg := ldapauth.TestConfig{}
 	db := pgtest.NewSqlxDB(t)
-	ldapAuthProvider, err := ldapauth.NewTestLDAPAuthenticator(db, pgtest.NewQConfig(true), &cfg, true, logger.TestLogger(t), &audit.AuditLoggerService{})
+	ldapAuthProvider, err := ldapauth.NewTestLDAPAuthenticator(db, &cfg, logger.TestSugared(t), &audit.LoggerService{})
 	if err != nil {
 		t.Fatalf("Error constructing NewTestLDAPAuthenticator: %v\n", err)
 	}
@@ -40,13 +39,14 @@ func setupAuthenticationProvider(t *testing.T, ldapClient ldapauth.LDAPClient) (
 
 func TestORM_FindUser_Empty(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	mockLdapClient := mocks.NewLDAPClient(t)
 	mockLdapConnProvider := mocks.NewLDAPConn(t)
 	mockLdapClient.On("CreateEphemeralConnection").Return(mockLdapConnProvider, nil)
 	mockLdapConnProvider.On("Close").Return(nil)
 
-	// Initilaize LDAP Authentication Provider with mock client
+	// Initialize LDAP Authentication Provider with mock client
 	_, ldapAuthProvider := setupAuthenticationProvider(t, mockLdapClient)
 
 	// User not in upstream, return no entry
@@ -56,19 +56,20 @@ func TestORM_FindUser_Empty(t *testing.T) {
 	mockLdapConnProvider.On("Search", mock.AnythingOfType("*ldap.SearchRequest")).Return(&expectedResults, nil)
 
 	// Not in upstream, no local admin users, expect error
-	_, err := ldapAuthProvider.FindUser("unknown-user")
+	_, err := ldapAuthProvider.FindUser(ctx, "unknown-user")
 	require.ErrorContains(t, err, "LDAP query returned no matching users")
 }
 
 func TestORM_FindUser_NoGroups(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	mockLdapClient := mocks.NewLDAPClient(t)
 	mockLdapConnProvider := mocks.NewLDAPConn(t)
 	mockLdapClient.On("CreateEphemeralConnection").Return(mockLdapConnProvider, nil)
 	mockLdapConnProvider.On("Close").Return(nil)
 
-	// Initilaize LDAP Authentication Provider with mock client
+	// Initialize LDAP Authentication Provider with mock client
 	_, ldapAuthProvider := setupAuthenticationProvider(t, mockLdapClient)
 
 	// User present in Upstream but no groups assigned
@@ -95,19 +96,20 @@ func TestORM_FindUser_NoGroups(t *testing.T) {
 	mockLdapConnProvider.On("Search", mock.AnythingOfType("*ldap.SearchRequest")).Return(&expectedResults, nil)
 
 	// No Groups, expect error
-	_, err := ldapAuthProvider.FindUser(user1.Email)
+	_, err := ldapAuthProvider.FindUser(ctx, user1.Email)
 	require.ErrorContains(t, err, "user present in directory, but matching no role groups assigned")
 }
 
 func TestORM_FindUser_NotActive(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	mockLdapClient := mocks.NewLDAPClient(t)
 	mockLdapConnProvider := mocks.NewLDAPConn(t)
 	mockLdapClient.On("CreateEphemeralConnection").Return(mockLdapConnProvider, nil)
 	mockLdapConnProvider.On("Close").Return(nil)
 
-	// Initilaize LDAP Authentication Provider with mock client
+	// Initialize LDAP Authentication Provider with mock client
 	_, ldapAuthProvider := setupAuthenticationProvider(t, mockLdapClient)
 
 	// User present in Upstream but not active
@@ -134,19 +136,20 @@ func TestORM_FindUser_NotActive(t *testing.T) {
 	mockLdapConnProvider.On("Search", mock.AnythingOfType("*ldap.SearchRequest")).Return(&expectedResults, nil)
 
 	// User not active, expect error
-	_, err := ldapAuthProvider.FindUser(user1.Email)
+	_, err := ldapAuthProvider.FindUser(ctx, user1.Email)
 	require.ErrorContains(t, err, "user not active")
 }
 
 func TestORM_FindUser_Single(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	mockLdapClient := mocks.NewLDAPClient(t)
 	mockLdapConnProvider := mocks.NewLDAPConn(t)
 	mockLdapClient.On("CreateEphemeralConnection").Return(mockLdapConnProvider, nil)
 	mockLdapConnProvider.On("Close").Return(nil)
 
-	// Initilaize LDAP Authentication Provider with mock client
+	// Initialize LDAP Authentication Provider with mock client
 	_, ldapAuthProvider := setupAuthenticationProvider(t, mockLdapClient)
 
 	// User present and valid
@@ -189,7 +192,7 @@ func TestORM_FindUser_Single(t *testing.T) {
 	mockLdapConnProvider.On("Search", mock.AnythingOfType("*ldap.SearchRequest")).Return(&expectedGroupResults, nil).Once()
 
 	// User active, and has editor group. Expect success
-	user, err := ldapAuthProvider.FindUser(user1.Email)
+	user, err := ldapAuthProvider.FindUser(ctx, user1.Email)
 	require.NoError(t, err)
 	require.Equal(t, user1.Email, user.Email)
 	require.Equal(t, sessions.UserRoleEdit, user.Role)
@@ -197,20 +200,22 @@ func TestORM_FindUser_Single(t *testing.T) {
 
 func TestORM_FindUser_FallbackMatchLocalAdmin(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
-	// Initilaize LDAP Authentication Provider with mock client
+	// Initialize LDAP Authentication Provider with mock client
 	mockLdapClient := mocks.NewLDAPClient(t)
 	_, ldapAuthProvider := setupAuthenticationProvider(t, mockLdapClient)
 
 	// Not in upstream, but utilize text fixture admin user presence in test DB. Succeed
-	user, err := ldapAuthProvider.FindUser(cltest.APIEmailAdmin)
+	user, err := ldapAuthProvider.FindUser(ctx, cltest.APIEmailAdmin)
 	require.NoError(t, err)
 	require.Equal(t, cltest.APIEmailAdmin, user.Email)
 	require.Equal(t, sessions.UserRoleAdmin, user.Role)
 }
 
 func TestORM_FindUserByAPIToken_Success(t *testing.T) {
-	// Initilaize LDAP Authentication Provider with mock client
+	ctx := t.Context()
+	// Initialize LDAP Authentication Provider with mock client
 	mockLdapClient := mocks.NewLDAPClient(t)
 	db, ldapAuthProvider := setupAuthenticationProvider(t, mockLdapClient)
 
@@ -221,40 +226,69 @@ func TestORM_FindUserByAPIToken_Success(t *testing.T) {
 	require.NoError(t, err)
 
 	// Found user by API token in specific ldap_user_api_tokens table
-	user, err := ldapAuthProvider.FindUserByAPIToken(apiToken)
+	user, err := ldapAuthProvider.FindUserByAPIToken(ctx, apiToken)
 	require.NoError(t, err)
 	require.Equal(t, testEmail, user.Email)
 	require.Equal(t, sessions.UserRoleEdit, user.Role)
 }
 
 func TestORM_FindUserByAPIToken_Expired(t *testing.T) {
+	ctx := t.Context()
 	cfg := ldapauth.TestConfig{}
 
-	// Initilaize LDAP Authentication Provider with mock client
+	// Initialize LDAP Authentication Provider with mock client
 	mockLdapClient := mocks.NewLDAPClient(t)
 	db, ldapAuthProvider := setupAuthenticationProvider(t, mockLdapClient)
 
 	// Ensure valid tokens return a user with role
 	testEmail := "test@test.com"
 	apiToken := "example"
-	expiredTime := time.Now().Add(-cfg.UserAPITokenDuration().Duration())
+	expiredTime := time.Now().Add(-cfg.UserAPITokenDuration().Duration() - time.Second)
 	_, err := db.Exec("INSERT INTO ldap_user_api_tokens values ($1, 'edit', false, $2, '', '', $3)", testEmail, apiToken, expiredTime)
 	require.NoError(t, err)
 
 	// Token found, but expired. Expect error
-	_, err = ldapAuthProvider.FindUserByAPIToken(apiToken)
+	_, err = ldapAuthProvider.FindUserByAPIToken(ctx, apiToken)
 	require.Equal(t, sessions.ErrUserSessionExpired, err)
+}
+
+func TestORM_DeleteAuthToken(t *testing.T) {
+	ctx := t.Context()
+
+	// Initialize LDAP Authentication Provider with mock client
+	mockLdapClient := mocks.NewLDAPClient(t)
+	db, ldapAuthProvider := setupAuthenticationProvider(t, mockLdapClient)
+
+	// Create a token for a test user
+	testEmail := "test-delete@test.com"
+	apiToken := "delete-test-token"
+	_, err := db.Exec("INSERT INTO ldap_user_api_tokens values ($1, 'edit', false, $2, '', '', now())", testEmail, apiToken)
+	require.NoError(t, err)
+
+	// Verify token exists by finding user
+	user, err := ldapAuthProvider.FindUserByAPIToken(ctx, apiToken)
+	require.NoError(t, err)
+	require.Equal(t, testEmail, user.Email)
+
+	// Delete the auth token
+	err = ldapAuthProvider.DeleteAuthToken(ctx, &user)
+	require.NoError(t, err)
+
+	// Verify token is deleted - FindUserByAPIToken should fail
+	_, err = ldapAuthProvider.FindUserByAPIToken(ctx, apiToken)
+	require.Error(t, err)
 }
 
 func TestORM_ListUsers_Full(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	mockLdapClient := mocks.NewLDAPClient(t)
 	mockLdapConnProvider := mocks.NewLDAPConn(t)
 	mockLdapClient.On("CreateEphemeralConnection").Return(mockLdapConnProvider, nil)
 	mockLdapConnProvider.On("Close").Return(nil)
 
-	// Initilaize LDAP Authentication Provider with mock client
+	// Initialize LDAP Authentication Provider with mock client
 	_, ldapAuthProvider := setupAuthenticationProvider(t, mockLdapClient)
 
 	user1 := cltest.MustRandomUser(t)
@@ -365,32 +399,33 @@ func TestORM_ListUsers_Full(t *testing.T) {
 
 	// Asserts 'uid=' parsing log in  ldapGroupMembersListToUser
 	// Expected full list of users above, including local admin user, excluding 'inactive' and duplicate users
-	users, err := ldapAuthProvider.ListUsers()
+	users, err := ldapAuthProvider.ListUsers(ctx)
 	require.NoError(t, err)
 	require.Equal(t, users[0].Email, user1.Email)
-	require.Equal(t, users[0].Role, sessions.UserRoleAdmin)
+	require.Equal(t, sessions.UserRoleAdmin, users[0].Role)
 	require.Equal(t, users[1].Email, user3.Email) // User 2 inactive
-	require.Equal(t, users[1].Role, sessions.UserRoleEdit)
+	require.Equal(t, sessions.UserRoleEdit, users[1].Role)
 	require.Equal(t, users[2].Email, user4.Email)
-	require.Equal(t, users[2].Role, sessions.UserRoleRun)
+	require.Equal(t, sessions.UserRoleRun, users[2].Role)
 	require.Equal(t, users[3].Email, user6.Email) // User 5 inactive
-	require.Equal(t, users[3].Role, sessions.UserRoleView)
-	require.Equal(t, users[4].Email, cltest.APIEmailAdmin) // Text fixture user is local admin included as well
-	require.Equal(t, users[4].Role, sessions.UserRoleAdmin)
+	require.Equal(t, sessions.UserRoleView, users[3].Role)
+	require.Equal(t, cltest.APIEmailAdmin, users[4].Email) // Text fixture user is local admin included as well
+	require.Equal(t, sessions.UserRoleAdmin, users[4].Role)
 }
 
 func TestORM_CreateSession_UpstreamBind(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	mockLdapClient := mocks.NewLDAPClient(t)
 	mockLdapConnProvider := mocks.NewLDAPConn(t)
 	mockLdapClient.On("CreateEphemeralConnection").Return(mockLdapConnProvider, nil)
 	mockLdapConnProvider.On("Close").Return(nil)
 
-	// Initilaize LDAP Authentication Provider with mock client
+	// Initialize LDAP Authentication Provider with mock client
 	_, ldapAuthProvider := setupAuthenticationProvider(t, mockLdapClient)
 
-	// Upsream user present
+	// Upstream user present
 	user1 := cltest.MustRandomUser(t)
 	expectedResults := ldap.SearchResult{ // Users query
 		Entries: []*ldap.Entry{
@@ -436,19 +471,20 @@ func TestORM_CreateSession_UpstreamBind(t *testing.T) {
 		Password: cltest.Password,
 	}
 
-	_, err := ldapAuthProvider.CreateSession(sessionRequest)
+	_, err := ldapAuthProvider.CreateSession(ctx, sessionRequest)
 	require.NoError(t, err)
 }
 
 func TestORM_CreateSession_LocalAdminFallbackLogin(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	mockLdapClient := mocks.NewLDAPClient(t)
 	mockLdapConnProvider := mocks.NewLDAPConn(t)
 	mockLdapClient.On("CreateEphemeralConnection").Return(mockLdapConnProvider, nil)
 	mockLdapConnProvider.On("Close").Return(nil)
 
-	// Initilaize LDAP Authentication Provider with mock client
+	// Initialize LDAP Authentication Provider with mock client
 	_, ldapAuthProvider := setupAuthenticationProvider(t, mockLdapClient)
 
 	// Fail the bind to trigger 'localLoginFallback' - local admin users should still be able to login
@@ -461,7 +497,7 @@ func TestORM_CreateSession_LocalAdminFallbackLogin(t *testing.T) {
 		Password: cltest.Password,
 	}
 
-	_, err := ldapAuthProvider.CreateSession(sessionRequest)
+	_, err := ldapAuthProvider.CreateSession(ctx, sessionRequest)
 	require.NoError(t, err)
 
 	// Finally, assert login failing altogether
@@ -472,19 +508,20 @@ func TestORM_CreateSession_LocalAdminFallbackLogin(t *testing.T) {
 		Password: "incorrect-password",
 	}
 
-	_, err = ldapAuthProvider.CreateSession(sessionRequest)
+	_, err = ldapAuthProvider.CreateSession(ctx, sessionRequest)
 	require.ErrorContains(t, err, "invalid password")
 }
 
 func TestORM_SetPassword_LocalAdminFallbackLogin(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	mockLdapClient := mocks.NewLDAPClient(t)
 	mockLdapConnProvider := mocks.NewLDAPConn(t)
 	mockLdapClient.On("CreateEphemeralConnection").Return(mockLdapConnProvider, nil)
 	mockLdapConnProvider.On("Close").Return(nil)
 
-	// Initilaize LDAP Authentication Provider with mock client
+	// Initialize LDAP Authentication Provider with mock client
 	_, ldapAuthProvider := setupAuthenticationProvider(t, mockLdapClient)
 
 	// Fail the bind to trigger 'localLoginFallback' - local admin users should still be able to login
@@ -497,7 +534,7 @@ func TestORM_SetPassword_LocalAdminFallbackLogin(t *testing.T) {
 		Password: cltest.Password,
 	}
 
-	_, err := ldapAuthProvider.CreateSession(sessionRequest)
+	_, err := ldapAuthProvider.CreateSession(ctx, sessionRequest)
 	require.NoError(t, err)
 
 	// Finally, assert login failing altogether
@@ -508,7 +545,7 @@ func TestORM_SetPassword_LocalAdminFallbackLogin(t *testing.T) {
 		Password: "incorrect-password",
 	}
 
-	_, err = ldapAuthProvider.CreateSession(sessionRequest)
+	_, err = ldapAuthProvider.CreateSession(ctx, sessionRequest)
 	require.ErrorContains(t, err, "invalid password")
 }
 

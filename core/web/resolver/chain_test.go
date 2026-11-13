@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -8,13 +9,19 @@ import (
 	"github.com/pelletier/go-toml/v2"
 	"github.com/stretchr/testify/require"
 
-	evmtoml "github.com/smartcontractkit/chainlink/v2/core/chains/evm/config/toml"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
+	"github.com/smartcontractkit/chainlink-common/pkg/loop"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	commontypes "github.com/smartcontractkit/chainlink-common/pkg/types"
+	evmtoml "github.com/smartcontractkit/chainlink-evm/pkg/config/toml"
+	chainlinkmocks "github.com/smartcontractkit/chainlink/v2/core/services/chainlink/mocks"
+	"github.com/smartcontractkit/chainlink/v2/core/services/relay"
+	"github.com/smartcontractkit/chainlink/v2/core/web/testutils"
 )
 
 func TestResolver_Chains(t *testing.T) {
+	t.Parallel()
 	var (
-		chainID = *big.NewI(1)
+		chainID = *sqlutil.NewI(1)
 		query   = `
 			query GetChains {
 				chains {
@@ -22,6 +29,7 @@ func TestResolver_Chains(t *testing.T) {
 						id
 						enabled
 						config
+						network
 					}
 					metadata {
 						total
@@ -39,7 +47,10 @@ FlagsContractAddress = '0xae4E781a6218A8031764928E88d457937A954fC3'
 LinkContractAddress = '0x538aAaB4ea120b2bC2fe5D296852D948F07D849e'
 LogBackfillBatchSize = 17
 LogPollInterval = '1m0s'
+LogPollerSkipEmptyBlocks = false
 LogKeepBlocksDepth = 100000
+LogPrunePageSize = 0
+BackupLogPollerBlockDelay = 100
 MinIncomingConfirmations = 13
 MinContractPayment = '9.223372036854775807 link'
 NonceAutoSync = true
@@ -69,14 +80,26 @@ ResendAfterThreshold = '1h0m0s'
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.App.On("EVMORM").Return(f.Mocks.evmORM)
-
-				f.Mocks.evmORM.PutChains(evmtoml.EVMConfig{
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				chainConf := evmtoml.EVMConfig{
 					ChainID: &chainID,
 					Enabled: chain.Enabled,
 					Chain:   chain.Chain,
-				})
+				}
+
+				chainConfToml, err2 := chainConf.TOMLString()
+				require.NoError(t, err2)
+
+				f.App.On("GetRelayers").Return(&chainlinkmocks.FakeRelayerChainInteroperators{Relayers: map[commontypes.RelayID]loop.Relayer{
+					{
+						Network: relay.NetworkEVM,
+						ChainID: chainID.String(),
+					}: &testutils.MockRelayer{ChainStatus: commontypes.ChainStatus{
+						ID:      chainID.String(),
+						Enabled: *chain.Enabled,
+						Config:  chainConfToml,
+					}},
+				}})
 			},
 			query: query,
 			result: fmt.Sprintf(`
@@ -85,7 +108,8 @@ ResendAfterThreshold = '1h0m0s'
 					"results": [{
 						"id": "1",
 						"enabled": true,
-						"config": %s
+						"config": %s,
+						"network": "evm"
 					}],
 					"metadata": {
 						"total": 1
@@ -93,14 +117,33 @@ ResendAfterThreshold = '1h0m0s'
 				}
 			}`, configTOMLEscaped),
 		},
+		unauthorizedTestCase(GQLTestCase{query: query}, "chains"),
+		{
+			name:          "no chains",
+			authenticated: true,
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.App.On("GetRelayers").Return(&chainlinkmocks.FakeRelayerChainInteroperators{Relayers: map[commontypes.RelayID]loop.Relayer{}})
+			},
+			query: query,
+			result: `
+			{
+				"chains": {
+					"results": [],
+					"metadata": {
+						"total": 0
+					}
+				}
+			}`,
+		},
 	}
 
 	RunGQLTests(t, testCases)
 }
 
 func TestResolver_Chain(t *testing.T) {
+	t.Parallel()
 	var (
-		chainID = *big.NewI(1)
+		chainID = *sqlutil.NewI(1)
 		query   = `
 			query GetChain {
 				chain(id: "1") {
@@ -108,6 +151,23 @@ func TestResolver_Chain(t *testing.T) {
 						id
 						enabled
 						config
+						network
+					}
+					... on NotFoundError {
+						code
+						message
+					}
+				}
+			}
+		`
+		queryWithNetwork = `
+			query GetChain($network: String)  {
+				chain(id: "1", network: $network) {
+					... on Chain {
+						id
+						enabled
+						config
+						network
 					}
 					... on NotFoundError {
 						code
@@ -126,7 +186,10 @@ FlagsContractAddress = '0xae4E781a6218A8031764928E88d457937A954fC3'
 LinkContractAddress = '0x538aAaB4ea120b2bC2fe5D296852D948F07D849e'
 LogBackfillBatchSize = 17
 LogPollInterval = '1m0s'
+LogPollerSkipEmptyBlocks = false
 LogKeepBlocksDepth = 100000
+LogPrunePageSize = 0
+BackupLogPollerBlockDelay = 100
 MinIncomingConfirmations = 13
 MinContractPayment = '9.223372036854775807 link'
 NonceAutoSync = true
@@ -156,12 +219,25 @@ ResendAfterThreshold = '1h0m0s'
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.App.On("EVMORM").Return(f.Mocks.evmORM)
-				f.Mocks.evmORM.PutChains(evmtoml.EVMConfig{
-					ChainID: &chainID,
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				chainConf := evmtoml.EVMConfig{
 					Chain:   chain,
-				})
+					ChainID: &chainID,
+				}
+
+				chainConfToml, err2 := chainConf.TOMLString()
+				require.NoError(t, err2)
+
+				f.App.On("GetRelayers").Return(&chainlinkmocks.FakeRelayerChainInteroperators{Relayers: map[commontypes.RelayID]loop.Relayer{
+					{
+						Network: relay.NetworkEVM,
+						ChainID: chainID.String(),
+					}: &testutils.MockRelayer{ChainStatus: commontypes.ChainStatus{
+						ID:      chainID.String(),
+						Enabled: chainConf.IsEnabled(),
+						Config:  chainConfToml,
+					}},
+				}})
 			},
 			query: query,
 			result: fmt.Sprintf(`
@@ -169,15 +245,16 @@ ResendAfterThreshold = '1h0m0s'
 					"chain": {
 						"id": "1",
 						"enabled": true,
-						"config": %s
+						"config": %s,
+						"network": "evm"
 					}
 				}`, configTOMLEscaped),
 		},
 		{
 			name:          "not found error",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.App.On("EVMORM").Return(f.Mocks.evmORM)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.App.On("GetRelayers").Return(&chainlinkmocks.FakeRelayerChainInteroperators{Relayers: map[commontypes.RelayID]loop.Relayer{}})
 			},
 			query: query,
 			result: `
@@ -187,6 +264,51 @@ ResendAfterThreshold = '1h0m0s'
 						"message": "chain not found"
 					}
 				}`,
+		},
+		{
+			name:          "should return aptos chain if network is aptos",
+			authenticated: true,
+			variables: map[string]any{
+				"network": relay.NetworkAptos,
+			},
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				chainConf := evmtoml.EVMConfig{
+					Chain:   chain,
+					ChainID: &chainID,
+				}
+
+				chainConfToml, err2 := chainConf.TOMLString()
+				require.NoError(t, err2)
+
+				f.App.On("GetRelayers").Return(&chainlinkmocks.FakeRelayerChainInteroperators{Relayers: map[commontypes.RelayID]loop.Relayer{
+					{
+						Network: relay.NetworkEVM,
+						ChainID: chainID.String(),
+					}: &testutils.MockRelayer{ChainStatus: commontypes.ChainStatus{
+						ID:      chainID.String(),
+						Enabled: chainConf.IsEnabled(),
+						Config:  chainConfToml,
+					}},
+					{
+						Network: relay.NetworkAptos,
+						ChainID: chainID.String(),
+					}: &testutils.MockRelayer{ChainStatus: commontypes.ChainStatus{
+						ID:      chainID.String(),
+						Enabled: chainConf.IsEnabled(),
+						Config:  chainConfToml,
+					}},
+				}})
+			},
+			query: queryWithNetwork,
+			result: fmt.Sprintf(`
+				{
+					"chain": {
+						"id": "1",
+						"enabled": true,
+						"config": %s,
+						"network": "aptos"
+					}
+				}`, configTOMLEscaped),
 		},
 	}
 

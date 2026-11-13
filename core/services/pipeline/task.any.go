@@ -7,7 +7,7 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 )
 
 // AnyTask picks a value at random from the set of non-errored inputs.
@@ -27,7 +27,7 @@ func (t *AnyTask) Run(_ context.Context, _ logger.Logger, _ Vars, inputs []Resul
 		return Result{Error: errors.Wrapf(ErrWrongInputCardinality, "AnyTask requires at least 1 input")}, runInfo
 	}
 
-	var answers []interface{}
+	var answers []any
 
 	for _, input := range inputs {
 		if input.Error != nil {

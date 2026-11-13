@@ -8,15 +8,15 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/pkg/errors"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-evm/pkg/types"
 )
 
 // Coordinator defines an interface for fetching request and fulfillment metadata from a VRF
 // coordinator.
 type Coordinator interface {
 	// Requests fetches VRF requests that occurred within the specified blocks.
-	Requests(ctx context.Context, fromBlock uint64, toBlock uint64) ([]Event, error)
+	Requests(ctx context.Context, fromBlock, toBlock uint64) ([]Event, error)
 
 	// Fulfillments fetches VRF fulfillments that occurred since the specified block.
 	Fulfillments(ctx context.Context, fromBlock uint64) ([]Event, error)
@@ -33,8 +33,6 @@ type Event struct {
 }
 
 // BHS defines an interface for interacting with a BlockhashStore contract.
-//
-//go:generate mockery --quiet --name BHS --output ./mocks/ --case=underscore
 type BHS interface {
 	// Store the hash associated with blockNum.
 	Store(ctx context.Context, blockNum uint64) error
@@ -79,12 +77,12 @@ func GetUnfulfilledBlocksAndRequests(
 			"err", err)
 		return nil, errors.Wrap(err, "fetching VRF fulfillments")
 	}
-	for _, ful := range fuls {
-		requestBlock, ok := requestIDToBlock[ful.ID]
+	for _, full := range fuls {
+		requestBlock, ok := requestIDToBlock[full.ID]
 		if !ok {
 			continue
 		}
-		delete(blockToRequests[requestBlock], ful.ID)
+		delete(blockToRequests[requestBlock], full.ID)
 	}
 
 	return blockToRequests, nil
@@ -112,7 +110,7 @@ func DecreasingBlockRange(start, end *big.Int) (ret []*big.Int, err error) {
 	for i := new(big.Int).Set(start); i.Cmp(end) >= 0; i.Sub(i, big.NewInt(1)) {
 		ret = append(ret, new(big.Int).Set(i))
 	}
-	return
+	return ret, err
 }
 
 // GetSearchWindow returns the search window (fromBlock, toBlock) given the latest block number, wait blocks and lookback blocks
@@ -133,8 +131,8 @@ func GetSearchWindow(latestBlock, waitBlocks, lookbackBlocks int) (uint64, uint6
 }
 
 // SendingKeys returns a list of sending keys (common.Address) given EIP55 addresses
-func SendingKeys(fromAddresses []ethkey.EIP55Address) []common.Address {
-	var keys []common.Address
+func SendingKeys(fromAddresses []types.EIP55Address) []common.Address {
+	keys := make([]common.Address, 0, len(fromAddresses))
 	for _, a := range fromAddresses {
 		keys = append(keys, a.Address())
 	}

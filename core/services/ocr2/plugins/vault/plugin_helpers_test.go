@@ -1,0 +1,263 @@
+package vault
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/libocr/offchainreporting2plus/ocr3_1types"
+	"github.com/smartcontractkit/libocr/offchainreporting2plus/ocr3types"
+	"github.com/smartcontractkit/tdh2/go/tdh2/tdh2easy"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities/consensus/requests"
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/cresettings"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/limits"
+	vaultcap "github.com/smartcontractkit/chainlink/v2/core/capabilities/vault"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities/vault/vaulttypes"
+)
+
+type testPluginOption func(*testPluginBuildOpts)
+
+type testPluginBuildOpts struct {
+	lggr                                 logger.SugaredLogger
+	store                                *requests.Store[*vaulttypes.Request]
+	publicKey                            *tdh2easy.PublicKey
+	privateKeyShare                      *tdh2easy.PrivateShare
+	onchainCfg                           ocr3types.ReportingPluginConfig
+	maxSecretsPerOwner                   int
+	maxCiphertextLengthBytes             int
+	maxIdentifierOwnerLengthBytes        int
+	maxIdentifierNamespaceLengthBytes    int
+	maxIdentifierKeyLengthBytes          int
+	maxRequestBatchSize                  int
+	batchSize                            int
+	maxBlobPayloadBytes                  int
+	vaultPendingQueueStallThreshold      int
+	marshalBlob                          func(ocr3_1types.BlobHandle) ([]byte, error)
+	unmarshalBlob                        func([]byte) (ocr3_1types.BlobHandle, error)
+	maxObservationBytesOverride          int
+	maxReportsPlusPrecursorBytesOverride int
+}
+
+func withLggr(lggr logger.Logger) testPluginOption {
+	return func(o *testPluginBuildOpts) { o.lggr = logger.Sugared(lggr) }
+}
+
+func withStore(store *requests.Store[*vaulttypes.Request]) testPluginOption {
+	return func(o *testPluginBuildOpts) { o.store = store }
+}
+
+func withKeys(pk *tdh2easy.PublicKey, share *tdh2easy.PrivateShare) testPluginOption {
+	return func(o *testPluginBuildOpts) {
+		o.publicKey = pk
+		o.privateKeyShare = share
+	}
+}
+
+func withMaxCiphertextLengthBytes(n int) testPluginOption {
+	return func(o *testPluginBuildOpts) { o.maxCiphertextLengthBytes = n }
+}
+
+func withMaxIdentifierLengths(owner, namespace, key int) testPluginOption {
+	return func(o *testPluginBuildOpts) {
+		o.maxIdentifierOwnerLengthBytes = owner
+		o.maxIdentifierNamespaceLengthBytes = namespace
+		o.maxIdentifierKeyLengthBytes = key
+	}
+}
+
+func withMaxSecretsPerOwner(n int) testPluginOption {
+	return func(o *testPluginBuildOpts) { o.maxSecretsPerOwner = n }
+}
+
+func withVaultPendingQueueStallThreshold(n int) testPluginOption {
+	return func(o *testPluginBuildOpts) { o.vaultPendingQueueStallThreshold = n }
+}
+
+func withOnchainCfg(n, f int) testPluginOption {
+	return func(o *testPluginBuildOpts) {
+		o.onchainCfg = ocr3types.ReportingPluginConfig{N: n, F: f}
+	}
+}
+
+func withBatchSize(n int) testPluginOption {
+	return func(o *testPluginBuildOpts) { o.batchSize = n }
+}
+
+func withMaxRequestBatchSize(n int) testPluginOption {
+	return func(o *testPluginBuildOpts) { o.maxRequestBatchSize = n }
+}
+
+func withMaxBlobPayloadBytes(n int) testPluginOption {
+	return func(o *testPluginBuildOpts) { o.maxBlobPayloadBytes = n }
+}
+
+func withMarshalBlob(fn func(ocr3_1types.BlobHandle) ([]byte, error)) testPluginOption {
+	return func(o *testPluginBuildOpts) { o.marshalBlob = fn }
+}
+
+func withMaxObservationBytes(n int) testPluginOption {
+	return func(o *testPluginBuildOpts) { o.maxObservationBytesOverride = n }
+}
+
+func newTestReportingPlugin(t *testing.T, opts ...testPluginOption) *ReportingPlugin {
+	t.Helper()
+	o := testPluginBuildOpts{
+		lggr:                              logger.TestSugared(t),
+		store:                             requests.NewStore[*vaulttypes.Request](),
+		onchainCfg:                        ocr3types.ReportingPluginConfig{N: 0, F: 0},
+		maxSecretsPerOwner:                1,
+		maxCiphertextLengthBytes:          1024,
+		maxIdentifierOwnerLengthBytes:     100,
+		maxIdentifierNamespaceLengthBytes: 100,
+		maxIdentifierKeyLengthBytes:       100,
+		maxRequestBatchSize:               10,
+		batchSize:                         10,
+		marshalBlob:                       mockMarshalBlob,
+		unmarshalBlob:                     mockUnmarshalBlob,
+	}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	cfg := makeReportingPluginConfig(t, o.batchSize, o.publicKey, o.privateKeyShare, o.maxSecretsPerOwner, o.maxBlobPayloadBytes)
+	if o.vaultPendingQueueStallThreshold > 0 {
+		stallLimiter, err := limits.MakeUpperBoundLimiter(
+			limits.Factory{Settings: cresettings.DefaultGetter},
+			settings.Int(o.vaultPendingQueueStallThreshold),
+		)
+		require.NoError(t, err)
+		cfg.VaultPendingQueueStallThreshold = stallLimiter
+	}
+	ctx := context.Background()
+	pl, err := initializePluginLimits(ctx, limits.Factory{Settings: cresettings.DefaultGetter})
+	require.NoError(t, err)
+	maxObs := pl.MaxObservationBytes
+	maxPrec := pl.MaxReportsPlusPrecursorBytes
+	if o.maxObservationBytesOverride > 0 {
+		maxObs = o.maxObservationBytesOverride
+	}
+	if o.maxReportsPlusPrecursorBytesOverride > 0 {
+		maxPrec = o.maxReportsPlusPrecursorBytesOverride
+	}
+	lc, err := vaultcap.NewRequestLifecycleTracker(o.lggr)
+	require.NoError(t, err)
+	validator := makeTestValidator(t,
+		o.maxCiphertextLengthBytes,
+		o.maxIdentifierOwnerLengthBytes,
+		o.maxIdentifierNamespaceLengthBytes,
+		o.maxIdentifierKeyLengthBytes,
+		o.maxRequestBatchSize,
+	)
+	metrics := newTestMetrics(t)
+	return &ReportingPlugin{
+		lggr:       o.lggr,
+		store:      o.store,
+		metrics:    metrics,
+		cfg:        cfg,
+		onchainCfg: o.onchainCfg,
+		validator:  validator,
+		reads: &getSecretsHandler{
+			lggr:            o.lggr,
+			metrics:         metrics,
+			validator:       validator,
+			publicKey:       o.publicKey,
+			privateKeyShare: o.privateKeyShare,
+		},
+		lifecycle:                    lc,
+		marshalBlob:                  o.marshalBlob,
+		unmarshalBlob:                o.unmarshalBlob,
+		maxObservationBytes:          maxObs,
+		maxReportsPlusPrecursorBytes: maxPrec,
+	}
+}
+
+func makeTestValidator(
+	t *testing.T,
+	maxCipherTextLengthBytes int,
+	maxIdentifierOwnerLengthBytes int,
+	maxIdentifierNamespaceOwnerLengthBytes int,
+	maxIdentifierKeyLengthBytes int,
+	maxRequestBatchSize int,
+) *vaultcap.RequestValidator {
+	t.Helper()
+
+	cipherTextLimiter, err := limits.MakeUpperBoundLimiter(limits.Factory{Settings: cresettings.DefaultGetter}, settings.Size(commonconfig.Size(maxCipherTextLengthBytes)*commonconfig.Byte))
+	require.NoError(t, err)
+
+	ownerLimiter, err := limits.MakeUpperBoundLimiter(limits.Factory{Settings: cresettings.DefaultGetter}, settings.Size(commonconfig.Size(maxIdentifierOwnerLengthBytes)*commonconfig.Byte))
+	require.NoError(t, err)
+
+	namespaceOwnerLimiter, err := limits.MakeUpperBoundLimiter(limits.Factory{Settings: cresettings.DefaultGetter}, settings.Size(commonconfig.Size(maxIdentifierNamespaceOwnerLengthBytes)*commonconfig.Byte))
+	require.NoError(t, err)
+
+	keyLimiter, err := limits.MakeUpperBoundLimiter(limits.Factory{Settings: cresettings.DefaultGetter}, settings.Size(commonconfig.Size(maxIdentifierKeyLengthBytes)*commonconfig.Byte))
+	require.NoError(t, err)
+
+	requestBatchSizeLimiter, err := limits.MakeUpperBoundLimiter(limits.Factory{Settings: cresettings.DefaultGetter}, settings.Int(maxRequestBatchSize))
+	require.NoError(t, err)
+
+	return vaultcap.NewRequestValidator(
+		requestBatchSizeLimiter,
+		cipherTextLimiter,
+		keyLimiter,
+		ownerLimiter,
+		namespaceOwnerLimiter,
+	)
+}
+
+func makeReportingPluginConfig(
+	t *testing.T,
+	batchSize int,
+	publicKey *tdh2easy.PublicKey,
+	privateKeyShare *tdh2easy.PrivateShare,
+	maxSecretsPerOwner int,
+	maxBlobPayloadBytes int,
+) *ReportingPluginConfig {
+	msl, err := limits.MakeUpperBoundLimiter(limits.Factory{Settings: cresettings.DefaultGetter}, settings.Int(maxSecretsPerOwner))
+	require.NoError(t, err)
+
+	shareLimiter, err := limits.MakeUpperBoundLimiter(limits.Factory{Settings: cresettings.DefaultGetter}, cresettings.Default.VaultShareSizeLimit)
+	require.NoError(t, err)
+
+	bsl, err := limits.MakeUpperBoundLimiter(limits.Factory{Settings: cresettings.DefaultGetter}, settings.Int(batchSize))
+	require.NoError(t, err)
+
+	maxPendingQueueWriteSizeLimiter, err := limits.MakeUpperBoundLimiter(limits.Factory{Settings: cresettings.DefaultGetter}, cresettings.Default.VaultPendingQueueWriteSizeLimit)
+	require.NoError(t, err)
+
+	pendingQueueStallThresholdLimiter, err := limits.MakeUpperBoundLimiter(limits.Factory{Settings: cresettings.DefaultGetter}, settings.Int(0))
+	require.NoError(t, err)
+
+	var maxBlobPayloadLimiter limits.BoundLimiter[commonconfig.Size]
+	if maxBlobPayloadBytes > 0 {
+		maxBlobPayloadLimiter, err = limits.MakeUpperBoundLimiter(limits.Factory{Settings: cresettings.DefaultGetter}, settings.Size(commonconfig.Size(maxBlobPayloadBytes)*commonconfig.Byte))
+	} else {
+		maxBlobPayloadLimiter, err = limits.MakeUpperBoundLimiter(limits.Factory{Settings: cresettings.DefaultGetter}, cresettings.Default.VaultMaxBlobPayloadSizeLimit)
+	}
+	require.NoError(t, err)
+
+	return &ReportingPluginConfig{
+		MaxBatchSize:                    bsl,
+		MaxPendingQueueWriteSize:        maxPendingQueueWriteSizeLimiter,
+		PublicKey:                       publicKey,
+		PrivateKeyShare:                 privateKeyShare,
+		MaxSecretsPerOwner:              msl,
+		MaxShareLengthBytes:             shareLimiter,
+		MaxBlobPayloadBytes:             maxBlobPayloadLimiter,
+		VaultForceEmptyOCRRounds:        limits.NewGateLimiter(false),
+		VaultGetSecretsIncludePublicKey: limits.NewGateLimiter(false),
+		VaultPendingQueueStallThreshold: pendingQueueStallThresholdLimiter,
+	}
+}
+
+func mockUnmarshalBlob(data []byte) (ocr3_1types.BlobHandle, error) {
+	return ocr3_1types.BlobHandle{}, nil
+}
+
+func mockMarshalBlob(ocr3_1types.BlobHandle) ([]byte, error) {
+	return []byte{}, nil
+}

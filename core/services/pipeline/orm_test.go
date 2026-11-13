@@ -1,40 +1,61 @@
 package pipeline_test
 
 import (
+	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/guregu/null.v4"
 
-	"github.com/jmoiron/sqlx"
-
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
 	"github.com/smartcontractkit/chainlink-common/pkg/utils/hex"
+	"github.com/smartcontractkit/chainlink-common/pkg/utils/jsonserializable"
 	"github.com/smartcontractkit/chainlink/v2/core/bridges"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest/heavyweight"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/v2/core/services/cron"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
-	"github.com/smartcontractkit/chainlink/v2/core/services/pg"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
-	"github.com/smartcontractkit/chainlink/v2/core/store/models"
+	"github.com/smartcontractkit/chainlink/v2/core/testdata/testspecs"
+	"github.com/smartcontractkit/chainlink/v2/core/utils/testutils/heavyweight"
 )
 
-type ormconfig struct {
-	pg.QConfig
+type testOnlyORM interface {
+	pipeline.ORM
+	AddJobPipelineSpecWithoutConstraints(ctx context.Context, jobID, pipelineSpecID int32) error
 }
 
-func (ormconfig) JobPipelineMaxSuccessfulRuns() uint64 { return 123456 }
+type testORM struct {
+	pipeline.ORM
+	ds sqlutil.DataSource
+}
 
-func setupORM(t *testing.T, heavy bool) (db *sqlx.DB, orm pipeline.ORM) {
+func (torm *testORM) AddJobPipelineSpecWithoutConstraints(ctx context.Context, jobID, pipelineSpecID int32) error {
+	_, err := torm.ds.ExecContext(ctx, `SET CONSTRAINTS fk_job_pipeline_spec_job DEFERRED`)
+	if err != nil {
+		return err
+	}
+	_, err = torm.ds.ExecContext(ctx, `INSERT INTO job_pipeline_specs (job_id,pipeline_spec_id, is_primary) VALUES ($1, $2, false)`, jobID, pipelineSpecID)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func newTestORM(orm pipeline.ORM, ds sqlutil.DataSource) testOnlyORM {
+	return &testORM{ORM: orm, ds: ds}
+}
+
+func setupORM(t *testing.T, heavy bool) (db *sqlx.DB, orm pipeline.ORM, jorm job.ORM) {
 	t.Helper()
 
 	if heavy {
@@ -42,33 +63,38 @@ func setupORM(t *testing.T, heavy bool) (db *sqlx.DB, orm pipeline.ORM) {
 	} else {
 		db = pgtest.NewSqlxDB(t)
 	}
-	cfg := ormconfig{pgtest.NewQConfig(true)}
-	orm = pipeline.NewORM(db, logger.TestLogger(t), cfg, cfg.JobPipelineMaxSuccessfulRuns())
+	orm = pipeline.NewORM(db, logger.TestLogger(t), 123456)
+	lggr := logger.TestLogger(t)
+	keyStore := cltest.NewKeyStore(t, db)
+	bridgeORM := bridges.NewORM(db)
 
-	return
+	jorm = job.NewORM(db, orm, bridgeORM, keyStore, lggr)
+
+	return db, orm, jorm
 }
 
-func setupHeavyORM(t *testing.T) (db *sqlx.DB, orm pipeline.ORM) {
+func setupHeavyORM(t *testing.T) (db *sqlx.DB, orm pipeline.ORM, jorm job.ORM) {
 	return setupORM(t, true)
 }
 
-func setupLiteORM(t *testing.T) (db *sqlx.DB, orm pipeline.ORM) {
+func setupLiteORM(t *testing.T) (db *sqlx.DB, orm pipeline.ORM, jorm job.ORM) {
 	return setupORM(t, false)
 }
 
 func Test_PipelineORM_CreateSpec(t *testing.T) {
-	db, orm := setupLiteORM(t)
+	ctx := t.Context()
+	db, orm, _ := setupLiteORM(t)
 
 	var (
 		source          = ""
-		maxTaskDuration = models.Interval(1 * time.Minute)
+		maxTaskDuration = sqlutil.Interval(1 * time.Minute)
 	)
 
 	p := pipeline.Pipeline{
 		Source: source,
 	}
 
-	id, err := orm.CreateSpec(p, maxTaskDuration)
+	id, err := orm.CreateSpec(ctx, p, maxTaskDuration)
 	require.NoError(t, err)
 
 	actual := pipeline.Spec{}
@@ -79,13 +105,16 @@ func Test_PipelineORM_CreateSpec(t *testing.T) {
 }
 
 func Test_PipelineORM_FindRun(t *testing.T) {
-	db, orm := setupLiteORM(t)
+	db, orm, _ := setupLiteORM(t)
 
-	_, err := db.Exec(`SET CONSTRAINTS pipeline_runs_pipeline_spec_id_fkey DEFERRED`)
+	_, err := db.Exec(`SET CONSTRAINTS fk_pipeline_runs_pruning_key DEFERRED`)
+	require.NoError(t, err)
+	_, err = db.Exec(`SET CONSTRAINTS pipeline_runs_pipeline_spec_id_fkey DEFERRED`)
 	require.NoError(t, err)
 	expected := mustInsertPipelineRun(t, orm)
 
-	run, err := orm.FindRun(expected.ID)
+	ctx := t.Context()
+	run, err := orm.FindRun(ctx, expected.ID)
 	require.NoError(t, err)
 
 	require.Equal(t, expected.ID, run.ID)
@@ -96,72 +125,65 @@ func mustInsertPipelineRun(t *testing.T, orm pipeline.ORM) pipeline.Run {
 
 	run := pipeline.Run{
 		State:       pipeline.RunStatusRunning,
-		Outputs:     pipeline.JSONSerializable{},
+		Outputs:     jsonserializable.JSONSerializable{},
 		AllErrors:   pipeline.RunErrors{},
 		FatalErrors: pipeline.RunErrors{},
 		FinishedAt:  null.Time{},
 	}
 
-	require.NoError(t, orm.InsertRun(&run))
+	ctx := t.Context()
+	require.NoError(t, orm.InsertRun(ctx, &run))
 	return run
 }
 
-func mustInsertAsyncRun(t *testing.T, orm pipeline.ORM) *pipeline.Run {
+func mustInsertAsyncRun(t *testing.T, orm pipeline.ORM, jobORM job.ORM) *pipeline.Run {
 	t.Helper()
+	ctx := t.Context()
 
-	s := `
-ds1 [type=bridge async=true name="example-bridge" timeout=0 requestData=<{"data": {"coin": "BTC", "market": "USD"}}>]
-ds1_parse [type=jsonparse lax=false  path="data,result"]
-ds1_multiply [type=multiply times=1000000000000000000]
-
-ds1->ds1_parse->ds1_multiply->answer1;
-
-answer1 [type=median index=0];
-answer2 [type=bridge name=election_winner index=1];
-`
-
-	p, err := pipeline.Parse(s)
+	jb, err := cron.ValidatedCronSpec(fmt.Sprintf(testspecs.CronSpecTemplate, uuid.New()))
 	require.NoError(t, err)
-	require.NotNil(t, p)
-
-	maxTaskDuration := models.Interval(1 * time.Minute)
-	specID, err := orm.CreateSpec(*p, maxTaskDuration)
+	err = jobORM.CreateJob(ctx, &jb)
 	require.NoError(t, err)
 
 	run := &pipeline.Run{
-		PipelineSpecID: specID,
+		PipelineSpecID: jb.PipelineSpecID, //nolint:staticcheck // SA1019: legacy column scanned back by CreateJob; used to link the pipeline run
+		PruningKey:     jb.ID,
 		State:          pipeline.RunStatusRunning,
-		Outputs:        pipeline.JSONSerializable{},
+		Outputs:        jsonserializable.JSONSerializable{},
 		CreatedAt:      time.Now(),
 	}
 
-	err = orm.CreateRun(run)
+	err = orm.CreateRun(ctx, run)
 	require.NoError(t, err)
 	return run
 }
 
 func TestInsertFinishedRuns(t *testing.T) {
-	db, orm := setupLiteORM(t)
+	ctx := t.Context()
+	db, orm, _ := setupLiteORM(t)
 
-	_, err := db.Exec(`SET CONSTRAINTS pipeline_runs_pipeline_spec_id_fkey DEFERRED`)
+	_, err := db.Exec(`SET CONSTRAINTS fk_pipeline_runs_pruning_key DEFERRED`)
+	require.NoError(t, err)
+	_, err = db.Exec(`SET CONSTRAINTS pipeline_runs_pipeline_spec_id_fkey DEFERRED`)
 	require.NoError(t, err)
 
-	ps := cltest.MustInsertPipelineSpec(t, db)
+	ps := mustInsertPipelineSpec(t, db)
 
-	var runs []*pipeline.Run
-	for i := 0; i < 3; i++ {
+	runs := make([]*pipeline.Run, 0, 3)
+	for range 3 {
 		now := time.Now()
 		r := pipeline.Run{
 			PipelineSpecID: ps.ID,
+			PruningKey:     ps.ID, // using the spec ID as the pruning key for test purposes, this is supposed to be the job ID
 			State:          pipeline.RunStatusRunning,
 			AllErrors:      pipeline.RunErrors{},
 			FatalErrors:    pipeline.RunErrors{},
 			CreatedAt:      now,
 			FinishedAt:     null.Time{},
-			Outputs:        pipeline.JSONSerializable{},
+			Outputs:        jsonserializable.JSONSerializable{},
 		}
 
-		require.NoError(t, orm.InsertRun(&r))
+		require.NoError(t, orm.InsertRun(ctx, &r))
 
 		r.PipelineTaskRuns = []pipeline.TaskRun{
 			{
@@ -177,13 +199,13 @@ func TestInsertFinishedRuns(t *testing.T) {
 				PipelineRunID: r.ID,
 				Type:          "median",
 				DotID:         "answer2",
-				Output:        pipeline.JSONSerializable{Val: 1, Valid: true},
+				Output:        jsonserializable.JSONSerializable{Val: 1, Valid: true},
 				CreatedAt:     now,
 				FinishedAt:    null.TimeFrom(now.Add(200 * time.Millisecond)),
 			},
 		}
 		r.FinishedAt = null.TimeFrom(now.Add(300 * time.Millisecond))
-		r.Outputs = pipeline.JSONSerializable{
+		r.Outputs = jsonserializable.JSONSerializable{
 			Val:   "stuff",
 			Valid: true,
 		}
@@ -192,16 +214,92 @@ func TestInsertFinishedRuns(t *testing.T) {
 		runs = append(runs, &r)
 	}
 
-	err = orm.InsertFinishedRuns(runs, true)
+	err = orm.InsertFinishedRuns(ctx, runs, true)
+	require.NoError(t, err)
+}
+
+func Test_PipelineORM_InsertFinishedRunWithSpec(t *testing.T) {
+	ctx := t.Context()
+	db, orm, jorm := setupLiteORM(t)
+
+	s := `
+ds1 [type=bridge async=true name="example-bridge" timeout=0 requestData=<{"data": {"coin": "BTC", "market": "USD"}}>]
+ds1_parse [type=jsonparse lax=false  path="data,result"]
+ds1_multiply [type=multiply times=1000000000000000000]
+
+ds1->ds1_parse->ds1_multiply->answer1;
+
+answer1 [type=median index=0];
+answer2 [type=bridge name=election_winner index=1];
+`
+	jb, err := cron.ValidatedCronSpec(fmt.Sprintf(testspecs.CronSpecTemplate, uuid.New()))
+	require.NoError(t, err)
+	err = jorm.CreateJob(ctx, &jb)
+	require.NoError(t, err)
+	spec := pipeline.Spec{
+		DotDagSource:    s,
+		CreatedAt:       time.Now(),
+		MaxTaskDuration: sqlutil.Interval(1 * time.Minute),
+		JobID:           jb.ID,
+		JobName:         jb.Name.ValueOrZero(),
+		JobType:         string(jb.Type),
+	}
+	defaultVars := map[string]any{
+		"jb": map[string]any{
+			"databaseID":    jb.ID,
+			"externalJobID": jb.ExternalJobID,
+			"name":          jb.Name.ValueOrZero(),
+		},
+	}
+	now := time.Now()
+	run := pipeline.NewRun(spec, pipeline.NewVarsFrom(defaultVars))
+	run.PipelineTaskRuns = []pipeline.TaskRun{
+		{
+			ID:            uuid.New(),
+			PipelineRunID: run.ID,
+			Type:          "bridge",
+			DotID:         "ds1",
+			CreatedAt:     now,
+			FinishedAt:    null.TimeFrom(now.Add(100 * time.Millisecond)),
+		},
+		{
+			ID:            uuid.New(),
+			PipelineRunID: run.ID,
+			Type:          "median",
+			DotID:         "answer2",
+			Output:        jsonserializable.JSONSerializable{Val: 1, Valid: true},
+			CreatedAt:     now,
+			FinishedAt:    null.TimeFrom(now.Add(200 * time.Millisecond)),
+		},
+	}
+	run.FinishedAt = null.TimeFrom(now.Add(300 * time.Millisecond))
+	run.Outputs = jsonserializable.JSONSerializable{
+		Val:   "stuff",
+		Valid: true,
+	}
+	run.AllErrors = append(run.AllErrors, null.NewString("", false))
+	run.State = pipeline.RunStatusCompleted
+
+	err = orm.InsertFinishedRunWithSpec(ctx, run, true)
 	require.NoError(t, err)
 
+	var pipelineSpec pipeline.Spec
+	err = db.Get(&pipelineSpec, "SELECT pipeline_specs.* FROM pipeline_specs JOIN job_pipeline_specs ON (pipeline_specs.id = job_pipeline_specs.pipeline_spec_id) WHERE job_pipeline_specs.job_id = $1 AND pipeline_specs.id = $2", jb.ID, run.PipelineSpecID)
+	require.NoError(t, err)
+	var jobPipelineSpec job.PipelineSpec
+	err = db.Get(&jobPipelineSpec, "SELECT * FROM job_pipeline_specs WHERE job_id = $1 AND pipeline_spec_id = $2", jb.ID, pipelineSpec.ID)
+	require.NoError(t, err)
+
+	assert.Equal(t, run.PipelineSpecID, pipelineSpec.ID)
+	assert.False(t, jobPipelineSpec.IsPrimary)
 }
 
 // Tests that inserting run results, then later updating the run results via upsert will work correctly.
 func Test_PipelineORM_StoreRun_ShouldUpsert(t *testing.T) {
-	_, orm := setupLiteORM(t)
+	ctx := t.Context()
+	_, orm, jorm := setupLiteORM(t)
 
-	run := mustInsertAsyncRun(t, orm)
+	run := mustInsertAsyncRun(t, orm, jorm)
 
 	now := time.Now()
 
@@ -221,23 +319,23 @@ func Test_PipelineORM_StoreRun_ShouldUpsert(t *testing.T) {
 			PipelineRunID: run.ID,
 			Type:          "median",
 			DotID:         "answer2",
-			Output:        pipeline.JSONSerializable{Val: 1, Valid: true},
+			Output:        jsonserializable.JSONSerializable{Val: 1, Valid: true},
 			CreatedAt:     now,
 			FinishedAt:    null.TimeFrom(now),
 		},
 	}
-	restart, err := orm.StoreRun(run)
+	restart, err := orm.StoreRun(ctx, run)
 	require.NoError(t, err)
 	// no new data, so we don't need a restart
-	require.Equal(t, false, restart)
+	require.False(t, restart)
 	// the run is paused
 	require.Equal(t, pipeline.RunStatusSuspended, run.State)
 
-	r, err := orm.FindRun(run.ID)
+	r, err := orm.FindRun(ctx, run.ID)
 	require.NoError(t, err)
 	run = &r
 	// this is an incomplete run, so partial results should be present (regardless of saveSuccessfulTaskRuns)
-	require.Equal(t, 2, len(run.PipelineTaskRuns))
+	require.Len(t, run.PipelineTaskRuns, 2)
 	// and ds1 is not finished
 	task := run.ByDotID("ds1")
 	require.NotNil(t, task)
@@ -252,23 +350,23 @@ func Test_PipelineORM_StoreRun_ShouldUpsert(t *testing.T) {
 			PipelineRunID: run.ID,
 			Type:          "bridge",
 			DotID:         "ds1",
-			Output:        pipeline.JSONSerializable{Val: 2, Valid: true},
+			Output:        jsonserializable.JSONSerializable{Val: 2, Valid: true},
 			CreatedAt:     now,
 			FinishedAt:    null.TimeFrom(now),
 		},
 	}
-	restart, err = orm.StoreRun(run)
+	restart, err = orm.StoreRun(ctx, run)
 	require.NoError(t, err)
 	// no new data, so we don't need a restart
-	require.Equal(t, false, restart)
+	require.False(t, restart)
 	// the run is paused
 	require.Equal(t, pipeline.RunStatusSuspended, run.State)
 
-	r, err = orm.FindRun(run.ID)
+	r, err = orm.FindRun(ctx, run.ID)
 	require.NoError(t, err)
 	run = &r
 	// this is an incomplete run, so partial results should be present (regardless of saveSuccessfulTaskRuns)
-	require.Equal(t, 2, len(run.PipelineTaskRuns))
+	require.Len(t, run.PipelineTaskRuns, 2)
 	// and ds1 is finished
 	task = run.ByDotID("ds1")
 	require.NotNil(t, task)
@@ -278,38 +376,40 @@ func Test_PipelineORM_StoreRun_ShouldUpsert(t *testing.T) {
 // Tests that trying to persist a partial run while new data became available (i.e. via /v2/restart)
 // will detect a restart and update the result data on the Run.
 func Test_PipelineORM_StoreRun_DetectsRestarts(t *testing.T) {
-	db, orm := setupLiteORM(t)
+	ctx := t.Context()
+	db, orm, jorm := setupLiteORM(t)
 
-	run := mustInsertAsyncRun(t, orm)
+	run := mustInsertAsyncRun(t, orm, jorm)
 
-	r, err := orm.FindRun(run.ID)
+	r, err := orm.FindRun(ctx, run.ID)
 	require.NoError(t, err)
 	require.Equal(t, run.Inputs, r.Inputs)
 
 	now := time.Now()
 
-	ds1_id := uuid.New()
+	ds1ID := uuid.New()
 
 	// insert something for this pipeline_run to trigger an early resume while the pipeline is running
+	//nolint:sqlclosecheck // rows closed via defer below
 	rows, err := db.NamedQuery(`
 	INSERT INTO pipeline_task_runs (pipeline_run_id, id, type, index, output, error, dot_id, created_at, finished_at)
 	VALUES (:pipeline_run_id, :id, :type, :index, :output, :error, :dot_id, :created_at, :finished_at)
 	`, pipeline.TaskRun{
-		ID:            ds1_id,
+		ID:            ds1ID,
 		PipelineRunID: run.ID,
 		Type:          "bridge",
 		DotID:         "ds1",
-		Output:        pipeline.JSONSerializable{Val: 2, Valid: true},
+		Output:        jsonserializable.JSONSerializable{Val: 2, Valid: true},
 		CreatedAt:     now,
 		FinishedAt:    null.TimeFrom(now),
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, rows.Close()) })
+	defer rows.Close()
 
 	run.PipelineTaskRuns = []pipeline.TaskRun{
 		// pending task
 		{
-			ID:            ds1_id,
+			ID:            ds1ID,
 			PipelineRunID: run.ID,
 			Type:          "bridge",
 			DotID:         "ds1",
@@ -322,36 +422,36 @@ func Test_PipelineORM_StoreRun_DetectsRestarts(t *testing.T) {
 			PipelineRunID: run.ID,
 			Type:          "median",
 			DotID:         "answer2",
-			Output:        pipeline.JSONSerializable{Val: 1, Valid: true},
+			Output:        jsonserializable.JSONSerializable{Val: 1, Valid: true},
 			CreatedAt:     now,
 			FinishedAt:    null.TimeFrom(now),
 		},
 	}
 
-	restart, err := orm.StoreRun(run)
+	restart, err := orm.StoreRun(ctx, run)
 	require.NoError(t, err)
 	// new data available! immediately restart the run
-	require.Equal(t, true, restart)
+	require.True(t, restart)
 	// the run is still in progress
 	require.Equal(t, pipeline.RunStatusRunning, run.State)
 
 	// confirm we now contain the latest restart data merged with local task data
 	ds1 := run.ByDotID("ds1")
-	require.Equal(t, ds1.Output.Val, int64(2))
+	require.Equal(t, int64(2), ds1.Output.Val)
 	require.True(t, ds1.FinishedAt.Valid)
-
 }
 
 func Test_PipelineORM_StoreRun_UpdateTaskRunResult(t *testing.T) {
-	_, orm := setupLiteORM(t)
+	ctx := t.Context()
+	_, orm, jorm := setupLiteORM(t)
 
-	run := mustInsertAsyncRun(t, orm)
+	run := mustInsertAsyncRun(t, orm, jorm)
 
-	ds1_id := uuid.New()
+	ds1ID := uuid.New()
 	now := time.Now()
 	address, err := hex.DecodeString("0x8bd112d3f8f92e41c861939545ad387307af9703")
 	require.NoError(t, err)
-	cborOutput := map[string]interface{}{
+	cborOutput := map[string]any{
 		"blockNum":        "0x13babbd",
 		"confirmations":   int64(10),
 		"contractAddress": address,
@@ -362,7 +462,7 @@ func Test_PipelineORM_StoreRun_UpdateTaskRunResult(t *testing.T) {
 	run.PipelineTaskRuns = []pipeline.TaskRun{
 		// pending task
 		{
-			ID:            ds1_id,
+			ID:            ds1ID,
 			PipelineRunID: run.ID,
 			Type:          "bridge",
 			DotID:         "ds1",
@@ -375,7 +475,7 @@ func Test_PipelineORM_StoreRun_UpdateTaskRunResult(t *testing.T) {
 			PipelineRunID: run.ID,
 			Type:          "cbor_parse",
 			DotID:         "ds2",
-			Output:        pipeline.JSONSerializable{Val: cborOutput, Valid: true},
+			Output:        jsonserializable.JSONSerializable{Val: cborOutput, Valid: true},
 			CreatedAt:     now,
 			FinishedAt:    null.TimeFrom(now),
 		},
@@ -385,7 +485,7 @@ func Test_PipelineORM_StoreRun_UpdateTaskRunResult(t *testing.T) {
 			PipelineRunID: run.ID,
 			Type:          "median",
 			DotID:         "answer2",
-			Output:        pipeline.JSONSerializable{Val: 1, Valid: true},
+			Output:        jsonserializable.JSONSerializable{Val: 1, Valid: true},
 			CreatedAt:     now,
 			FinishedAt:    null.TimeFrom(now),
 		},
@@ -394,17 +494,17 @@ func Test_PipelineORM_StoreRun_UpdateTaskRunResult(t *testing.T) {
 	require.Equal(t, pipeline.RunStatusRunning, run.State)
 
 	// Now store a partial run
-	restart, err := orm.StoreRun(run)
+	restart, err := orm.StoreRun(ctx, run)
 	require.NoError(t, err)
 	require.False(t, restart)
 	// assert that run should be in "paused" state
 	require.Equal(t, pipeline.RunStatusSuspended, run.State)
 
-	r, start, err := orm.UpdateTaskRunResult(ds1_id, pipeline.Result{Value: "foo"})
+	r, start, err := orm.UpdateTaskRunResult(ctx, ds1ID, pipeline.Result{Value: "foo"})
 	run = &r
 	require.NoError(t, err)
-	assert.Greater(t, run.ID, int64(0))
-	assert.Greater(t, run.PipelineSpec.ID, int32(0)) // Make sure it actually loaded everything
+	assert.Positive(t, run.ID)
+	assert.Positive(t, run.PipelineSpec.ID) // Make sure it actually loaded everything
 
 	require.Len(t, run.PipelineTaskRuns, 3)
 	// assert that run should be in "running" state
@@ -415,18 +515,19 @@ func Test_PipelineORM_StoreRun_UpdateTaskRunResult(t *testing.T) {
 	// assert that the task is now updated
 	task := run.ByDotID("ds1")
 	require.True(t, task.FinishedAt.Valid)
-	require.Equal(t, pipeline.JSONSerializable{Val: "foo", Valid: true}, task.Output)
+	require.Equal(t, jsonserializable.JSONSerializable{Val: "foo", Valid: true}, task.Output)
 
 	// assert correct task run serialization
 	task2 := run.ByDotID("ds2")
 	cborOutput["contractAddress"] = "0x8bd112d3f8f92e41c861939545ad387307af9703"
-	require.Equal(t, pipeline.JSONSerializable{Val: cborOutput, Valid: true}, task2.Output)
+	require.Equal(t, jsonserializable.JSONSerializable{Val: cborOutput, Valid: true}, task2.Output)
 }
 
 func Test_PipelineORM_DeleteRun(t *testing.T) {
-	_, orm := setupLiteORM(t)
+	ctx := t.Context()
+	_, orm, jorm := setupLiteORM(t)
 
-	run := mustInsertAsyncRun(t, orm)
+	run := mustInsertAsyncRun(t, orm, jorm)
 
 	now := time.Now()
 
@@ -446,32 +547,33 @@ func Test_PipelineORM_DeleteRun(t *testing.T) {
 			PipelineRunID: run.ID,
 			Type:          "median",
 			DotID:         "answer2",
-			Output:        pipeline.JSONSerializable{Val: 1, Valid: true},
+			Output:        jsonserializable.JSONSerializable{Val: 1, Valid: true},
 			CreatedAt:     now,
 			FinishedAt:    null.TimeFrom(now),
 		},
 	}
-	restart, err := orm.StoreRun(run)
+	restart, err := orm.StoreRun(ctx, run)
 	require.NoError(t, err)
 	// no new data, so we don't need a restart
-	require.Equal(t, false, restart)
+	require.False(t, restart)
 	// the run is paused
 	require.Equal(t, pipeline.RunStatusSuspended, run.State)
 
-	err = orm.DeleteRun(run.ID)
+	err = orm.DeleteRun(ctx, run.ID)
 	require.NoError(t, err)
 
-	_, err = orm.FindRun(run.ID)
+	_, err = orm.FindRun(ctx, run.ID)
 	require.Error(t, err, "not found")
 }
 
 func Test_PipelineORM_DeleteRunsOlderThan(t *testing.T) {
-	_, orm := setupHeavyORM(t)
+	ctx := t.Context()
+	_, orm, jorm := setupHeavyORM(t)
 
-	var runsIds []int64
+	var runsIDs []int64
 
 	for i := 1; i <= 2000; i++ {
-		run := mustInsertAsyncRun(t, orm)
+		run := mustInsertAsyncRun(t, orm, jorm)
 
 		now := time.Now()
 
@@ -482,223 +584,31 @@ func Test_PipelineORM_DeleteRunsOlderThan(t *testing.T) {
 				PipelineRunID: run.ID,
 				Type:          "median",
 				DotID:         "answer2",
-				Output:        pipeline.JSONSerializable{Val: 1, Valid: true},
+				Output:        jsonserializable.JSONSerializable{Val: 1, Valid: true},
 				CreatedAt:     now,
 				FinishedAt:    null.TimeFrom(now.Add(-1 * time.Second)),
 			},
 		}
 		run.State = pipeline.RunStatusCompleted
 		run.FinishedAt = null.TimeFrom(now.Add(-1 * time.Second))
-		run.Outputs = pipeline.JSONSerializable{Val: 1, Valid: true}
+		run.Outputs = jsonserializable.JSONSerializable{Val: 1, Valid: true}
 		run.AllErrors = pipeline.RunErrors{null.StringFrom("SOMETHING")}
 
-		restart, err := orm.StoreRun(run)
-		assert.NoError(t, err)
+		restart, err := orm.StoreRun(ctx, run)
+		require.NoError(t, err)
 		// no new data, so we don't need a restart
-		assert.Equal(t, false, restart)
+		assert.False(t, restart)
 
-		runsIds = append(runsIds, run.ID)
+		runsIDs = append(runsIDs, run.ID)
 	}
 
-	err := orm.DeleteRunsOlderThan(testutils.Context(t), 1*time.Second)
-	assert.NoError(t, err)
+	err := orm.DeleteRunsOlderThan(t.Context(), 1*time.Second)
+	require.NoError(t, err)
 
-	for _, runId := range runsIds {
-		_, err := orm.FindRun(runId)
+	for _, runID := range runsIDs {
+		_, err := orm.FindRun(ctx, runID)
 		require.Error(t, err, "not found")
 	}
-}
-
-func Test_GetUnfinishedRuns_Keepers(t *testing.T) {
-	t.Parallel()
-
-	// The test configures single Keeper job with two running tasks.
-	// GetUnfinishedRuns() expects to catch both running tasks.
-
-	config := configtest.NewTestGeneralConfig(t)
-	lggr := logger.TestLogger(t)
-	db := pgtest.NewSqlxDB(t)
-	keyStore := cltest.NewKeyStore(t, db, config.Database())
-	porm := pipeline.NewORM(db, lggr, config.Database(), config.JobPipeline().MaxSuccessfulRuns())
-	bridgeORM := bridges.NewORM(db, lggr, config.Database())
-
-	jorm := job.NewORM(db, porm, bridgeORM, keyStore, lggr, config.Database())
-	defer func() { assert.NoError(t, jorm.Close()) }()
-
-	timestamp := time.Now()
-	var keeperJob = job.Job{
-		ID: 1,
-		KeeperSpec: &job.KeeperSpec{
-			ContractAddress: cltest.NewEIP55Address(),
-			FromAddress:     cltest.NewEIP55Address(),
-			CreatedAt:       timestamp,
-			UpdatedAt:       timestamp,
-			EVMChainID:      (*big.Big)(&cltest.FixtureChainID),
-		},
-		ExternalJobID: uuid.MustParse("0EEC7E1D-D0D2-476C-A1A8-72DFB6633F46"),
-		PipelineSpec: &pipeline.Spec{
-			ID:           1,
-			DotDagSource: "",
-		},
-		Type:            job.Keeper,
-		SchemaVersion:   1,
-		Name:            null.StringFrom("test"),
-		MaxTaskDuration: models.Interval(1 * time.Minute),
-	}
-
-	err := jorm.CreateJob(&keeperJob)
-	require.NoError(t, err)
-	require.Equal(t, job.Keeper, keeperJob.Type)
-
-	runID1 := uuid.New()
-	runID2 := uuid.New()
-
-	err = porm.CreateRun(&pipeline.Run{
-		PipelineSpecID: keeperJob.PipelineSpecID,
-		State:          pipeline.RunStatusRunning,
-		Outputs:        pipeline.JSONSerializable{},
-		CreatedAt:      time.Now(),
-		PipelineTaskRuns: []pipeline.TaskRun{{
-			ID:        runID1,
-			Type:      pipeline.TaskTypeETHTx,
-			Index:     0,
-			Output:    pipeline.JSONSerializable{},
-			CreatedAt: time.Now(),
-			DotID:     "perform_upkeep_tx",
-		}},
-	})
-	require.NoError(t, err)
-
-	err = porm.CreateRun(&pipeline.Run{
-		PipelineSpecID: keeperJob.PipelineSpecID,
-		State:          pipeline.RunStatusRunning,
-		Outputs:        pipeline.JSONSerializable{},
-		CreatedAt:      time.Now(),
-		PipelineTaskRuns: []pipeline.TaskRun{{
-			ID:        runID2,
-			Type:      pipeline.TaskTypeETHCall,
-			Index:     1,
-			Output:    pipeline.JSONSerializable{},
-			CreatedAt: time.Now(),
-			DotID:     "check_upkeep_tx",
-		}},
-	})
-	require.NoError(t, err)
-
-	var counter int
-
-	err = porm.GetUnfinishedRuns(testutils.Context(t), time.Now(), func(run pipeline.Run) error {
-		counter++
-
-		require.Equal(t, job.Keeper.String(), run.PipelineSpec.JobType)
-		require.Equal(t, pipeline.KeepersObservationSource, run.PipelineSpec.DotDagSource)
-		require.NotEmpty(t, run.PipelineTaskRuns)
-
-		switch run.PipelineTaskRuns[0].ID {
-		case runID1:
-			trun := run.ByDotID("perform_upkeep_tx")
-			require.NotNil(t, trun)
-		case runID2:
-			trun := run.ByDotID("check_upkeep_tx")
-			require.NotNil(t, trun)
-		}
-
-		return nil
-	})
-	require.NoError(t, err)
-	require.Equal(t, 2, counter)
-}
-
-func Test_GetUnfinishedRuns_DirectRequest(t *testing.T) {
-	t.Parallel()
-
-	// The test configures single DR job with two task runs: one is running and one is suspended.
-	// GetUnfinishedRuns() expects to catch the one that is running.
-
-	config := configtest.NewTestGeneralConfig(t)
-	lggr := logger.TestLogger(t)
-	db := pgtest.NewSqlxDB(t)
-	keyStore := cltest.NewKeyStore(t, db, config.Database())
-	porm := pipeline.NewORM(db, lggr, config.Database(), config.JobPipeline().MaxSuccessfulRuns())
-	bridgeORM := bridges.NewORM(db, lggr, config.Database())
-
-	jorm := job.NewORM(db, porm, bridgeORM, keyStore, lggr, config.Database())
-	defer func() { assert.NoError(t, jorm.Close()) }()
-
-	timestamp := time.Now()
-	var drJob = job.Job{
-		ID: 1,
-		DirectRequestSpec: &job.DirectRequestSpec{
-			ContractAddress: cltest.NewEIP55Address(),
-			CreatedAt:       timestamp,
-			UpdatedAt:       timestamp,
-			EVMChainID:      (*big.Big)(&cltest.FixtureChainID),
-		},
-		ExternalJobID: uuid.MustParse("0EEC7E1D-D0D2-476C-A1A8-72DFB6633F46"),
-		PipelineSpec: &pipeline.Spec{
-			ID:           1,
-			DotDagSource: `ds1 [type=http method=GET url="https://pricesource1.com"`,
-		},
-		Type:            job.DirectRequest,
-		SchemaVersion:   1,
-		Name:            null.StringFrom("test"),
-		MaxTaskDuration: models.Interval(1 * time.Minute),
-	}
-
-	err := jorm.CreateJob(&drJob)
-	require.NoError(t, err)
-	require.Equal(t, job.DirectRequest, drJob.Type)
-
-	runningID := uuid.New()
-
-	err = porm.CreateRun(&pipeline.Run{
-		PipelineSpecID: drJob.PipelineSpecID,
-		State:          pipeline.RunStatusRunning,
-		Outputs:        pipeline.JSONSerializable{},
-		CreatedAt:      time.Now(),
-		PipelineTaskRuns: []pipeline.TaskRun{{
-			ID:        runningID,
-			Type:      pipeline.TaskTypeHTTP,
-			Index:     0,
-			Output:    pipeline.JSONSerializable{},
-			CreatedAt: time.Now(),
-			DotID:     "ds1",
-		}},
-	})
-	require.NoError(t, err)
-
-	err = porm.CreateRun(&pipeline.Run{
-		PipelineSpecID: drJob.PipelineSpecID,
-		State:          pipeline.RunStatusSuspended,
-		Outputs:        pipeline.JSONSerializable{},
-		CreatedAt:      time.Now(),
-		PipelineTaskRuns: []pipeline.TaskRun{{
-			ID:        uuid.New(),
-			Type:      pipeline.TaskTypeHTTP,
-			Index:     1,
-			Output:    pipeline.JSONSerializable{},
-			CreatedAt: time.Now(),
-			DotID:     "ds1",
-		}},
-	})
-	require.NoError(t, err)
-
-	var counter int
-
-	err = porm.GetUnfinishedRuns(testutils.Context(t), time.Now(), func(run pipeline.Run) error {
-		counter++
-
-		require.Equal(t, job.DirectRequest.String(), run.PipelineSpec.JobType)
-		require.NotEmpty(t, run.PipelineTaskRuns)
-		require.Equal(t, runningID, run.PipelineTaskRuns[0].ID)
-
-		trun := run.ByDotID("ds1")
-		require.NotNil(t, trun)
-
-		return nil
-	})
-	require.NoError(t, err)
-	require.Equal(t, 1, counter)
 }
 
 func Test_Prune(t *testing.T) {
@@ -711,47 +621,59 @@ func Test_Prune(t *testing.T) {
 	})
 	lggr, observed := logger.TestLoggerObserved(t, zapcore.DebugLevel)
 	db := pgtest.NewSqlxDB(t)
-	porm := pipeline.NewORM(db, lggr, cfg.Database(), cfg.JobPipeline().MaxSuccessfulRuns())
+	porm := pipeline.NewORM(db, lggr, cfg.JobPipeline().MaxSuccessfulRuns())
+	torm := newTestORM(porm, db)
 
-	ps1 := cltest.MustInsertPipelineSpec(t, db)
+	ps1 := mustInsertPipelineSpec(t, db)
+
+	// We need a job_pipeline_specs entry to test the pruning mechanism
+	err := torm.AddJobPipelineSpecWithoutConstraints(t.Context(), ps1.ID, ps1.ID)
+	require.NoError(t, err)
+
+	jobID := ps1.ID
 
 	t.Run("when there are no runs to prune, does nothing", func(t *testing.T) {
-		porm.Prune(db, ps1.ID)
+		ctx := t.Context()
+		porm.Prune(ctx, jobID)
 
 		// no error logs; it did nothing
 		assert.Empty(t, observed.All())
 	})
 
+	_, err = db.Exec(`SET CONSTRAINTS fk_pipeline_runs_pruning_key DEFERRED`)
+	require.NoError(t, err)
+
 	// ps1 has:
 	// - 20 completed runs
-	for i := 0; i < 20; i++ {
-		cltest.MustInsertPipelineRunWithStatus(t, db, ps1.ID, pipeline.RunStatusCompleted)
+	for range 20 {
+		mustInsertPipelineRunWithStatus(t, db, ps1.ID, pipeline.RunStatusCompleted, jobID)
 	}
 
-	ps2 := cltest.MustInsertPipelineSpec(t, db)
+	ps2 := mustInsertPipelineSpec(t, db)
 
+	jobID2 := ps2.ID
 	// ps2 has:
 	// - 12 completed runs
 	// - 3 errored runs
-	// - 3 running run
+	// - 3 running runs
 	// - 3 suspended run
-	for i := 0; i < 12; i++ {
-		cltest.MustInsertPipelineRunWithStatus(t, db, ps2.ID, pipeline.RunStatusCompleted)
+	for range 12 {
+		mustInsertPipelineRunWithStatus(t, db, ps2.ID, pipeline.RunStatusCompleted, jobID2)
 	}
-	for i := 0; i < 3; i++ {
-		cltest.MustInsertPipelineRunWithStatus(t, db, ps2.ID, pipeline.RunStatusErrored)
+	for range 3 {
+		mustInsertPipelineRunWithStatus(t, db, ps2.ID, pipeline.RunStatusErrored, jobID2)
 	}
-	for i := 0; i < 3; i++ {
-		cltest.MustInsertPipelineRunWithStatus(t, db, ps2.ID, pipeline.RunStatusRunning)
+	for range 3 {
+		mustInsertPipelineRunWithStatus(t, db, ps2.ID, pipeline.RunStatusRunning, jobID2)
 	}
-	for i := 0; i < 3; i++ {
-		cltest.MustInsertPipelineRunWithStatus(t, db, ps2.ID, pipeline.RunStatusSuspended)
+	for range 3 {
+		mustInsertPipelineRunWithStatus(t, db, ps2.ID, pipeline.RunStatusSuspended, jobID2)
 	}
 
-	porm.Prune(db, ps2.ID)
+	porm.Prune(t.Context(), jobID2)
 
 	cnt := pgtest.MustCount(t, db, "SELECT count(*) FROM pipeline_runs WHERE pipeline_spec_id = $1 AND state = $2", ps1.ID, pipeline.RunStatusCompleted)
-	assert.Equal(t, cnt, 20)
+	assert.Equal(t, 20, cnt)
 
 	cnt = pgtest.MustCount(t, db, "SELECT count(*) FROM pipeline_runs WHERE pipeline_spec_id = $1 AND state = $2", ps2.ID, pipeline.RunStatusCompleted)
 	assert.Equal(t, 2, cnt)
@@ -761,4 +683,36 @@ func Test_Prune(t *testing.T) {
 	assert.Equal(t, 3, cnt)
 	cnt = pgtest.MustCount(t, db, "SELECT count(*) FROM pipeline_runs WHERE pipeline_spec_id = $1 AND state = $2", ps2.ID, pipeline.RunStatusSuspended)
 	assert.Equal(t, 3, cnt)
+}
+
+func mustInsertPipelineRunWithStatus(t *testing.T, db *sqlx.DB, pipelineSpecID int32, status pipeline.RunStatus, jobID int32) (runID int64) {
+	var finishedAt *time.Time
+	var outputs jsonserializable.JSONSerializable
+	var allErrors pipeline.RunErrors
+	var fatalErrors pipeline.RunErrors
+	now := time.Now()
+	switch status {
+	case pipeline.RunStatusCompleted:
+		finishedAt = &now
+		outputs = jsonserializable.JSONSerializable{
+			Val:   "foo",
+			Valid: true,
+		}
+	case pipeline.RunStatusErrored:
+		finishedAt = &now
+		allErrors = []null.String{null.StringFrom("oh no!")}
+		fatalErrors = []null.String{null.StringFrom("oh no!")}
+	case pipeline.RunStatusRunning, pipeline.RunStatusSuspended:
+		// leave empty
+	default:
+		t.Fatalf("unknown status: %s", status)
+	}
+	require.NoError(t, db.Get(&runID, `INSERT INTO pipeline_runs (state,pipeline_spec_id,pruning_key,finished_at,outputs,all_errors,fatal_errors,created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) RETURNING id`, status, pipelineSpecID, jobID, finishedAt, outputs, allErrors, fatalErrors))
+	return runID
+}
+
+func mustInsertPipelineSpec(t *testing.T, db *sqlx.DB) (spec pipeline.Spec) {
+	err := db.Get(&spec, `INSERT INTO pipeline_specs (dot_dag_source,created_at) VALUES ('',NOW()) RETURNING *`)
+	require.NoError(t, err)
+	return spec
 }

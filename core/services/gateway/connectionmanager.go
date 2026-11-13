@@ -3,42 +3,42 @@ package gateway
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"go.uber.org/multierr"
+	"github.com/jonboulle/clockwork"
+	"go.opentelemetry.io/otel/attribute"
 
+	"github.com/smartcontractkit/chainlink-common/pkg/beholder"
+	jsonrpc "github.com/smartcontractkit/chainlink-common/pkg/jsonrpc2"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink-common/pkg/services"
-
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
-	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/api"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/limits"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/common"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/config"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/handlers"
+	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/monitoring"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/network"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
-	"github.com/smartcontractkit/chainlink/v2/core/utils"
 )
-
-var promHeartbeatsSent = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "gateway_heartbeats_sent",
-	Help: "Metric to track the number of successful node heartbeates per DON",
-}, []string{"don_id"})
 
 // ConnectionManager holds all connections between Gateway and Nodes.
 type ConnectionManager interface {
 	job.ServiceCtx
 	network.ConnectionAcceptor
 
-	DONConnectionManager(donId string) *donConnectionManager
+	DONConnectionManager(donID string) *donConnectionManager
 	GetPort() int
+	ReadyForTraffic(ctx context.Context) error
 }
 
 type connectionManager struct {
@@ -47,10 +47,11 @@ type connectionManager struct {
 	config             *config.ConnectionManagerConfig
 	dons               map[string]*donConnectionManager
 	wsServer           network.WebSocketServer
-	clock              utils.Clock
+	clock              clockwork.Clock
 	connAttempts       map[string]*connAttempt
 	connAttemptCounter uint64
 	connAttemptsMu     sync.Mutex
+	gMetrics           *monitoring.GatewayMetrics
 	lggr               logger.Logger
 }
 
@@ -69,15 +70,36 @@ func (m *connectionManager) Name() string { return m.lggr.Name() }
 type donConnectionManager struct {
 	donConfig  *config.DONConfig
 	nodes      map[string]*nodeState
-	handler    handlers.Handler
-	codec      api.Codec
+	handlers   map[string]handlers.Handler // service name -> handler
 	closeWait  sync.WaitGroup
 	shutdownCh services.StopChan
+	gMetrics   *monitoring.GatewayMetrics
 	lggr       logger.Logger
 }
 
 type nodeState struct {
+	name string
 	conn network.WSConnectionWrapper
+	// pingTracker correlates the latest keepalive ping probe with its pong so a
+	// round-trip duration can be recorded. Replaced on every handshake so pongs
+	// from a replaced connection can never match the new connection's probes.
+	pingTracker atomic.Pointer[pingProbeTracker]
+}
+
+// sendPing writes a keepalive ping carrying a fresh random correlation token,
+// registering the probe on the current connection's tracker immediately before
+// the write because the matching pong can arrive before Write returns. The
+// token is internal state and is never used as a metric label.
+func (ns *nodeState) sendPing(ctx context.Context) error {
+	raw := make([]byte, pingTokenLen)
+	if _, err := rand.Read(raw); err != nil {
+		return fmt.Errorf("failed to generate ping correlation token: %w", err)
+	}
+	token := base64.StdEncoding.EncodeToString(raw)
+	if tracker := ns.pingTracker.Load(); tracker != nil {
+		tracker.register(token, time.Now())
+	}
+	return ns.conn.Write(ctx, websocket.PingMessage, []byte(token))
 }
 
 // immutable
@@ -88,36 +110,34 @@ type connAttempt struct {
 	timestamp   uint32
 }
 
-func NewConnectionManager(gwConfig *config.GatewayConfig, clock utils.Clock, lggr logger.Logger) (ConnectionManager, error) {
-	codec := &api.JsonRPCCodec{}
+func NewConnectionManager(gwConfig *config.GatewayConfig, clock clockwork.Clock, gMetrics *monitoring.GatewayMetrics, lggr logger.Logger, lf limits.Factory) (ConnectionManager, error) {
+	wsMetrics, err := network.NewWSConnectionMetrics(beholder.GetMeter())
+	if err != nil {
+		return nil, fmt.Errorf("failed to create websocket connection metrics: %w", err)
+	}
 	dons := make(map[string]*donConnectionManager)
-	for _, donConfig := range gwConfig.Dons {
-		donConfig := donConfig
-		if donConfig.DonId == "" {
-			return nil, errors.New("empty DON ID")
-		}
-		_, ok := dons[donConfig.DonId]
-		if ok {
-			return nil, fmt.Errorf("duplicate DON ID %s", donConfig.DonId)
-		}
-		nodes := make(map[string]*nodeState)
-		for _, nodeConfig := range donConfig.Members {
-			nodeAddress := strings.ToLower(nodeConfig.Address)
-			_, ok := nodes[nodeAddress]
-			if ok {
-				return nil, fmt.Errorf("duplicate node address %s in DON %s", nodeAddress, donConfig.DonId)
+	for _, shardedDON := range gwConfig.ShardedDONs {
+		for shardIdx, shard := range shardedDON.Shards {
+			donID := config.GatewayDONIDForShard(shardedDON.DonName, shardIdx)
+			if _, ok := dons[donID]; ok {
+				return nil, fmt.Errorf("duplicate DON ID %s", donID)
 			}
-			nodes[nodeAddress] = &nodeState{conn: network.NewWSConnectionWrapper(lggr)}
-			if nodes[nodeAddress].conn == nil {
-				return nil, fmt.Errorf("error creating WSConnectionWrapper for node %s", nodeAddress)
+			nodes, ierr := buildNodeStates(shard.Nodes, donID, lggr, wsMetrics)
+			if ierr != nil {
+				return nil, ierr
 			}
-		}
-		dons[donConfig.DonId] = &donConnectionManager{
-			donConfig:  &donConfig,
-			codec:      codec,
-			nodes:      nodes,
-			shutdownCh: make(chan struct{}),
-			lggr:       lggr.Named("DONConnectionManager." + donConfig.DonId),
+			dons[donID] = &donConnectionManager{
+				donConfig: &config.DONConfig{
+					DonID:   donID,
+					F:       shardedDON.F,
+					Members: shard.Nodes,
+				},
+				nodes:      nodes,
+				handlers:   make(map[string]handlers.Handler),
+				shutdownCh: make(chan struct{}),
+				gMetrics:   gMetrics,
+				lggr:       logger.Named(lggr, "DONConnectionManager."+donID),
+			}
 		}
 	}
 	connMgr := &connectionManager{
@@ -125,15 +145,40 @@ func NewConnectionManager(gwConfig *config.GatewayConfig, clock utils.Clock, lgg
 		dons:         dons,
 		connAttempts: make(map[string]*connAttempt),
 		clock:        clock,
-		lggr:         lggr.Named("ConnectionManager"),
+		gMetrics:     gMetrics,
+		lggr:         logger.Named(lggr, "ConnectionManager"),
 	}
-	wsServer := network.NewWebSocketServer(&gwConfig.NodeServerConfig, connMgr, lggr)
+	wsServer, err := network.NewWebSocketServer(&gwConfig.NodeServerConfig, connMgr, lggr, lf)
+	if err != nil {
+		return nil, err
+	}
 	connMgr.wsServer = wsServer
 	return connMgr, nil
 }
 
-func (m *connectionManager) DONConnectionManager(donId string) *donConnectionManager {
-	return m.dons[donId]
+func buildNodeStates(members []config.NodeConfig, donID string, lggr logger.Logger, wsMetrics *network.WSConnectionMetrics) (map[string]*nodeState, error) {
+	nodes := make(map[string]*nodeState)
+	for _, nodeConfig := range members {
+		nodeAddress := strings.ToLower(nodeConfig.Address)
+		if _, ok := nodes[nodeAddress]; ok {
+			return nil, fmt.Errorf("duplicate node address %s in DON %s", nodeAddress, donID)
+		}
+		connWrapper := network.NewWSConnectionWrapperWithObserver(lggr, wsMetrics.Observer(
+			attribute.String("nodeAddress", nodeAddress),
+			attribute.String("nodeName", nodeConfig.Name),
+		))
+		ns := &nodeState{
+			name: nodeConfig.Name,
+			conn: connWrapper,
+		}
+		ns.pingTracker.Store(&pingProbeTracker{})
+		nodes[nodeAddress] = ns
+	}
+	return nodes, nil
+}
+
+func (m *connectionManager) DONConnectionManager(donID string) *donConnectionManager {
+	return m.dons[donID]
 }
 
 func (m *connectionManager) Start(ctx context.Context) error {
@@ -147,8 +192,10 @@ func (m *connectionManager) Start(ctx context.Context) error {
 				}
 				go donConnMgr.readLoop(nodeAddress, nodeState)
 			}
-			donConnMgr.closeWait.Add(1)
-			go donConnMgr.heartbeatLoop(m.config.HeartbeatIntervalSec)
+			donConnMgr.closeWait.Add(len(donConnMgr.nodes))
+			for nodeAddress, nodeState := range donConnMgr.nodes {
+				go donConnMgr.nodeKeepalive(nodeAddress, nodeState, m.config.HeartbeatIntervalSec)
+			}
 		}
 		return m.wsServer.Start(ctx)
 	})
@@ -157,7 +204,7 @@ func (m *connectionManager) Start(ctx context.Context) error {
 func (m *connectionManager) Close() error {
 	return m.StopOnce("ConnectionManager", func() (err error) {
 		m.lggr.Info("closing connection manager")
-		err = multierr.Combine(err, m.wsServer.Close())
+		err = errors.Join(err, m.wsServer.Close())
 		for _, donConnMgr := range m.dons {
 			close(donConnMgr.shutdownCh)
 			for _, nodeState := range donConnMgr.nodes {
@@ -167,38 +214,38 @@ func (m *connectionManager) Close() error {
 		for _, donConnMgr := range m.dons {
 			donConnMgr.closeWait.Wait()
 		}
-		return
+		return err
 	})
 }
 
-func (m *connectionManager) StartHandshake(authHeader []byte) (attemptId string, challenge []byte, err error) {
+func (m *connectionManager) StartHandshake(authHeader []byte) (attemptID string, challenge []byte, err error) {
 	m.lggr.Debug("StartHandshake")
 	authHeaderElems, signer, err := network.UnpackSignedAuthHeader(authHeader)
 	if err != nil {
-		return "", nil, multierr.Append(network.ErrAuthHeaderParse, err)
+		return "", nil, errors.Join(network.ErrAuthHeaderParse, err)
 	}
 	nodeAddress := "0x" + hex.EncodeToString(signer)
-	donConnMgr, ok := m.dons[authHeaderElems.DonId]
+	donConnMgr, ok := m.dons[authHeaderElems.DonID]
 	if !ok {
-		return "", nil, network.ErrAuthInvalidDonId
+		return "", nil, network.ErrAuthInvalidDonID
 	}
 	nodeState, ok := donConnMgr.nodes[nodeAddress]
 	if !ok {
 		return "", nil, network.ErrAuthInvalidNode
 	}
-	if authHeaderElems.GatewayId != m.config.AuthGatewayId {
+	if authHeaderElems.GatewayID != m.config.AuthGatewayID {
 		return "", nil, network.ErrAuthInvalidGateway
 	}
-	nowTs := uint32(m.clock.Now().Unix())
+	nowTs := uint32(m.clock.Now().Unix()) //nolint:gosec // G115: uint32 timestamp is intentional per the auth handshake protocol
 	ts := authHeaderElems.Timestamp
 	if ts < nowTs-m.config.AuthTimestampToleranceSec || nowTs+m.config.AuthTimestampToleranceSec < ts {
 		return "", nil, network.ErrAuthInvalidTimestamp
 	}
-	attemptId, challenge, err = m.newAttempt(nodeState, nodeAddress, ts)
+	attemptID, challenge, err = m.newAttempt(nodeState, nodeAddress, ts)
 	if err != nil {
 		return "", nil, err
 	}
-	return attemptId, challenge, nil
+	return attemptID, challenge, nil
 }
 
 func (m *connectionManager) newAttempt(nodeSt *nodeState, nodeAddress string, timestamp uint32) (string, []byte, error) {
@@ -207,20 +254,20 @@ func (m *connectionManager) newAttempt(nodeSt *nodeState, nodeAddress string, ti
 	if err != nil {
 		return "", nil, err
 	}
-	challenge := network.ChallengeElems{Timestamp: timestamp, GatewayId: m.config.AuthGatewayId, ChallengeBytes: challengeBytes}
+	challenge := network.ChallengeElems{Timestamp: timestamp, GatewayID: m.config.AuthGatewayID, ChallengeBytes: challengeBytes}
 	m.connAttemptsMu.Lock()
 	defer m.connAttemptsMu.Unlock()
 	m.connAttemptCounter++
-	newId := fmt.Sprintf("%s_%d", nodeAddress, m.connAttemptCounter)
-	m.connAttempts[newId] = &connAttempt{nodeState: nodeSt, nodeAddress: nodeAddress, challenge: challenge, timestamp: timestamp}
-	return newId, network.PackChallenge(&challenge), nil
+	newID := fmt.Sprintf("%s_%d", nodeAddress, m.connAttemptCounter)
+	m.connAttempts[newID] = &connAttempt{nodeState: nodeSt, nodeAddress: nodeAddress, challenge: challenge, timestamp: timestamp}
+	return newID, network.PackChallenge(&challenge), nil
 }
 
-func (m *connectionManager) FinalizeHandshake(attemptId string, response []byte, conn *websocket.Conn) error {
-	m.lggr.Debugw("FinalizeHandshake", "attemptId", attemptId)
+func (m *connectionManager) FinalizeHandshake(attemptID string, response []byte, conn *websocket.Conn) error {
+	m.lggr.Debugw("FinalizeHandshake", "attemptId", attemptID)
 	m.connAttemptsMu.Lock()
-	attempt, ok := m.connAttempts[attemptId]
-	delete(m.connAttempts, attemptId)
+	attempt, ok := m.connAttempts[attemptID]
+	delete(m.connAttempts, attemptID)
 	m.connAttemptsMu.Unlock()
 	if !ok {
 		return network.ErrChallengeAttemptNotFound
@@ -229,39 +276,153 @@ func (m *connectionManager) FinalizeHandshake(attemptId string, response []byte,
 	if err != nil || attempt.nodeAddress != "0x"+hex.EncodeToString(signer) {
 		return network.ErrChallengeInvalidSignature
 	}
+	// Set a read deadline so that half-open connections are detected and closed.
+	// The deadline is reset every time a pong is received. If PongTimeoutSec is
+	// 0, deadline enforcement is disabled.
+	pongWait := time.Duration(m.config.PongTimeoutSec) * time.Second
+	// Install a fresh probe tracker scoped to this connection. The pong handler
+	// below closes over it, so pongs arriving on a replaced connection are matched
+	// against its own stale tracker and can never record against this one.
+	tracker := &pingProbeTracker{}
+	attempt.nodeState.pingTracker.Store(tracker)
 	if conn != nil {
+		if pongWait > 0 {
+			if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+				m.lggr.Warnw("failed to set initial read deadline, connection may be unusable",
+					"nodeAddress", attempt.nodeAddress, "err", err)
+			}
+		}
 		conn.SetPongHandler(func(data string) error {
-			m.lggr.Debugw("received heartbeat pong from node", "nodeAddress", attempt.nodeAddress)
+			if pongWait > 0 {
+				if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+					m.lggr.Warnw("failed to reset read deadline on pong",
+						"nodeAddress", attempt.nodeAddress, "err", err)
+				}
+			}
+			m.lggr.Debugw("received keepalive pong from node", "nodeAddress", attempt.nodeAddress)
+			m.gMetrics.RecordKeepalivePongsReceived(context.Background(), attempt.nodeAddress, attempt.nodeState.name)
+			// Only a pong echoing this connection's latest probe token yields a
+			// round-trip observation. Superseded, duplicate, or old-connection
+			// pongs produce no sample but still refresh the deadline above.
+			// The node's default ping handler echoes the ping payload, so the
+			// pong carries our token unchanged.
+			if start, ok := tracker.consume(data); ok {
+				m.gMetrics.RecordWSPingRoundTrip(context.Background(), attempt.nodeAddress, attempt.nodeState.name, time.Since(start))
+			}
 			return nil
 		})
 	}
-	attempt.nodeState.conn.Reset(conn)
+	// A nil *websocket.Conn must not be passed as a WSConnection: the interface
+	// would be non-nil and Reset would start a readPump on a nil conn.
+	if conn != nil {
+		attempt.nodeState.conn.Reset(conn)
+	} else {
+		attempt.nodeState.conn.Reset(nil)
+	}
+	if conn != nil && pongWait > 0 {
+		// Send an immediate ping so the first pong arrives quickly (within
+		// milliseconds on a healthy connection) rather than waiting up to one
+		// full heartbeat interval for the keepalive ticker to fire.
+		ctx := context.Background()
+		if ierr := attempt.nodeState.sendPing(ctx); ierr != nil {
+			m.lggr.Debugw("unable to send post-handshake ping to node",
+				"nodeAddress", attempt.nodeAddress, "name", attempt.nodeState.name, "err", ierr)
+		}
+	}
 	m.lggr.Infof("node %s connected", attempt.nodeAddress)
+	m.gMetrics.RecordNodeConnectedEvent(context.Background(), attempt.nodeAddress, attempt.nodeState.name)
 	return nil
 }
 
-func (m *connectionManager) AbortHandshake(attemptId string) {
-	m.lggr.Debugw("AbortHandshake", "attemptId", attemptId)
+func (m *connectionManager) AbortHandshake(attemptID string) {
+	m.lggr.Debugw("AbortHandshake", "attemptId", attemptID)
 	m.connAttemptsMu.Lock()
 	defer m.connAttemptsMu.Unlock()
-	delete(m.connAttempts, attemptId)
+	delete(m.connAttempts, attemptID)
 }
 
 func (m *connectionManager) GetPort() int {
 	return m.wsServer.GetPort()
 }
 
-func (m *donConnectionManager) SetHandler(handler handlers.Handler) {
-	m.handler = handler
+// ReadyForTraffic returns nil when every configured DON shard has at least
+// 2F+1 active authenticated connections. Since each shard contains at least
+// 3F+1 nodes, readiness tolerates F disconnected nodes per shard.
+func (m *connectionManager) ReadyForTraffic(ctx context.Context) error {
+	if len(m.dons) == 0 {
+		m.gMetrics.RecordUserReady(ctx, false)
+		return errors.New("no DON shards configured")
+	}
+
+	donIDs := make([]string, 0, len(m.dons))
+	for donID := range m.dons {
+		donIDs = append(donIDs, donID)
+	}
+	sort.Strings(donIDs)
+
+	var readinessErrs []error
+	for _, donID := range donIDs {
+		don := m.dons[donID]
+		connected := 0
+		disconnectedNodeAddresses := make([]string, 0, len(don.nodes))
+		for nodeAddress, node := range don.nodes {
+			if node.conn.IsConnected() {
+				connected++
+			} else {
+				disconnectedNodeAddresses = append(disconnectedNodeAddresses, nodeAddress)
+			}
+		}
+		sort.Strings(disconnectedNodeAddresses)
+
+		required := 2*don.donConfig.F + 1
+		configured := len(don.nodes)
+		m.gMetrics.RecordDONConnectionState(ctx, donID, connected, required, configured)
+		if connected < required {
+			m.lggr.Debugw("DON shard is not ready for traffic",
+				"donID", donID,
+				"connected", connected,
+				"required", required,
+				"configured", configured,
+				"disconnectedNodeAddresses", disconnectedNodeAddresses,
+			)
+			readinessErrs = append(readinessErrs, fmt.Errorf("DON %s has %d connected nodes; requires %d", donID, connected, required))
+		}
+	}
+
+	ready := len(readinessErrs) == 0
+	m.gMetrics.RecordUserReady(ctx, ready)
+	return errors.Join(readinessErrs...)
 }
 
-func (m *donConnectionManager) SendToNode(ctx context.Context, nodeAddress string, msg *api.Message) error {
-	if msg == nil {
-		return errors.New("nil message")
+func (m *donConnectionManager) SetHandler(serviceName string, handler handlers.Handler) {
+	m.handlers[serviceName] = handler
+}
+
+func (m *donConnectionManager) getHandler(method string) (handlers.Handler, error) {
+	if len(m.handlers) == 1 {
+		for _, h := range m.handlers {
+			return h, nil // supports legacy single-handler case
+		}
 	}
-	data, err := m.codec.EncodeRequest(msg)
+	serviceName, _, hasDot := strings.Cut(method, ".")
+	// Special case for legacy methods - default to "workflows" service.
+	if !hasDot {
+		serviceName = "workflows"
+	}
+	handler, ok := m.handlers[serviceName]
+	if !ok {
+		return nil, fmt.Errorf("no handler for service %q (method %q)", serviceName, method)
+	}
+	return handler, nil
+}
+
+func (m *donConnectionManager) SendToNode(ctx context.Context, nodeAddress string, req *jsonrpc.Request[json.RawMessage]) error {
+	if req == nil {
+		return errors.New("nil request")
+	}
+	data, err := jsonrpc.EncodeRequest(req)
 	if err != nil {
-		return fmt.Errorf("error encoding request for node %s: %v", nodeAddress, err)
+		return fmt.Errorf("error encoding request for node %s: %w", nodeAddress, err)
 	}
 	nodeState := m.nodes[nodeAddress]
 	if nodeState == nil {
@@ -271,43 +432,46 @@ func (m *donConnectionManager) SendToNode(ctx context.Context, nodeAddress strin
 }
 
 func (m *donConnectionManager) readLoop(nodeAddress string, nodeState *nodeState) {
-	ctx, _ := m.shutdownCh.NewCtx()
+	defer m.closeWait.Done()
+	ctx, cancel := m.shutdownCh.NewCtx()
+	defer cancel()
 	for {
 		select {
 		case <-m.shutdownCh:
-			m.closeWait.Done()
 			return
 		case item := <-nodeState.conn.ReadChannel():
-			msg, err := m.codec.DecodeResponse(item.Data)
+			var resp jsonrpc.Response[json.RawMessage]
+			err := json.Unmarshal(item.Data, &resp)
 			if err != nil {
 				m.lggr.Errorw("parse error when reading from node", "nodeAddress", nodeAddress, "err", err)
 				break
 			}
-			if err = msg.Validate(); err != nil {
-				m.lggr.Errorw("message validation error when reading from node", "nodeAddress", nodeAddress, "err", err)
-				break
-			}
-			if msg.Body.Sender != nodeAddress {
-				m.lggr.Errorw("message sender mismatch when reading from node", "nodeAddress", nodeAddress, "sender", msg.Body.Sender)
-				break
-			}
-			err = m.handler.HandleNodeMessage(ctx, msg, nodeAddress)
+			handler, err := m.getHandler(resp.Method)
 			if err != nil {
-				m.lggr.Error("error when calling HandleNodeMessage ", err)
+				m.lggr.Errorw("no handler for node message", "nodeAddress", nodeAddress, "method", resp.Method, "err", err)
+				break
+			}
+			startTime := time.Now()
+			err = handler.HandleNodeMessage(ctx, &resp, nodeAddress)
+			m.gMetrics.RecordNodeMsgHandlerInvocation(ctx, nodeAddress, nodeState.name, err == nil)
+			m.gMetrics.RecordNodeMsgHandlerDuration(ctx, nodeAddress, nodeState.name, time.Since(startTime), err == nil)
+			if err != nil {
+				m.lggr.Errorw("error when calling HandleNodeMessage", "err", err, "nodeAddress", nodeAddress, "nodeState", nodeState.name, "responseID", resp.ID)
 			}
 		}
 	}
 }
 
-func (m *donConnectionManager) heartbeatLoop(intervalSec uint32) {
-	ctx, _ := m.shutdownCh.NewCtx()
+func (m *donConnectionManager) nodeKeepalive(addr string, ns *nodeState, intervalSec uint32) {
 	defer m.closeWait.Done()
+	ctx, cancel := m.shutdownCh.NewCtx()
+	defer cancel()
 
 	if intervalSec == 0 {
-		m.lggr.Error("heartbeat interval is 0, heartbeat disabled")
+		m.lggr.Errorw("keepalive interval is 0, keepalive disabled", "donID", m.donConfig.DonID)
 		return
 	}
-	m.lggr.Info("starting heartbeat loop")
+	m.lggr.Infow("starting keepalive loop", "donID", m.donConfig.DonID, "nodeName", ns.name)
 
 	ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
 	defer ticker.Stop()
@@ -317,16 +481,15 @@ func (m *donConnectionManager) heartbeatLoop(intervalSec uint32) {
 		case <-m.shutdownCh:
 			return
 		case <-ticker.C:
-			errorCount := 0
-			for nodeAddress, nodeState := range m.nodes {
-				err := nodeState.conn.Write(ctx, websocket.PingMessage, []byte{})
-				if err != nil {
-					m.lggr.Debugw("unable to send heartbeat to node", "nodeAddress", nodeAddress, "err", err)
-					errorCount++
-				}
+			// Per-node write with a timeout context
+			pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
+			err := ns.sendPing(pingCtx)
+			pingCancel()
+			m.gMetrics.RecordKeepalivePingsSent(ctx, addr, ns.name, err == nil)
+			if err != nil {
+				m.lggr.Debugw("unable to send keepalive ping to node",
+					"nodeAddress", addr, "name", ns.name, "err", err)
 			}
-			promHeartbeatsSent.WithLabelValues(m.donConfig.DonId).Set(float64(len(m.nodes) - errorCount))
-			m.lggr.Infow("sent heartbeat to nodes", "donID", m.donConfig.DonId, "errCount", errorCount)
 		}
 	}
 }

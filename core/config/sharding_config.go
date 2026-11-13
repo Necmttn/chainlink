@@ -1,0 +1,17 @@
+package config
+
+import (
+	"net/url"
+	"time"
+)
+
+type Sharding interface {
+	ShardingEnabled() bool
+	ArbiterPort() uint16
+	ArbiterPollInterval() time.Duration
+	ArbiterRetryInterval() time.Duration
+	ShardIndex() uint16
+	ShardOrchestratorPort() uint16
+	ShardOrchestratorAddress() *url.URL
+	ShardAssignmentMode() string
+}

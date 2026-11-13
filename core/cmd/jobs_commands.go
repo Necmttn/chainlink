@@ -3,14 +3,16 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"strings"
 	"time"
 
+	"github.com/olekukonko/tablewriter"
+	"github.com/olekukonko/tablewriter/tw"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
-	"go.uber.org/multierr"
 
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 	"github.com/smartcontractkit/chainlink/v2/core/web"
@@ -132,10 +134,6 @@ func (p JobPresenter) FriendlyCreatedAt() string {
 		if p.OffChainReportingSpec != nil {
 			return p.OffChainReportingSpec.CreatedAt.Format(time.RFC3339)
 		}
-	case presenters.KeeperJobSpec:
-		if p.KeeperSpec != nil {
-			return p.KeeperSpec.CreatedAt.Format(time.RFC3339)
-		}
 	case presenters.CronJobSpec:
 		if p.CronSpec != nil {
 			return p.CronSpec.CreatedAt.Format(time.RFC3339)
@@ -164,6 +162,26 @@ func (p JobPresenter) FriendlyCreatedAt() string {
 		if p.GatewaySpec != nil {
 			return p.GatewaySpec.CreatedAt.Format(time.RFC3339)
 		}
+	case presenters.WorkflowJobSpec:
+		if p.WorkflowSpec != nil {
+			return p.WorkflowSpec.CreatedAt.Format(time.RFC3339)
+		}
+	case presenters.StandardCapabilitiesJobSpec:
+		if p.StandardCapabilitiesSpec != nil {
+			return p.StandardCapabilitiesSpec.CreatedAt.Format(time.RFC3339)
+		}
+	case presenters.CCIPSJobSpec:
+		if p.CCIPSpec != nil {
+			return p.CCIPSpec.CreatedAt.Format(time.RFC3339)
+		}
+	case presenters.CCVCommitteeVerifierJobSpec:
+		if p.CCVCommitteeVerifierSpec != nil {
+			return p.CCVCommitteeVerifierSpec.CreatedAt.Format(time.RFC3339)
+		}
+	case presenters.CCVExecutorJobSpec:
+		if p.CCVExecutorSpec != nil {
+			return p.CCVExecutorSpec.CreatedAt.Format(time.RFC3339)
+		}
 	default:
 		return "unknown"
 	}
@@ -174,15 +192,18 @@ func (p JobPresenter) FriendlyCreatedAt() string {
 }
 
 // RenderTable implements TableRenderer
-func (p *JobPresenter) RenderTable(rt RendererTable) error {
+func (p JobPresenter) RenderTable(rt RendererTable) error {
 	table := rt.newTable([]string{"ID", "Name", "Type", "Tasks", "Created At"})
-	table.SetAutoMergeCells(true)
+	table.Configure(func(cfg *tablewriter.Config) {
+		cfg.Behavior.Compact.Merge = tw.MergeHorizontal
+	})
 	for _, r := range p.ToRows() {
-		table.Append(r)
+		if err := table.Append(r); err != nil {
+			return err
+		}
 	}
 
-	render("Jobs", table)
-	return nil
+	return render("Jobs", table)
 }
 
 type JobPresenters []JobPresenter
@@ -190,15 +211,18 @@ type JobPresenters []JobPresenter
 // RenderTable implements TableRenderer
 func (ps JobPresenters) RenderTable(rt RendererTable) error {
 	table := rt.newTable([]string{"ID", "Name", "Type", "Tasks", "Created At"})
-	table.SetAutoMergeCells(true)
+	table.Configure(func(cfg *tablewriter.Config) {
+		cfg.Behavior.Compact.Merge = tw.MergeHorizontal
+	})
 	for _, p := range ps {
 		for _, r := range p.ToRows() {
-			table.Append(r)
+			if err := table.Append(r); err != nil {
+				return err
+			}
 		}
 	}
 
-	render("Jobs (V2)", table)
-	return nil
+	return render("Jobs (V2)", table)
 }
 
 // ListJobs lists all jobs
@@ -218,7 +242,7 @@ func (s *Shell) ShowJob(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -250,14 +274,14 @@ func (s *Shell) CreateJob(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
 	if resp.StatusCode >= 400 {
 		body, rerr := io.ReadAll(resp.Body)
 		if err != nil {
-			err = multierr.Append(err, rerr)
+			err = stderrors.Join(err, rerr)
 			return s.errorOut(err)
 		}
 		fmt.Printf("Response: '%v', Status: %d\n", string(body), resp.StatusCode)
@@ -277,6 +301,7 @@ func (s *Shell) DeleteJob(c *cli.Context) error {
 	if err != nil {
 		return s.errorOut(err)
 	}
+	defer resp.Body.Close()
 	_, err = s.parseResponse(resp)
 	if err != nil {
 		return s.errorOut(err)
@@ -297,7 +322,7 @@ func (s *Shell) TriggerPipelineRun(c *cli.Context) error {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 

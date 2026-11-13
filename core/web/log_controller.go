@@ -1,7 +1,7 @@
 package web
 
 import (
-	"fmt"
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -20,12 +20,13 @@ type LogController struct {
 
 type LogPatchRequest struct {
 	Level      string `json:"level"`
-	SqlEnabled *bool  `json:"sqlEnabled"`
+	SQLEnabled *bool  `json:"sqlEnabled"`
 }
 
 // Get retrieves the current log config settings
 func (cc *LogController) Get(c *gin.Context) {
-	var svcs, lvls []string
+	svcs := make([]string, 0, 2)
+	lvls := make([]string, 0, 2)
 	svcs = append(svcs, "Global")
 	lvls = append(lvls, cc.App.GetConfig().Log().Level().String())
 
@@ -53,11 +54,12 @@ func (cc *LogController) Patch(c *gin.Context) {
 	}
 
 	// Build log config response
-	var svcs, lvls []string
+	svcs := make([]string, 0, 2)
+	lvls := make([]string, 0, 2)
 
 	// Validate request params
-	if request.Level == "" && request.SqlEnabled == nil {
-		jsonAPIError(c, http.StatusBadRequest, fmt.Errorf("please check request params, no params configured"))
+	if request.Level == "" && request.SQLEnabled == nil {
+		jsonAPIError(c, http.StatusBadRequest, errors.New("please check request params, no params configured"))
 		return
 	}
 
@@ -76,8 +78,8 @@ func (cc *LogController) Patch(c *gin.Context) {
 	svcs = append(svcs, "Global")
 	lvls = append(lvls, cc.App.GetConfig().Log().Level().String())
 
-	if request.SqlEnabled != nil {
-		cc.App.GetConfig().SetLogSQL(*request.SqlEnabled)
+	if request.SQLEnabled != nil {
+		cc.App.GetConfig().SetLogSQL(*request.SQLEnabled)
 	}
 
 	svcs = append(svcs, "IsSqlEnabled")
@@ -91,13 +93,13 @@ func (cc *LogController) Patch(c *gin.Context) {
 		LogLevel:    lvls,
 	}
 
-	cc.App.GetAuditLogger().Audit(audit.GlobalLogLevelSet, map[string]interface{}{"logLevel": request.Level})
+	cc.App.GetAuditLogger().Audit(audit.GlobalLogLevelSet, map[string]any{"logLevel": request.Level})
 
 	if request.Level == "debug" {
-		if request.SqlEnabled != nil && *request.SqlEnabled {
-			cc.App.GetAuditLogger().Audit(audit.ConfigSqlLoggingEnabled, map[string]interface{}{})
+		if request.SQLEnabled != nil && *request.SQLEnabled {
+			cc.App.GetAuditLogger().Audit(audit.ConfigSQLLoggingEnabled, map[string]any{})
 		} else {
-			cc.App.GetAuditLogger().Audit(audit.ConfigSqlLoggingDisabled, map[string]interface{}{})
+			cc.App.GetAuditLogger().Audit(audit.ConfigSQLLoggingDisabled, map[string]any{})
 		}
 	}
 

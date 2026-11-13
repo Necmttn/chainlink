@@ -7,7 +7,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 )
@@ -21,7 +20,7 @@ func TestMergeTask(t *testing.T) {
 		right             string
 		vars              pipeline.Vars
 		inputs            []pipeline.Result
-		wantData          interface{}
+		wantData          any
 		wantError         bool
 		wantErrorContains string
 	}{
@@ -31,7 +30,7 @@ func TestMergeTask(t *testing.T) {
 			`{"foo": "42", "bar": null, "blobber": false}`,
 			pipeline.NewVarsFrom(nil),
 			[]pipeline.Result{{Value: `{"foo": "baz", "qux": 99, "flibber": null, "baz": true}`}},
-			map[string]interface{}{
+			map[string]any{
 				"foo":     "42",
 				"qux":     float64(99),
 				"bar":     nil,
@@ -48,7 +47,7 @@ func TestMergeTask(t *testing.T) {
 			`{"foo": 42, "qux": null}`,
 			pipeline.NewVarsFrom(nil),
 			[]pipeline.Result{{Value: `{"ignored": true}`}},
-			map[string]interface{}{
+			map[string]any{
 				"foo":     int64(42),
 				"qux":     nil,
 				"flibber": nil,
@@ -62,7 +61,7 @@ func TestMergeTask(t *testing.T) {
 			`{"foo": "baz", "qux": 99, "flibber": null}`,
 			pipeline.NewVarsFrom(nil),
 			[]pipeline.Result{{Value: `{"ignored": true}`}},
-			map[string]interface{}{
+			map[string]any{
 				"foo":     "baz",
 				"qux":     int64(99),
 				"bar":     nil,
@@ -95,15 +94,15 @@ func TestMergeTask(t *testing.T) {
 			"explicit left variable data on right",
 			`{"foo": 42, "bar": null}`,
 			"$(someInput)",
-			pipeline.NewVarsFrom(map[string]interface{}{
-				"someInput": map[string]interface{}{
+			pipeline.NewVarsFrom(map[string]any{
+				"someInput": map[string]any{
 					"foo":     "baz",
 					"qux":     99,
 					"flibber": nil,
 				},
 			}),
 			[]pipeline.Result{},
-			map[string]interface{}{
+			map[string]any{
 				"foo":     "baz",
 				"qux":     99,
 				"bar":     nil,
@@ -116,7 +115,7 @@ func TestMergeTask(t *testing.T) {
 			"explicit left invalid variable data on right",
 			`{"foo": 42, "bar": null}`,
 			"$(someInput)",
-			pipeline.NewVarsFrom(map[string]interface{}{
+			pipeline.NewVarsFrom(map[string]any{
 				"someInput": "this is a string",
 			}),
 			[]pipeline.Result{},
@@ -128,11 +127,11 @@ func TestMergeTask(t *testing.T) {
 			"variable in left",
 			`{"foo": 42, "bar": null}`,
 			`{"flibber": $(someInput)}`,
-			pipeline.NewVarsFrom(map[string]interface{}{
+			pipeline.NewVarsFrom(map[string]any{
 				"someInput": "this is a string",
 			}),
 			[]pipeline.Result{},
-			map[string]interface{}{
+			map[string]any{
 				"foo":     int64(42),
 				"bar":     nil,
 				"flibber": "this is a string",
@@ -144,11 +143,11 @@ func TestMergeTask(t *testing.T) {
 			"variable in right",
 			`{"flibber": $(someInput)}`,
 			`{"foo": 42, "bar": null}`,
-			pipeline.NewVarsFrom(map[string]interface{}{
+			pipeline.NewVarsFrom(map[string]any{
 				"someInput": "this is a string",
 			}),
 			[]pipeline.Result{},
-			map[string]interface{}{
+			map[string]any{
 				"foo":     int64(42),
 				"bar":     nil,
 				"flibber": "this is a string",
@@ -166,7 +165,7 @@ func TestMergeTask(t *testing.T) {
 				Left:     test.left,
 				Right:    test.right,
 			}
-			result, runInfo := task.Run(testutils.Context(t), logger.TestLogger(t), test.vars, test.inputs)
+			result, runInfo := task.Run(t.Context(), logger.TestLogger(t), test.vars, test.inputs)
 			assert.False(t, runInfo.IsPending)
 			assert.False(t, runInfo.IsRetryable)
 
@@ -180,7 +179,7 @@ func TestMergeTask(t *testing.T) {
 				require.Equal(t, pipeline.ErrKeypathNotFound, errors.Cause(err))
 				require.Nil(t, val)
 			} else {
-				assert.NoError(t, result.Error)
+				require.NoError(t, result.Error)
 				assert.Equal(t, test.wantData, result.Value)
 			}
 		})

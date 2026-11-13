@@ -1,0 +1,21 @@
+module github.com/smartcontractkit/chainlink/core/scripts/cre/environment/examples/workflows/cron
+
+go 1.27.3
+
+require (
+	github.com/smartcontractkit/cre-sdk-go v1.5.0
+	github.com/smartcontractkit/cre-sdk-go/capabilities/scheduler/cron v1.3.0
+	gopkg.in/yaml.v3 v3.0.1
+)
+
+require (
+	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
+	github.com/kr/pretty v0.3.1 // indirect
+	github.com/rogpeppe/go-internal v1.16.0 // indirect
+	github.com/shopspring/decimal v1.4.0 // indirect
+	github.com/smartcontractkit/chainlink-protos/cre/go v0.0.0-20260804191526-b7a850ae7648 // indirect
+	github.com/stretchr/testify v1.12.1 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
+	google.golang.org/protobuf v1.36.12 // indirect
+	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
+)

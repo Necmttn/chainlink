@@ -1,0 +1,183 @@
+package contracts
+
+import (
+	"errors"
+	"fmt"
+	"io"
+
+	"github.com/ethereum/go-ethereum/common"
+
+	evmstate "github.com/smartcontractkit/cld-changesets/legacy/pkg/family/evm"
+
+	cldf "github.com/smartcontractkit/chainlink-deployments-framework/deployment"
+	"github.com/smartcontractkit/chainlink-deployments-framework/operations"
+	"github.com/smartcontractkit/chainlink/deployment/cre/common/strategies"
+	crecontracts "github.com/smartcontractkit/chainlink/deployment/cre/contracts"
+	"github.com/smartcontractkit/chainlink/deployment/cre/jobs/pkg"
+	"github.com/smartcontractkit/chainlink/deployment/cre/ocr3/ocr3_1"
+	"github.com/smartcontractkit/chainlink/deployment/cre/ocr3/v2/changeset"
+	"github.com/smartcontractkit/chainlink/deployment/cre/ocr3/v2/changeset/operations/contracts"
+)
+
+var _ cldf.ChangeSetV2[ConfigureVaultDKGInput] = ConfigureVaultDKG{}
+
+type ConfigureVaultDKGInput struct {
+	ContractChainSelector uint64 `json:"contractChainSelector" yaml:"contractChainSelector"`
+	ContractQualifier     string `json:"contractQualifier" yaml:"contractQualifier"`
+
+	DON          DKGDon                   `json:"don" yaml:"don"`
+	OracleConfig *ocr3_1.V3_1OracleConfig `json:"oracleConfig" yaml:"oracleConfig"`
+	DryRun       bool                     `json:"dryRun" yaml:"dryRun"`
+
+	MCMSConfig          *crecontracts.MCMSConfig `json:"mcmsConfig" yaml:"mcmsConfig"`
+	ExtraSignerFamilies []string                 `json:"extraSignerFamilies,omitempty" yaml:"extraSignerFamilies,omitempty"`
+}
+
+type DKGDon struct {
+	contracts.DonNodeSet
+	// DealerPublicKeys are the DKG public keys of the dealers (the nodes that contribute
+	// shares in this run). Both DealerPublicKeys and RecipientPublicKeys must always be set
+	// explicitly so the intent of the run is unambiguous:
+	//   - Fresh DKG (PreviousInstanceID nil): DealerPublicKeys must equal RecipientPublicKeys
+	//     (every participant both deals and receives).
+	//   - Resharing (PreviousInstanceID set): DealerPublicKeys must exactly equal the previous
+	//     instance's RecipientPublicKeys (same values, same order) — the old holders reshare to
+	//     the new set. RecipientPublicKeys is the new participant set. The smdkg plugin rejects
+	//     the config if dealers do not match the prior recipients.
+	DealerPublicKeys []string `json:"dealerPublicKeys" yaml:"dealerPublicKeys"`
+	// RecipientPublicKeys are the DKG public keys of the recipients (the resulting participant
+	// set that will hold shares of the master secret). NodeIDs correspond positionally to
+	// RecipientPublicKeys for a fresh DKG. For a reshare, NodeIDs is the outgoing committee (==
+	// DealerPublicKeys) and the recipient set may be smaller/different.
+	RecipientPublicKeys []string `json:"recipientPublicKeys" yaml:"recipientPublicKeys"`
+	// PreviousInstanceID, when set, makes this a resharing DKG instead of a fresh dealing.
+	// It must be the currently-live DKG instance ID (e.g.
+	// "sanmarinodkg/v1/<dkgContract>/<configDigest>"). Resharing preserves the group
+	// (master) public key while changing the participant/share set; a fresh dealing
+	// (nil) generates a NEW group key. Leave nil only for the very first DKG config.
+	PreviousInstanceID *string `json:"previousInstanceID,omitempty" yaml:"previousInstanceID,omitempty"`
+}
+
+type ConfigureVaultDKG struct{}
+
+func (l ConfigureVaultDKG) VerifyPreconditions(_ cldf.Environment, input ConfigureVaultDKGInput) error {
+	if input.ContractChainSelector == 0 {
+		return errors.New("contract chain selector is required")
+	}
+	if input.ContractQualifier == "" {
+		return errors.New("contract qualifier is required")
+	}
+	if input.DON.Name == "" {
+		return errors.New("don name is required")
+	}
+	if len(input.DON.NodeIDs) == 0 {
+		return errors.New("at least one don node ID is required")
+	}
+	if len(input.DON.RecipientPublicKeys) == 0 {
+		return errors.New("at least one recipient public key is required")
+	}
+	if len(input.DON.DealerPublicKeys) == 0 {
+		return errors.New("at least one dealer public key is required (set dealerPublicKeys explicitly: equal to recipientPublicKeys for a fresh DKG, or equal to the previous instance's recipientPublicKeys for a reshare)")
+	}
+	// The DKG instance is run by NodeIDs, so N == len(NodeIDs).
+	if input.DON.PreviousInstanceID == nil {
+		// Fresh DKG: everyone deals and receives, so all three sets are identical.
+		if len(input.DON.NodeIDs) != len(input.DON.RecipientPublicKeys) || !equalStringSlices(input.DON.DealerPublicKeys, input.DON.RecipientPublicKeys) {
+			return errors.New("for a fresh DKG, nodeIDs, dealerPublicKeys and recipientPublicKeys must all be equal in length, and dealerPublicKeys must equal recipientPublicKeys")
+		}
+	} else {
+		// Reshare: only the outgoing committee holds shares, so it runs the instance: N == dealers.
+		if len(input.DON.NodeIDs) != len(input.DON.DealerPublicKeys) {
+			return errors.New("for a reshare, the number of nodeIDs must equal the number of dealerPublicKeys (the outgoing committee runs the reshare)")
+		}
+	}
+	if input.OracleConfig == nil {
+		return errors.New("oracle config is required")
+	}
+	_, _, err := ocr3_1.VerifyAndExtractOCR3_1Fields(input.OracleConfig.PrevConfigDigest, input.OracleConfig.PrevSeqNr, input.OracleConfig.PrevHistoryDigest)
+	if err != nil {
+		return errors.New("verifyAndExtractOCR3_1Fields failed verification: " + err.Error())
+	}
+	return nil
+}
+
+func (l ConfigureVaultDKG) Apply(e cldf.Environment, input ConfigureVaultDKGInput) (cldf.ChangesetOutput, error) {
+	e.Logger.Infow("Configuring Vault DKG contract with DON", "donName", input.DON.Name, "nodes", input.DON.NodeIDs, "dryRun", input.DryRun)
+
+	var mcmsContracts *evmstate.MCMSWithTimelockState
+	if input.MCMSConfig != nil {
+		var mcmsErr error
+		mcmsContracts, mcmsErr = strategies.GetMCMSContracts(e, input.ContractChainSelector, *input.MCMSConfig)
+		if mcmsErr != nil {
+			return cldf.ChangesetOutput{}, fmt.Errorf("failed to get MCMS contracts: %w", mcmsErr)
+		}
+	}
+
+	chain, ok := e.BlockChains.EVMChains()[input.ContractChainSelector]
+	if !ok {
+		return cldf.ChangesetOutput{}, fmt.Errorf("chain with selector %d not found in environment", input.ContractChainSelector)
+	}
+
+	contractRefKey := pkg.GetOCR3CapabilityAddressRefKey(input.ContractChainSelector, input.ContractQualifier)
+	contractAddrRef, err := e.DataStore.Addresses().Get(contractRefKey)
+	if err != nil {
+		return cldf.ChangesetOutput{}, fmt.Errorf("failed to get OCR3 contract address for chain selector %d and qualifier %s: %w", input.ContractChainSelector, input.ContractQualifier, err)
+	}
+	contractAddr := common.HexToAddress(contractAddrRef.Address)
+
+	strategy, err := strategies.CreateStrategy(
+		chain,
+		e,
+		input.MCMSConfig,
+		mcmsContracts,
+		common.HexToAddress(contractAddrRef.Address),
+		changeset.ConfigureOCR3Description,
+	)
+	if err != nil {
+		return cldf.ChangesetOutput{}, fmt.Errorf("failed to create strategy: %w", err)
+	}
+
+	input.OracleConfig.DKGOffchainConfig = dkgOffchainConfig(input.DON, input.OracleConfig.MaxFaultyOracles+1)
+	report, err := operations.ExecuteOperation(e.OperationsBundle, ConfigureDKG, ConfigureDKGDeps{
+		WriteGeneratedConfig: io.Discard,
+		Env:                  &e,
+		Strategy:             strategy,
+	}, ConfigureDKGInput{
+		ContractAddress:     &contractAddr,
+		ChainSelector:       input.ContractChainSelector,
+		DON:                 input.DON.DonNodeSet,
+		Config:              input.OracleConfig,
+		DryRun:              input.DryRun,
+		MCMSConfig:          input.MCMSConfig,
+		ExtraSignerFamilies: input.ExtraSignerFamilies,
+	})
+	if err != nil {
+		return cldf.ChangesetOutput{}, fmt.Errorf("failed to configure OCR3 contract: %w", err)
+	}
+
+	return cldf.ChangesetOutput{
+		MCMSTimelockProposals: report.Output.MCMSTimelockProposals,
+		Reports:               []operations.Report[any, any]{report.ToGenericReport()},
+	}, nil
+}
+
+func dkgOffchainConfig(don DKGDon, threshold int) *ocr3_1.DKGOffchainConfig {
+	return &ocr3_1.DKGOffchainConfig{
+		T:                   threshold,
+		DealerPublicKeys:    don.DealerPublicKeys,
+		RecipientPublicKeys: don.RecipientPublicKeys,
+		PreviousInstanceID:  don.PreviousInstanceID,
+	}
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zapcore"
@@ -24,8 +23,6 @@ func TestLogger_Passthrough(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
-
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -67,7 +64,7 @@ func TestLogger_Passthrough(t *testing.T) {
 			require.Equal(t, "mockLogger", nm)
 
 			err := l.Sync()
-			assert.ErrorIs(t, err, errTest)
+			require.ErrorIs(t, err, errTest)
 
 			l.Recover(errTest)
 		})

@@ -3,22 +3,17 @@ package chainlink
 import (
 	"errors"
 	"fmt"
+	"slices"
 
-	"go.uber.org/multierr"
-
+	"github.com/imdario/mergo"
 	gotoml "github.com/pelletier/go-toml/v2"
 
-	coscfg "github.com/smartcontractkit/chainlink-cosmos/pkg/cosmos/config"
-	"github.com/smartcontractkit/chainlink-solana/pkg/solana"
-	stkcfg "github.com/smartcontractkit/chainlink-starknet/relayer/pkg/chainlink/config"
-
-	evmcfg "github.com/smartcontractkit/chainlink/v2/core/chains/evm/config/toml"
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	configtoml "github.com/smartcontractkit/chainlink-evm/pkg/config/toml"
 	"github.com/smartcontractkit/chainlink/v2/core/config/docs"
 	"github.com/smartcontractkit/chainlink/v2/core/config/env"
 	"github.com/smartcontractkit/chainlink/v2/core/config/toml"
-	"github.com/smartcontractkit/chainlink/v2/core/store/models"
-	"github.com/smartcontractkit/chainlink/v2/core/utils"
-	"github.com/smartcontractkit/chainlink/v2/core/utils/config"
+	configutils "github.com/smartcontractkit/chainlink/v2/core/utils/config"
 )
 
 // Config is the root type used for TOML configuration.
@@ -34,13 +29,241 @@ import (
 type Config struct {
 	toml.Core
 
-	EVM evmcfg.EVMConfigs `toml:",omitempty"`
+	EVM configtoml.EVMConfigs `toml:",omitempty"`
 
-	Cosmos coscfg.TOMLConfigs `toml:",omitempty"`
+	Solana RawConfigs `toml:",omitempty"`
 
-	Solana solana.TOMLConfigs `toml:",omitempty"`
+	Starknet RawConfigs `toml:",omitempty"`
 
-	Starknet stkcfg.TOMLConfigs `toml:",omitempty"`
+	Aptos RawConfigs `toml:",omitempty"`
+
+	Tron RawConfigs `toml:",omitempty"`
+
+	TON RawConfigs `toml:",omitempty"`
+
+	Sui RawConfigs `toml:",omitempty"`
+
+	Stellar RawConfigs `toml:",omitempty"`
+}
+
+// RawConfigs is a list of RawConfig.
+type RawConfigs []RawConfig
+
+func (rs RawConfigs) SetDefaults() {
+	for _, r := range rs {
+		r.SetDefaults()
+	}
+}
+
+func (rs *RawConfigs) SetFrom(configs RawConfigs) error {
+	if err := configs.validateKeys(); err != nil {
+		return err
+	}
+
+	for _, config := range configs {
+		chainID := config.ChainID()
+		i := slices.IndexFunc(*rs, func(r RawConfig) bool {
+			otherChainID := r.ChainID()
+			return otherChainID != "" && chainID == otherChainID
+		})
+		if i != -1 {
+			if err := (*rs)[i].SetFrom(config); err != nil {
+				return err
+			}
+		} else {
+			*rs = append(*rs, config)
+		}
+	}
+
+	return nil
+}
+
+func (rs RawConfigs) validateKeys() (err error) {
+	chainIDs := commonconfig.UniqueStrings{}
+	for i, config := range rs {
+		chainID := config.ChainID()
+		if chainIDs.IsDupe(&chainID) {
+			err = errors.Join(err, commonconfig.NewErrDuplicate(fmt.Sprintf("%d.ChainID", i), chainID))
+		}
+	}
+
+	nodeNames := commonconfig.UniqueStrings{}
+	for i, config := range rs {
+		configNodeNames := config.NodeNames()
+		for j, nodeName := range configNodeNames {
+			if nodeNames.IsDupe(&nodeName) {
+				err = errors.Join(err, commonconfig.NewErrDuplicate(fmt.Sprintf("%d.Nodes.%d.Name", i, j), nodeName))
+			}
+		}
+	}
+	return err
+}
+
+func (rs RawConfigs) ValidateConfig() (err error) {
+	return rs.validateKeys()
+}
+
+// RawConfig is the config used for chains that are not embedded.
+type RawConfig map[string]any
+
+type parsedRawConfig struct {
+	chainID    string
+	nodesExist bool
+	nodes      []map[string]any
+	nodeNames  []string
+}
+
+func (c RawConfig) parse() (*parsedRawConfig, error) {
+	var err error
+	if v, ok := c["Enabled"]; ok {
+		if _, ok := v.(bool); !ok {
+			err = errors.Join(err, commonconfig.ErrInvalid{Name: "Enabled", Value: v, Msg: "expected bool"})
+		}
+	}
+
+	parsedRawConfig := &parsedRawConfig{}
+	chainID, exists := c["ChainID"]
+	if !exists {
+		err = errors.Join(err, commonconfig.ErrMissing{Name: "ChainID", Msg: "required for all chains"})
+	} else {
+		chainIDStr, ok := chainID.(string)
+		switch {
+		case !ok:
+			err = errors.Join(err, commonconfig.ErrInvalid{Name: "ChainID", Value: chainID, Msg: "expected string"})
+		case chainIDStr == "":
+			err = errors.Join(err, commonconfig.ErrEmpty{Name: "ChainID", Msg: "required for all chains"})
+		default:
+			parsedRawConfig.chainID = chainIDStr
+		}
+	}
+	nodes, nodesExist := c["Nodes"]
+	parsedRawConfig.nodesExist = nodesExist
+	if nodesExist {
+		nodeMaps, ok := nodes.([]any)
+		switch {
+		case !ok:
+			err = errors.Join(err, commonconfig.ErrInvalid{Name: "Nodes", Value: nodes, Msg: "expected array of node configs"})
+		default:
+			for i, node := range nodeMaps {
+				nodeConfig, ok := node.(map[string]any)
+				if !ok {
+					err = errors.Join(err, commonconfig.ErrInvalid{Name: fmt.Sprintf("Nodes.%d", i), Value: nodeConfig, Msg: "expected node config map"})
+				} else {
+					parsedRawConfig.nodes = append(parsedRawConfig.nodes, nodeConfig)
+					nodeName, exists := nodeConfig["Name"]
+					if !exists {
+						err = errors.Join(err, commonconfig.ErrMissing{Name: fmt.Sprintf("Nodes.%d.Name", i), Msg: "required for all nodes"})
+					} else {
+						nodeNameStr, ok := nodeName.(string)
+						switch {
+						case !ok:
+							err = errors.Join(err, commonconfig.ErrInvalid{Name: fmt.Sprintf("Nodes.%d.Name", i), Value: nodeName, Msg: "expected string"})
+						case nodeNameStr == "":
+							err = errors.Join(err, commonconfig.ErrEmpty{Name: fmt.Sprintf("Nodes.%d.Name", i), Msg: "required for all nodes"})
+						default:
+							parsedRawConfig.nodeNames = append(parsedRawConfig.nodeNames, nodeNameStr)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return parsedRawConfig, err
+}
+
+// ValidateConfig returns an error if the Config is not valid for use, as-is.
+func (c RawConfig) ValidateConfig() error {
+	parsedRawConfig, err := c.parse()
+	if !parsedRawConfig.nodesExist {
+		err = errors.Join(err, commonconfig.ErrMissing{Name: "Nodes", Msg: "expected at least one node"})
+	} else if len(parsedRawConfig.nodes) == 0 {
+		err = errors.Join(err, commonconfig.ErrEmpty{Name: "Nodes", Msg: "expected at least one node"})
+	}
+	return err
+}
+
+func (c RawConfig) IsEnabled() bool {
+	s := c["Enabled"]
+	if s == nil {
+		return true // default to true if omitted
+	}
+	b, ok := s.(bool)
+	return ok && b
+}
+
+func (c RawConfig) ChainID() string {
+	chainID, _ := c["ChainID"].(string)
+	return chainID
+}
+
+func (c *RawConfig) SetFrom(config RawConfig) error {
+	if e := config["Enabled"]; e != nil {
+		(*c)["Enabled"] = e
+	}
+	parsedRawConfig, err := c.parse()
+	if err != nil {
+		return err
+	}
+
+	incomingParsedRawConfig, err := config.parse()
+	if err != nil {
+		return err
+	}
+
+	// Create a copy of config without nodes to merge other fields
+	configWithoutNodes := make(RawConfig)
+	for k, v := range config {
+		if k != "Nodes" {
+			configWithoutNodes[k] = v
+		}
+	}
+
+	// Merge all non-node fields
+	if err := mergo.Merge(c, configWithoutNodes, mergo.WithOverride); err != nil {
+		return err
+	}
+
+	// Handle node merging
+	for i, nodeConfig := range incomingParsedRawConfig.nodes {
+		nodeName := incomingParsedRawConfig.nodeNames[i]
+		i := slices.Index(parsedRawConfig.nodeNames, nodeName)
+		if i != -1 {
+			if err := mergo.Merge(&parsedRawConfig.nodes[i], nodeConfig, mergo.WithOverride); err != nil {
+				return err
+			}
+		} else {
+			parsedRawConfig.nodes = append(parsedRawConfig.nodes, nodeConfig)
+		}
+	}
+
+	// Subsequence SetFrom invocations will call parse(), and expect to be able to cast c["Nodes"] to []any,
+	// so we can't directly assign parsedRawConfig.nodes back to c["Nodes"].
+	anyConfigs := []any{}
+	for _, nodeConfig := range parsedRawConfig.nodes {
+		anyConfigs = append(anyConfigs, nodeConfig)
+	}
+
+	(*c)["Nodes"] = anyConfigs
+	return nil
+}
+
+func (c RawConfig) NodeNames() []string {
+	nodes, _ := c["Nodes"].([]any)
+	nodeNames := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		config, _ := node.(map[string]any)
+		nodeName, _ := config["Name"].(string)
+		nodeNames = append(nodeNames, nodeName)
+	}
+	return nodeNames
+}
+
+func (c RawConfig) SetDefaults() {
+	if e, ok := c["Enabled"].(bool); ok && e {
+		// already enabled by default so drop it
+		delete(c, "Enabled")
+	}
 }
 
 // TOMLString returns a TOML encoded string.
@@ -55,9 +278,10 @@ func (c *Config) TOMLString() (string, error) {
 // warnings aggregates warnings from valueWarnings and deprecationWarnings
 func (c *Config) warnings() (err error) {
 	deprecationErr := c.deprecationWarnings()
+
 	warningErr := c.valueWarnings()
-	err = multierr.Append(deprecationErr, warningErr)
-	_, list := utils.MultiErrorList(err)
+	err = errors.Join(deprecationErr, warningErr)
+	_, list := commonconfig.MultiErrorList(err)
 	return list
 }
 
@@ -66,24 +290,23 @@ func (c *Config) valueWarnings() (err error) {
 	if c.Tracing.Enabled != nil && *c.Tracing.Enabled {
 		if c.Tracing.Mode != nil && *c.Tracing.Mode == "unencrypted" {
 			if c.Tracing.TLSCertPath != nil {
-				err = multierr.Append(err, config.ErrInvalid{Name: "Tracing.TLSCertPath", Value: *c.Tracing.TLSCertPath, Msg: "must be empty when Tracing.Mode is 'unencrypted'"})
+				err = errors.Join(err, configutils.InvalidError{Name: "Tracing.TLSCertPath", Value: *c.Tracing.TLSCertPath, Msg: "must be empty when Tracing.Mode is 'unencrypted'"})
 			}
 		}
 	}
-	return
+	return err
 }
 
 // deprecationWarnings returns an error if the Config contains deprecated fields.
 // This is typically used before defaults have been applied, with input from the user.
 func (c *Config) deprecationWarnings() (err error) {
-	// none
-	return
+	return nil
 }
 
 // Validate returns an error if the Config is not valid for use, as-is.
 // This is typically used after defaults have been applied.
 func (c *Config) Validate() error {
-	if err := config.Validate(c); err != nil {
+	if err := commonconfig.Validate(c); err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
 	return nil
@@ -95,57 +318,48 @@ func (c *Config) setDefaults() {
 	core.SetFrom(&c.Core)
 	c.Core = core
 
+	c.Aptos.SetDefaults()
+
 	for i := range c.EVM {
 		if input := c.EVM[i]; input == nil {
-			c.EVM[i] = &evmcfg.EVMConfig{Chain: evmcfg.Defaults(nil)}
+			c.EVM[i] = &configtoml.EVMConfig{Chain: configtoml.Defaults(nil)}
 		} else {
-			input.Chain = evmcfg.Defaults(input.ChainID, &input.Chain)
+			input.Chain = configtoml.Defaults(input.ChainID, &input.Chain)
 		}
 	}
 
-	for i := range c.Cosmos {
-		if c.Cosmos[i] == nil {
-			c.Cosmos[i] = new(coscfg.TOMLConfig)
-		}
-		c.Cosmos[i].Chain.SetDefaults()
-	}
+	c.Solana.SetDefaults()
 
-	for i := range c.Solana {
-		if c.Solana[i] == nil {
-			c.Solana[i] = new(solana.TOMLConfig)
-		}
-		c.Solana[i].Chain.SetDefaults()
-	}
+	c.Starknet.SetDefaults()
 
-	for i := range c.Starknet {
-		if c.Starknet[i] == nil {
-			c.Starknet[i] = new(stkcfg.TOMLConfig)
-		}
-		c.Starknet[i].Chain.SetDefaults()
-	}
+	c.Tron.SetDefaults()
+
+	c.TON.SetDefaults()
+
+	c.Sui.SetDefaults()
+
+	c.Stellar.SetDefaults()
 }
 
 func (c *Config) SetFrom(f *Config) (err error) {
 	c.Core.SetFrom(&f.Core)
 
-	if err1 := c.EVM.SetFrom(&f.EVM); err1 != nil {
-		err = multierr.Append(err, config.NamedMultiErrorList(err1, "EVM"))
+	appendErr := func(e error, name string) {
+		if e != nil {
+			err = errors.Join(err, commonconfig.NamedMultiErrorList(e, name))
+		}
 	}
 
-	if err2 := c.Cosmos.SetFrom(&f.Cosmos); err2 != nil {
-		err = multierr.Append(err, config.NamedMultiErrorList(err2, "Cosmos"))
-	}
+	appendErr(c.EVM.SetFrom(&f.EVM), "EVM")
+	appendErr(c.Solana.SetFrom(f.Solana), "Solana")
+	appendErr(c.Starknet.SetFrom(f.Starknet), "Starknet")
+	appendErr(c.Aptos.SetFrom(f.Aptos), "Aptos")
+	appendErr(c.Tron.SetFrom(f.Tron), "Tron")
+	appendErr(c.TON.SetFrom(f.TON), "TON")
+	appendErr(c.Sui.SetFrom(f.Sui), "Sui")
+	appendErr(c.Stellar.SetFrom(f.Stellar), "Stellar")
 
-	if err3 := c.Solana.SetFrom(&f.Solana); err3 != nil {
-		err = multierr.Append(err, config.NamedMultiErrorList(err3, "Solana"))
-	}
-
-	if err4 := c.Starknet.SetFrom(&f.Starknet); err4 != nil {
-		err = multierr.Append(err, config.NamedMultiErrorList(err4, "Starknet"))
-	}
-
-	_, err = utils.MultiErrorList(err)
-
+	_, err = commonconfig.MultiErrorList(err)
 	return err
 }
 
@@ -155,41 +369,73 @@ type Secrets struct {
 
 func (s *Secrets) SetFrom(f *Secrets) (err error) {
 	if err2 := s.Database.SetFrom(&f.Database); err2 != nil {
-		err = multierr.Append(err, config.NamedMultiErrorList(err2, "Database"))
+		err = errors.Join(err, commonconfig.NamedMultiErrorList(err2, "Database"))
 	}
 
 	if err2 := s.Password.SetFrom(&f.Password); err2 != nil {
-		err = multierr.Append(err, config.NamedMultiErrorList(err2, "Password"))
+		err = errors.Join(err, commonconfig.NamedMultiErrorList(err2, "Password"))
 	}
 
 	if err2 := s.WebServer.SetFrom(&f.WebServer); err2 != nil {
-		err = multierr.Append(err, config.NamedMultiErrorList(err2, "WebServer"))
+		err = errors.Join(err, commonconfig.NamedMultiErrorList(err2, "WebServer"))
 	}
 
 	if err2 := s.Pyroscope.SetFrom(&f.Pyroscope); err2 != nil {
-		err = multierr.Append(err, config.NamedMultiErrorList(err2, "Pyroscope"))
+		err = errors.Join(err, commonconfig.NamedMultiErrorList(err2, "Pyroscope"))
 	}
 
 	if err2 := s.Prometheus.SetFrom(&f.Prometheus); err2 != nil {
-		err = multierr.Append(err, config.NamedMultiErrorList(err2, "Prometheus"))
+		err = errors.Join(err, commonconfig.NamedMultiErrorList(err2, "Prometheus"))
 	}
 
 	if err2 := s.Mercury.SetFrom(&f.Mercury); err2 != nil {
-		err = multierr.Append(err, config.NamedMultiErrorList(err2, "Mercury"))
+		err = errors.Join(err, commonconfig.NamedMultiErrorList(err2, "Mercury"))
 	}
 
 	if err2 := s.Threshold.SetFrom(&f.Threshold); err2 != nil {
-		err = multierr.Append(err, config.NamedMultiErrorList(err2, "Threshold"))
+		err = errors.Join(err, commonconfig.NamedMultiErrorList(err2, "Threshold"))
 	}
 
-	_, err = utils.MultiErrorList(err)
+	if err2 := s.EVM.SetFrom(&f.EVM); err2 != nil {
+		err = errors.Join(err, commonconfig.NamedMultiErrorList(err2, "EthKeys"))
+	}
+
+	if err2 := s.P2PKey.SetFrom(&f.P2PKey); err2 != nil {
+		err = errors.Join(err, commonconfig.NamedMultiErrorList(err2, "P2PKey"))
+	}
+
+	if err2 := s.Solana.SetFrom(&f.Solana); err2 != nil {
+		err = errors.Join(err, commonconfig.NamedMultiErrorList(err2, "Solana"))
+	}
+
+	if err2 := s.Aptos.SetFrom(&f.Aptos); err2 != nil {
+		err = errors.Join(err, commonconfig.NamedMultiErrorList(err2, "Aptos"))
+	}
+
+	if err2 := s.Stellar.SetFrom(&f.Stellar); err2 != nil {
+		err = errors.Join(err, commonconfig.NamedMultiErrorList(err2, "Stellar"))
+	}
+
+	if err2 := s.DKGRecipientKey.SetFrom(&f.DKGRecipientKey); err2 != nil {
+		err = errors.Join(err, commonconfig.NamedMultiErrorList(err2, "DKGRecipientKey"))
+	}
+
+	if err2 := s.CRE.SetFrom(&f.CRE); err2 != nil {
+		err = errors.Join(err, commonconfig.NamedMultiErrorList(err2, "CRE"))
+	}
+
+	if err2 := s.CCV.SetFrom(&f.CCV); err2 != nil {
+		err = errors.Join(err, commonconfig.NamedMultiErrorList(err2, "CCV"))
+	}
+
+	_, err = commonconfig.MultiErrorList(err)
 
 	return err
 }
 
 func (s *Secrets) setDefaults() {
 	if nil == s.Database.AllowSimplePasswords {
-		s.Database.AllowSimplePasswords = new(bool)
+		s.Database.AllowSimplePasswords = new(false)
 	}
 }
 
@@ -202,12 +448,27 @@ func (s *Secrets) TOMLString() (string, error) {
 	return string(b), nil
 }
 
-var ErrInvalidSecrets = errors.New("invalid secrets")
+type InvalidSecretsError struct {
+	err error
+}
+
+func (e InvalidSecretsError) Error() string {
+	return fmt.Sprintf("invalid secrets: %v", e.err)
+}
+
+func (e InvalidSecretsError) Unwrap() error {
+	return e.err
+}
+
+func (e InvalidSecretsError) Is(err error) bool {
+	_, ok := err.(InvalidSecretsError)
+	return ok
+}
 
 // Validate validates every consitutent secret and return an accumulated error
 func (s *Secrets) Validate() error {
-	if err := config.Validate(s); err != nil {
-		return fmt.Errorf("%w: %s", ErrInvalidSecrets, err)
+	if err := commonconfig.Validate(s); err != nil {
+		return InvalidSecretsError{err: err}
 	}
 	return nil
 }
@@ -228,8 +489,8 @@ func (s *Secrets) ValidateDB() error {
 	}
 	s.setDefaults()
 	v := &dbValidationType{s.Database}
-	if err := config.Validate(v); err != nil {
-		return fmt.Errorf("%w: %s", ErrInvalidSecrets, err)
+	if err := commonconfig.Validate(v); err != nil {
+		return InvalidSecretsError{err: err}
 	}
 	return nil
 }
@@ -237,20 +498,19 @@ func (s *Secrets) ValidateDB() error {
 // setEnv overrides fields from ENV vars, if present.
 func (s *Secrets) setEnv() error {
 	if dbURL := env.DatabaseURL.Get(); dbURL != "" {
-		s.Database.URL = new(models.SecretURL)
+		s.Database.URL = new(commonconfig.SecretURL)
 		if err := s.Database.URL.UnmarshalText([]byte(dbURL)); err != nil {
 			return err
 		}
 	}
-	if dbBackupUrl := env.DatabaseBackupURL.Get(); dbBackupUrl != "" {
-		s.Database.BackupURL = new(models.SecretURL)
-		if err := s.Database.BackupURL.UnmarshalText([]byte(dbBackupUrl)); err != nil {
+	if dbBackupURL := env.DatabaseBackupURL.Get(); dbBackupURL != "" {
+		s.Database.BackupURL = new(commonconfig.SecretURL)
+		if err := s.Database.BackupURL.UnmarshalText([]byte(dbBackupURL)); err != nil {
 			return err
 		}
 	}
 	if env.DatabaseAllowSimplePasswords.IsTrue() {
-		s.Database.AllowSimplePasswords = new(bool)
-		*s.Database.AllowSimplePasswords = true
+		s.Database.AllowSimplePasswords = new(true)
 	}
 	if keystorePassword := env.PasswordKeystore.Get(); keystorePassword != "" {
 		s.Password.Keystore = &keystorePassword

@@ -7,11 +7,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
 	"github.com/smartcontractkit/chainlink/v2/core/config/env"
 	"github.com/smartcontractkit/chainlink/v2/core/config/toml"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
+	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
-	"github.com/smartcontractkit/chainlink/v2/core/store/models"
 )
 
 var (
@@ -35,7 +36,7 @@ var (
 	testSecretsFileContents = chainlink.Secrets{
 		Secrets: toml.Secrets{
 			Prometheus: toml.PrometheusSecrets{
-				AuthToken: models.NewSecret("PROM_TOKEN"),
+				AuthToken: commonconfig.NewSecretString("PROM_TOKEN"),
 			},
 		},
 	}
@@ -43,7 +44,7 @@ var (
 	testSecretsRedactedContents = chainlink.Secrets{
 		Secrets: toml.Secrets{
 			Prometheus: toml.PrometheusSecrets{
-				AuthToken: models.NewSecret("xxxxx"),
+				AuthToken: commonconfig.NewSecretString("xxxxx"),
 			},
 		},
 	}
@@ -152,6 +153,7 @@ func Test_initServerConfig(t *testing.T) {
 					"../services/chainlink/testdata/mergingsecretsdata/secrets-mercury-split-two.toml",
 					"../services/chainlink/testdata/mergingsecretsdata/secrets-threshold.toml",
 					"../services/chainlink/testdata/mergingsecretsdata/secrets-webserver-ldap.toml",
+					"../services/chainlink/testdata/mergingsecretsdata/secrets-webserver-oidc.toml",
 				},
 			},
 			wantErr: false,
@@ -242,5 +244,19 @@ func Test_initServerConfig(t *testing.T) {
 				assert.Equal(t, tt.wantCfg, cfg)
 			}
 		})
+	}
+}
+
+func Test_initCCVCommand_returns_ccv_with_chain_statuses_subcommands(t *testing.T) {
+	s := &Shell{Logger: logger.TestLogger(t)}
+	ccvCmd := initCCVCommand(s)
+	require.Equal(t, "ccv", ccvCmd.Name)
+	require.Len(t, ccvCmd.Subcommands, 1)
+	chainStatusesCmd := ccvCmd.Subcommands[0]
+	require.Equal(t, "chain-statuses", chainStatusesCmd.Name)
+	wantSubs := []string{"list", "enable", "disable", "set-finalized-height"}
+	require.Len(t, chainStatusesCmd.Subcommands, len(wantSubs))
+	for i, name := range wantSubs {
+		assert.Equal(t, name, chainStatusesCmd.Subcommands[i].Name, "subcommand order")
 	}
 }

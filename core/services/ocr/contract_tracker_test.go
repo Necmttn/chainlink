@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
-	gethCommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
@@ -17,13 +16,11 @@ import (
 
 	"github.com/smartcontractkit/chainlink-common/pkg/services/servicetest"
 	"github.com/smartcontractkit/chainlink-common/pkg/utils/mailbox/mailboxtest"
-
-	commonmocks "github.com/smartcontractkit/chainlink/v2/common/mocks"
-	evmclimocks "github.com/smartcontractkit/chainlink/v2/core/chains/evm/client/mocks"
-	evmconfig "github.com/smartcontractkit/chainlink/v2/core/chains/evm/config"
-	logmocks "github.com/smartcontractkit/chainlink/v2/core/chains/evm/log/mocks"
-	evmtypes "github.com/smartcontractkit/chainlink/v2/core/chains/evm/types"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/offchain_aggregator_wrapper"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/offchainaggregator/generated/ocr/offchain_aggregator_wrapper"
+	"github.com/smartcontractkit/chainlink-evm/pkg/client/clienttest"
+	"github.com/smartcontractkit/chainlink-evm/pkg/heads/headstest"
+	evmtypes "github.com/smartcontractkit/chainlink-evm/pkg/types"
+	logmocks "github.com/smartcontractkit/chainlink/v2/common/log/mocks"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
@@ -34,7 +31,7 @@ import (
 	ocrmocks "github.com/smartcontractkit/chainlink/v2/core/services/ocr/mocks"
 )
 
-func mustNewContract(t *testing.T, address gethCommon.Address) *offchain_aggregator_wrapper.OffchainAggregator {
+func mustNewContract(t *testing.T, address common.Address) *offchain_aggregator_wrapper.OffchainAggregator {
 	contract, err := offchain_aggregator_wrapper.NewOffchainAggregator(address, nil)
 	require.NoError(t, err)
 	return contract
@@ -49,19 +46,16 @@ func mustNewFilterer(t *testing.T) *offchainaggregator.OffchainAggregatorFiltere
 type contractTrackerUni struct {
 	db      *ocrmocks.OCRContractTrackerDB
 	lb      *logmocks.Broadcaster
-	hb      *commonmocks.HeadBroadcaster[*evmtypes.Head, common.Hash]
-	ec      *evmclimocks.Client
-	tracker *ocr.OCRContractTracker
+	hb      *headstest.Broadcaster[*evmtypes.Head, common.Hash]
+	ec      *clienttest.Client
+	tracker *ocr.ContractTracker
 }
 
-func newContractTrackerUni(t *testing.T, opts ...interface{}) (uni contractTrackerUni) {
-	var cfg evmconfig.ChainScopedConfig
+func newContractTrackerUni(t *testing.T, opts ...any) (uni contractTrackerUni) {
 	var filterer *offchainaggregator.OffchainAggregatorFilterer
 	var contract *offchain_aggregator_wrapper.OffchainAggregator
 	for _, opt := range opts {
 		switch v := opt.(type) {
-		case evmconfig.ChainScopedConfig:
-			cfg = v
 		case *offchainaggregator.OffchainAggregatorFilterer:
 			filterer = v
 		case *offchain_aggregator_wrapper.OffchainAggregator:
@@ -70,9 +64,8 @@ func newContractTrackerUni(t *testing.T, opts ...interface{}) (uni contractTrack
 			t.Fatalf("unrecognised option type %T", v)
 		}
 	}
-	if cfg == nil {
-		cfg = evmtest.NewChainScopedConfig(t, configtest.NewTestGeneralConfig(t))
-	}
+	gcfg := configtest.NewTestGeneralConfig(t)
+	cfg := evmtest.NewChainScopedConfig(t, gcfg)
 	if filterer == nil {
 		filterer = mustNewFilterer(t)
 	}
@@ -81,8 +74,8 @@ func newContractTrackerUni(t *testing.T, opts ...interface{}) (uni contractTrack
 	}
 	uni.db = ocrmocks.NewOCRContractTrackerDB(t)
 	uni.lb = logmocks.NewBroadcaster(t)
-	uni.hb = commonmocks.NewHeadBroadcaster[*evmtypes.Head, common.Hash](t)
-	uni.ec = evmtest.NewEthClientMock(t)
+	uni.hb = headstest.NewBroadcaster[*evmtypes.Head, common.Hash](t)
+	uni.ec = clienttest.NewClient(t)
 
 	mailMon := servicetest.Run(t, mailboxtest.NewMonitor(t))
 	db := pgtest.NewSqlxDB(t)
@@ -97,7 +90,6 @@ func newContractTrackerUni(t *testing.T, opts ...interface{}) (uni contractTrack
 		db,
 		uni.db,
 		cfg.EVM(),
-		cfg.Database(),
 		uni.hb,
 		mailMon,
 	)
@@ -110,9 +102,9 @@ func Test_OCRContractTracker_LatestBlockHeight(t *testing.T) {
 
 	t.Run("before first head incoming, looks up on-chain", func(t *testing.T) {
 		uni := newContractTrackerUni(t)
-		uni.ec.On("HeadByNumber", mock.AnythingOfType("*context.cancelCtx"), (*big.Int)(nil)).Return(&evmtypes.Head{Number: 42}, nil)
+		uni.ec.On("HeadByNumber", mock.Anything, (*big.Int)(nil)).Return(&evmtypes.Head{Number: 42}, nil)
 
-		l, err := uni.tracker.LatestBlockHeight(testutils.Context(t))
+		l, err := uni.tracker.LatestBlockHeight(t.Context())
 		require.NoError(t, err)
 
 		assert.Equal(t, uint64(42), l)
@@ -120,38 +112,38 @@ func Test_OCRContractTracker_LatestBlockHeight(t *testing.T) {
 
 	t.Run("Before first head incoming, on client error returns error", func(t *testing.T) {
 		uni := newContractTrackerUni(t)
-		uni.ec.On("HeadByNumber", mock.AnythingOfType("*context.cancelCtx"), (*big.Int)(nil)).Return(nil, nil).Once()
+		uni.ec.On("HeadByNumber", mock.Anything, (*big.Int)(nil)).Return(nil, nil).Once()
 
-		_, err := uni.tracker.LatestBlockHeight(testutils.Context(t))
-		assert.EqualError(t, err, "got nil head")
+		_, err := uni.tracker.LatestBlockHeight(t.Context())
+		require.EqualError(t, err, "got nil head")
 
-		uni.ec.On("HeadByNumber", mock.AnythingOfType("*context.cancelCtx"), (*big.Int)(nil)).Return(nil, errors.New("bar")).Once()
+		uni.ec.On("HeadByNumber", mock.Anything, (*big.Int)(nil)).Return(nil, errors.New("bar")).Once()
 
-		_, err = uni.tracker.LatestBlockHeight(testutils.Context(t))
+		_, err = uni.tracker.LatestBlockHeight(t.Context())
 		assert.EqualError(t, err, "bar")
 	})
 
 	t.Run("after first head incoming, uses cached value", func(t *testing.T) {
 		uni := newContractTrackerUni(t)
 
-		uni.tracker.OnNewLongestChain(testutils.Context(t), &evmtypes.Head{Number: 42})
+		uni.tracker.OnNewLongestChain(t.Context(), &evmtypes.Head{Number: 42})
 
-		l, err := uni.tracker.LatestBlockHeight(testutils.Context(t))
+		l, err := uni.tracker.LatestBlockHeight(t.Context())
 		require.NoError(t, err)
 
 		assert.Equal(t, uint64(42), l)
 	})
 
-	t.Run("if headbroadcaster has it, uses the given value on start", func(t *testing.T) {
+	t.Run("if Broadcaster has it, uses the given value on start", func(t *testing.T) {
 		uni := newContractTrackerUni(t)
 
 		uni.hb.On("Subscribe", uni.tracker).Return(&evmtypes.Head{Number: 42}, func() {})
-		uni.db.On("LoadLatestRoundRequested").Return(offchainaggregator.OffchainAggregatorRoundRequested{}, nil)
+		uni.db.On("LoadLatestRoundRequested", mock.Anything).Return(offchainaggregator.OffchainAggregatorRoundRequested{}, nil)
 		uni.lb.On("Register", uni.tracker, mock.Anything).Return(func() {})
 
 		servicetest.Run(t, uni.tracker)
 
-		l, err := uni.tracker.LatestBlockHeight(testutils.Context(t))
+		l, err := uni.tracker.LatestBlockHeight(t.Context())
 		require.NoError(t, err)
 
 		assert.Equal(t, uint64(42), l)
@@ -161,7 +153,7 @@ func Test_OCRContractTracker_LatestBlockHeight(t *testing.T) {
 func Test_OCRContractTracker_HandleLog_OCRContractLatestRoundRequested(t *testing.T) {
 	t.Parallel()
 
-	fixtureLogAddress := gethCommon.HexToAddress("0x03bd0d5d39629423979f8a0e53dbce78c1791ebf")
+	fixtureLogAddress := common.HexToAddress("0x03bd0d5d39629423979f8a0e53dbce78c1791ebf")
 	fixtureFilterer := mustNewFilterer(t)
 	fixtureContract := mustNewContract(t, fixtureLogAddress)
 
@@ -172,18 +164,18 @@ func Test_OCRContractTracker_HandleLog_OCRContractLatestRoundRequested(t *testin
 		rawLog := cltest.LogFromFixture(t, "../../testdata/jsonrpc/round_requested_log_1_1.json")
 		logBroadcast.On("RawLog").Return(rawLog).Maybe()
 		logBroadcast.On("String").Return("").Maybe()
-		uni.lb.On("MarkConsumed", mock.Anything, mock.Anything).Return(nil)
+		uni.lb.On("MarkConsumed", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 		uni.lb.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil)
 
-		configDigest, epoch, round, err := uni.tracker.LatestRoundRequested(testutils.Context(t), 0)
+		configDigest, epoch, round, err := uni.tracker.LatestRoundRequested(t.Context(), 0)
 		require.NoError(t, err)
 		require.Equal(t, ocrtypes.ConfigDigest{}, configDigest)
 		require.Equal(t, 0, int(round))
 		require.Equal(t, 0, int(epoch))
 
-		uni.tracker.HandleLog(logBroadcast)
+		uni.tracker.HandleLog(t.Context(), logBroadcast)
 
-		configDigest, epoch, round, err = uni.tracker.LatestRoundRequested(testutils.Context(t), 0)
+		configDigest, epoch, round, err = uni.tracker.LatestRoundRequested(t.Context(), 0)
 		require.NoError(t, err)
 		require.Equal(t, ocrtypes.ConfigDigest{}, configDigest)
 		require.Equal(t, 0, int(round))
@@ -197,15 +189,15 @@ func Test_OCRContractTracker_HandleLog_OCRContractLatestRoundRequested(t *testin
 
 		uni.lb.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(true, nil)
 
-		configDigest, epoch, round, err := uni.tracker.LatestRoundRequested(testutils.Context(t), 0)
+		configDigest, epoch, round, err := uni.tracker.LatestRoundRequested(t.Context(), 0)
 		require.NoError(t, err)
 		require.Equal(t, ocrtypes.ConfigDigest{}, configDigest)
 		require.Equal(t, 0, int(round))
 		require.Equal(t, 0, int(epoch))
 
-		uni.tracker.HandleLog(logBroadcast)
+		uni.tracker.HandleLog(t.Context(), logBroadcast)
 
-		configDigest, epoch, round, err = uni.tracker.LatestRoundRequested(testutils.Context(t), 0)
+		configDigest, epoch, round, err = uni.tracker.LatestRoundRequested(t.Context(), 0)
 		require.NoError(t, err)
 		require.Equal(t, ocrtypes.ConfigDigest{}, configDigest)
 		require.Equal(t, 0, int(round))
@@ -215,7 +207,7 @@ func Test_OCRContractTracker_HandleLog_OCRContractLatestRoundRequested(t *testin
 	t.Run("for new round requested log", func(t *testing.T) {
 		uni := newContractTrackerUni(t, fixtureFilterer, fixtureContract)
 
-		configDigest, epoch, round, err := uni.tracker.LatestRoundRequested(testutils.Context(t), 0)
+		configDigest, epoch, round, err := uni.tracker.LatestRoundRequested(t.Context(), 0)
 		require.NoError(t, err)
 		require.Equal(t, ocrtypes.ConfigDigest{}, configDigest)
 		require.Equal(t, 0, int(round))
@@ -228,15 +220,16 @@ func Test_OCRContractTracker_HandleLog_OCRContractLatestRoundRequested(t *testin
 		logBroadcast.On("RawLog").Return(rawLog).Maybe()
 		logBroadcast.On("String").Return("").Maybe()
 		uni.lb.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil)
-		uni.lb.On("MarkConsumed", mock.Anything, mock.Anything).Return(nil)
+		uni.lb.On("MarkConsumed", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 		uni.db.On("SaveLatestRoundRequested", mock.Anything, mock.MatchedBy(func(rr offchainaggregator.OffchainAggregatorRoundRequested) bool {
 			return rr.Epoch == 1 && rr.Round == 1
 		})).Return(nil)
+		uni.db.On("WithDataSource", mock.Anything).Return(uni.db)
 
-		uni.tracker.HandleLog(logBroadcast)
+		uni.tracker.HandleLog(t.Context(), logBroadcast)
 
-		configDigest, epoch, round, err = uni.tracker.LatestRoundRequested(testutils.Context(t), 0)
+		configDigest, epoch, round, err = uni.tracker.LatestRoundRequested(t.Context(), 0)
 		require.NoError(t, err)
 		assert.Equal(t, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", configDigest.Hex())
 		assert.Equal(t, 1, int(epoch))
@@ -248,24 +241,24 @@ func Test_OCRContractTracker_HandleLog_OCRContractLatestRoundRequested(t *testin
 		logBroadcast2.On("RawLog").Return(rawLog2)
 		logBroadcast2.On("String").Return("").Maybe()
 		uni.lb.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil)
-		uni.lb.On("MarkConsumed", mock.Anything, mock.Anything).Return(nil)
+		uni.lb.On("MarkConsumed", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 		uni.db.On("SaveLatestRoundRequested", mock.Anything, mock.MatchedBy(func(rr offchainaggregator.OffchainAggregatorRoundRequested) bool {
 			return rr.Epoch == 1 && rr.Round == 9
 		})).Return(nil)
 
-		uni.tracker.HandleLog(logBroadcast2)
+		uni.tracker.HandleLog(t.Context(), logBroadcast2)
 
-		configDigest, epoch, round, err = uni.tracker.LatestRoundRequested(testutils.Context(t), 0)
+		configDigest, epoch, round, err = uni.tracker.LatestRoundRequested(t.Context(), 0)
 		require.NoError(t, err)
 		assert.Equal(t, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", configDigest.Hex())
 		assert.Equal(t, 1, int(epoch))
 		assert.Equal(t, 9, int(round))
 
 		// Same round with lower epoch is ignored
-		uni.tracker.HandleLog(logBroadcast)
+		uni.tracker.HandleLog(t.Context(), logBroadcast)
 
-		configDigest, epoch, round, err = uni.tracker.LatestRoundRequested(testutils.Context(t), 0)
+		configDigest, epoch, round, err = uni.tracker.LatestRoundRequested(t.Context(), 0)
 		require.NoError(t, err)
 		assert.Equal(t, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", configDigest.Hex())
 		assert.Equal(t, 1, int(epoch))
@@ -277,15 +270,15 @@ func Test_OCRContractTracker_HandleLog_OCRContractLatestRoundRequested(t *testin
 		logBroadcast3.On("RawLog").Return(rawLog3).Maybe()
 		logBroadcast3.On("String").Return("").Maybe()
 		uni.lb.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil)
-		uni.lb.On("MarkConsumed", mock.Anything, mock.Anything).Return(nil)
+		uni.lb.On("MarkConsumed", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 		uni.db.On("SaveLatestRoundRequested", mock.Anything, mock.MatchedBy(func(rr offchainaggregator.OffchainAggregatorRoundRequested) bool {
 			return rr.Epoch == 2 && rr.Round == 1
 		})).Return(nil)
 
-		uni.tracker.HandleLog(logBroadcast3)
+		uni.tracker.HandleLog(t.Context(), logBroadcast3)
 
-		configDigest, epoch, round, err = uni.tracker.LatestRoundRequested(testutils.Context(t), 0)
+		configDigest, epoch, round, err = uni.tracker.LatestRoundRequested(t.Context(), 0)
 		require.NoError(t, err)
 		assert.Equal(t, "cccccccccccccccccccccccccccccccc", configDigest.Hex())
 		assert.Equal(t, 2, int(epoch))
@@ -302,10 +295,11 @@ func Test_OCRContractTracker_HandleLog_OCRContractLatestRoundRequested(t *testin
 		uni.lb.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil)
 
 		uni.db.On("SaveLatestRoundRequested", mock.Anything, mock.Anything).Return(errors.New("something exploded"))
+		uni.db.On("WithDataSource", mock.Anything).Return(uni.db)
 
-		uni.tracker.HandleLog(logBroadcast)
+		uni.tracker.HandleLog(t.Context(), logBroadcast)
 
-		configDigest, epoch, round, err := uni.tracker.LatestRoundRequested(testutils.Context(t), 0)
+		configDigest, epoch, round, err := uni.tracker.LatestRoundRequested(t.Context(), 0)
 		require.NoError(t, err)
 		require.Equal(t, ocrtypes.ConfigDigest{}, configDigest)
 		require.Equal(t, 0, int(round))
@@ -328,22 +322,22 @@ func Test_OCRContractTracker_HandleLog_OCRContractLatestRoundRequested(t *testin
 		uni.lb.On("Register", uni.tracker, mock.Anything).Return(func() { eventuallyCloseLogBroadcaster.ItHappened() })
 		uni.lb.On("IsConnected").Return(true).Maybe()
 
-		eventuallyCloseHeadBroadcaster := cltest.NewAwaiter()
-		uni.hb.On("Subscribe", uni.tracker).Return((*evmtypes.Head)(nil), func() { eventuallyCloseHeadBroadcaster.ItHappened() })
+		eventuallyCloseBroadcaster := cltest.NewAwaiter()
+		uni.hb.On("Subscribe", uni.tracker).Return((*evmtypes.Head)(nil), func() { eventuallyCloseBroadcaster.ItHappened() })
 
-		uni.db.On("LoadLatestRoundRequested").Return(rr, nil)
+		uni.db.On("LoadLatestRoundRequested", mock.Anything).Return(rr, nil)
 
-		require.NoError(t, uni.tracker.Start(testutils.Context(t)))
+		require.NoError(t, uni.tracker.Start(t.Context()))
 
-		configDigest, epoch, round, err := uni.tracker.LatestRoundRequested(testutils.Context(t), 0)
+		configDigest, epoch, round, err := uni.tracker.LatestRoundRequested(t.Context(), 0)
 		require.NoError(t, err)
-		assert.Equal(t, (ocrtypes.ConfigDigest)(rr.ConfigDigest).Hex(), configDigest.Hex())
+		assert.Equal(t, ocrtypes.ConfigDigest(rr.ConfigDigest).Hex(), configDigest.Hex())
 		assert.Equal(t, rr.Epoch, epoch)
 		assert.Equal(t, rr.Round, round)
 
 		require.NoError(t, uni.tracker.Close())
 
-		eventuallyCloseHeadBroadcaster.AssertHappened(t, true)
+		eventuallyCloseBroadcaster.AssertHappened(t, true)
 		eventuallyCloseLogBroadcaster.AssertHappened(t, true)
 	})
 }

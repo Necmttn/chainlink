@@ -5,16 +5,17 @@ import (
 	"net/mail"
 	"time"
 
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 	"gopkg.in/guregu/null.v4"
 
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
 )
 
 // User holds the credentials for API user.
 type User struct {
 	Email             string
-	HashedPassword    string
+	HashedPassword    commonconfig.SecretString
 	Role              UserRole
 	CreatedAt         time.Time
 	TokenKey          null.String
@@ -38,7 +39,7 @@ const (
 )
 
 // NewUser creates a new user by hashing the passed plainPwd with bcrypt.
-func NewUser(email string, plainPwd string, role UserRole) (User, error) {
+func NewUser(email, plainPwd string, role UserRole) (User, error) {
 	if err := ValidateEmail(email); err != nil {
 		return User{}, err
 	}
@@ -50,7 +51,7 @@ func NewUser(email string, plainPwd string, role UserRole) (User, error) {
 
 	return User{
 		Email:          email,
-		HashedPassword: pwd,
+		HashedPassword: *commonconfig.NewSecretString(pwd),
 		Role:           role,
 	}, nil
 }
@@ -58,7 +59,7 @@ func NewUser(email string, plainPwd string, role UserRole) (User, error) {
 // ValidateEmail is the single point of logic for user email validations
 func ValidateEmail(email string) error {
 	if len(email) == 0 {
-		return errors.New("Must enter an email")
+		return pkgerrors.New("Must enter an email")
 	}
 	_, err := mail.ParseAddress(email)
 	return err
@@ -67,10 +68,10 @@ func ValidateEmail(email string) error {
 // ValidateAndHashPassword is the single point of logic for user password validations
 func ValidateAndHashPassword(plainPwd string) (string, error) {
 	if err := utils.VerifyPasswordComplexity(plainPwd); err != nil {
-		return "", errors.Wrapf(err, "password insufficiently complex:\n%s", utils.PasswordComplexityRequirements)
+		return "", pkgerrors.Wrapf(err, "password insufficiently complex:\n%s", utils.PasswordComplexityRequirements)
 	}
 	if len(plainPwd) > MaxBcryptPasswordLength {
-		return "", errors.Errorf("must enter a password less than %v characters", MaxBcryptPasswordLength)
+		return "", pkgerrors.Errorf("must enter a password less than %v characters", MaxBcryptPasswordLength)
 	}
 
 	pwd, err := utils.HashPassword(plainPwd)
@@ -104,5 +105,5 @@ func GetUserRole(role string) (UserRole, error) {
 		UserRoleRun,
 		UserRoleView,
 	)
-	return UserRole(""), errors.New(errStr)
+	return UserRole(""), pkgerrors.New(errStr)
 }

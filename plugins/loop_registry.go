@@ -3,15 +3,18 @@ package plugins
 import (
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 
-	"github.com/hashicorp/consul/sdk/freeport"
+	"github.com/smartcontractkit/freeport"
 
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
 	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink-common/pkg/loop"
-
-	"github.com/smartcontractkit/chainlink/v2/core/config"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/cresettings"
+	"github.com/smartcontractkit/chainlink-data-streams/llo/transmitter/dataengine"
+	coreconfig "github.com/smartcontractkit/chainlink/v2/core/config"
 )
 
 var ErrExists = errors.New("plugin already registered")
@@ -27,15 +30,49 @@ type LoopRegistry struct {
 	mu       sync.Mutex
 	registry map[string]*RegisteredLoop
 
-	lggr       logger.Logger
-	cfgTracing config.Tracing
+	lggr                   logger.Logger
+	appID                  string
+	featureLogPoller       bool
+	cfgDatabase            coreconfig.Database
+	cfgMercury             dataengine.Mercury
+	cfgPyroscope           coreconfig.Pyroscope
+	autoPPROF              coreconfig.AutoPprof
+	cfgTracing             coreconfig.Tracing
+	cfgTelemetry           coreconfig.Telemetry
+	cfgApp                 coreconfig.AppConfig
+	cfgMetering            coreconfig.Metering
+	telemetryAuthHeaders   map[string]string
+	telemetryAuthPubKeyHex string
+	cfgLOOPP               coreconfig.LOOPP
 }
 
-func NewLoopRegistry(lggr logger.Logger, tracingConfig config.Tracing) *LoopRegistry {
+func NewLoopRegistry(lggr logger.Logger, appID string, featureLogPoller bool, dbConfig coreconfig.Database,
+	mercury dataengine.Mercury, pyroscope coreconfig.Pyroscope, autoPPROF coreconfig.AutoPprof, tracing coreconfig.Tracing, appConfig coreconfig.AppConfig,
+	metering coreconfig.Metering, telemetryAuthHeaders map[string]string, telemetryAuthPubKeyHex string, looppCfg coreconfig.LOOPP,
+) *LoopRegistry {
 	return &LoopRegistry{
-		registry:   map[string]*RegisteredLoop{},
-		lggr:       logger.Named(lggr, "LoopRegistry"),
-		cfgTracing: tracingConfig,
+		registry:               map[string]*RegisteredLoop{},
+		lggr:                   logger.Named(lggr, "LoopRegistry"),
+		appID:                  appID,
+		featureLogPoller:       featureLogPoller,
+		cfgDatabase:            dbConfig,
+		cfgMercury:             mercury,
+		cfgPyroscope:           pyroscope,
+		autoPPROF:              autoPPROF,
+		cfgTracing:             tracing,
+		cfgTelemetry:           appConfig.Telemetry(),
+		cfgApp:                 appConfig,
+		cfgMetering:            metering,
+		telemetryAuthHeaders:   telemetryAuthHeaders,
+		telemetryAuthPubKeyHex: telemetryAuthPubKeyHex,
+		cfgLOOPP:               looppCfg,
+	}
+}
+
+func NewTestLoopRegistry(lggr logger.Logger) *LoopRegistry {
+	return &LoopRegistry{
+		registry: map[string]*RegisteredLoop{},
+		lggr:     logger.Named(lggr, "LoopRegistry"),
 	}
 }
 
@@ -50,12 +87,56 @@ func (m *LoopRegistry) Register(id string) (*RegisteredLoop, error) {
 	}
 	ports, err := freeport.Take(1)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get free port: %v", err)
+		return nil, fmt.Errorf("failed to get free port: %w", err)
 	}
 	if len(ports) != 1 {
-		return nil, fmt.Errorf("failed to get free port: no ports returned")
+		return nil, errors.New("failed to get free port: no ports returned")
 	}
-	envCfg := loop.EnvConfig{PrometheusPort: ports[0]}
+	envCfg := loop.EnvConfig{
+		AppID:            m.appID,
+		FeatureLogPoller: m.featureLogPoller,
+		PrometheusPort:   ports[0],
+	}
+
+	if m.cfgLOOPP != nil {
+		envCfg.GRPCServerMaxRecvMsgSize = m.cfgLOOPP.GRPCServerMaxRecvMsgSizeBytes()
+	}
+
+	if m.cfgDatabase != nil {
+		dbURL := m.cfgDatabase.URL()
+		envCfg.DatabaseURL = (*commonconfig.SecretURL)(&dbURL)
+		envCfg.DatabaseIdleInTxSessionTimeout = m.cfgDatabase.DefaultIdleInTxSessionTimeout()
+		envCfg.DatabaseLockTimeout = m.cfgDatabase.DefaultLockTimeout()
+		envCfg.DatabaseQueryTimeout = m.cfgDatabase.DefaultQueryTimeout()
+		envCfg.DatabaseListenerFallbackPollInterval = m.cfgDatabase.Listener().FallbackPollInterval()
+		envCfg.DatabaseLogSQL = m.cfgDatabase.LogSQL()
+		envCfg.DatabaseMaxOpenConns = m.cfgDatabase.MaxOpenConns()
+		envCfg.DatabaseMaxIdleConns = m.cfgDatabase.MaxIdleConns()
+	}
+
+	if m.cfgMercury != nil {
+		envCfg.MercuryCacheLatestReportDeadline = m.cfgMercury.Cache().LatestReportDeadline()
+		envCfg.MercuryCacheLatestReportTTL = m.cfgMercury.Cache().LatestReportTTL()
+		envCfg.MercuryCacheMaxStaleAge = m.cfgMercury.Cache().MaxStaleAge()
+		envCfg.MercuryTransmitterProtocol = string(m.cfgMercury.Transmitter().Protocol())
+		envCfg.MercuryTransmitterTransmitQueueMaxSize = m.cfgMercury.Transmitter().TransmitQueueMaxSize()
+		envCfg.MercuryTransmitterTransmitTimeout = m.cfgMercury.Transmitter().TransmitTimeout()
+		envCfg.MercuryTransmitterTransmitConcurrency = m.cfgMercury.Transmitter().TransmitConcurrency()
+		envCfg.MercuryTransmitterReaperFrequency = m.cfgMercury.Transmitter().ReaperFrequency()
+		envCfg.MercuryTransmitterReaperMaxAge = m.cfgMercury.Transmitter().ReaperMaxAge()
+		envCfg.MercuryVerboseLogging = m.cfgMercury.VerboseLogging()
+	}
+
+	if m.cfgPyroscope != nil {
+		envCfg.PyroscopeAuthToken = m.cfgPyroscope.AuthToken()
+		envCfg.PyroscopeServerAddress = m.cfgPyroscope.ServerAddress()
+		envCfg.PyroscopeEnvironment = m.cfgPyroscope.Environment()
+		envCfg.PyroscopeLinkTracesToProfiles = m.cfgPyroscope.LinkTracesToProfiles()
+		if m.autoPPROF != nil {
+			envCfg.PyroscopePPROFBlockProfileRate = m.autoPPROF.BlockProfileRate()
+			envCfg.PyroscopePPROFMutexProfileFraction = m.autoPPROF.MutexProfileFraction()
+		}
+	}
 
 	if m.cfgTracing != nil {
 		envCfg.TracingEnabled = m.cfgTracing.Enabled()
@@ -65,15 +146,93 @@ func (m *LoopRegistry) Register(id string) (*RegisteredLoop, error) {
 		envCfg.TracingAttributes = m.cfgTracing.Attributes()
 	}
 
+	if m.cfgTelemetry != nil {
+		envCfg.TelemetryEnabled = m.cfgTelemetry.Enabled()
+		envCfg.TelemetryEndpoint = m.cfgTelemetry.OtelExporterGRPCEndpoint()
+		envCfg.TelemetryInsecureConnection = m.cfgTelemetry.InsecureConnection()
+		envCfg.TelemetryCACertFile = m.cfgTelemetry.CACertFile()
+		envCfg.TelemetryAttributes = m.cfgApp.ResourceAttributes()
+		envCfg.TelemetryTraceSampleRatio = m.cfgTelemetry.TraceSampleRatio()
+		envCfg.TelemetryEmitterBatchProcessor = m.cfgTelemetry.EmitterBatchProcessor()
+		envCfg.TelemetryEmitterExportTimeout = m.cfgTelemetry.EmitterExportTimeout()
+		envCfg.TelemetryAuthPubKeyHex = m.telemetryAuthPubKeyHex
+		envCfg.ChipIngressEndpoint = m.cfgTelemetry.ChipIngressEndpoint()
+		envCfg.ChipIngressInsecureConnection = m.cfgTelemetry.ChipIngressInsecureConnection()
+		envCfg.ChipIngressBatchEmitterEnabled = m.cfgTelemetry.ChipIngressBatchEmitterEnabled()
+		envCfg.ChipIngressDurableEmitterEnabled = m.cfgTelemetry.DurableEmitterEnabled()
+		envCfg.ChipIngressBufferSize = m.cfgTelemetry.ChipIngressBufferSize()
+		envCfg.ChipIngressMaxBatchSize = m.cfgTelemetry.ChipIngressMaxBatchSize()
+		envCfg.ChipIngressMaxConcurrentSends = m.cfgTelemetry.ChipIngressMaxConcurrentSends()
+		envCfg.ChipIngressSendInterval = m.cfgTelemetry.ChipIngressSendInterval()
+		envCfg.ChipIngressSendTimeout = m.cfgTelemetry.ChipIngressSendTimeout()
+		envCfg.ChipIngressDrainTimeout = m.cfgTelemetry.ChipIngressDrainTimeout()
+		envCfg.ChipIngressMaxGRPCRequestSize = m.cfgTelemetry.ChipIngressMaxGRPCRequestSize()
+		envCfg.TelemetryLogStreamingEnabled = m.cfgTelemetry.LogStreamingEnabled()
+		envCfg.TelemetryLogLevel = m.cfgTelemetry.LogLevel()
+		envCfg.TelemetryLogBatchProcessor = m.cfgTelemetry.LogBatchProcessor()
+		envCfg.TelemetryLogExportTimeout = m.cfgTelemetry.LogExportTimeout()
+		envCfg.TelemetryLogExportMaxBatchSize = m.cfgTelemetry.LogExportMaxBatchSize()
+		envCfg.TelemetryLogExportInterval = m.cfgTelemetry.LogExportInterval()
+		envCfg.TelemetryLogMaxQueueSize = m.cfgTelemetry.LogMaxQueueSize()
+		envCfg.TelemetryMetricViewsDenyAttributes = m.cfgTelemetry.MetricViewsDenyAttributes()
+		limit := m.cfgTelemetry.MetricCardinalityLimit()
+		envCfg.TelemetryMetricCardinalityLimit = &limit
+		envCfg.TelemetryPrometheusBridgeEnabled = m.cfgTelemetry.PrometheusBridge().Enabled()
+		envCfg.TelemetryPrometheusBridgePrefixes = m.cfgTelemetry.PrometheusBridge().Prefixes()
+	}
+
+	// Metering config (emission toggles + deployment/node identity dimensions)
+	// is passed over the env channel to every LOOP plugin, rather than the
+	// standard-capabilities boundary.
+	if m.cfgMetering != nil {
+		envCfg.MeterRecordsEnabled = m.cfgMetering.MeterRecordsEnabled()
+		envCfg.MeterSnapshotsEnabled = m.cfgMetering.MeterSnapshotsEnabled()
+		envCfg.MeterProduct = m.cfgMetering.Product()
+		envCfg.MeterTenant = m.cfgMetering.Tenant()
+		envCfg.MeterNumericTenantID = m.cfgMetering.NumericTenantID()
+		envCfg.MeterEnvironment = m.cfgMetering.Environment()
+		envCfg.MeterZone = m.cfgMetering.Zone()
+		envCfg.MeterNodeID = m.cfgMetering.NodeID()
+	}
+	m.lggr.Debugf("Registered loopp %q with port %d", id, envCfg.PrometheusPort)
+
+	// Add auth header after logging config
+	if m.cfgTelemetry != nil {
+		envCfg.TelemetryAuthHeaders = m.telemetryAuthHeaders
+	}
+
+	if s, ok := os.LookupEnv(cresettings.EnvNameSettings); ok {
+		envCfg.CRESettings = s
+	}
+	if s, ok := os.LookupEnv(cresettings.EnvNameSettingsDefault); ok {
+		envCfg.CRESettingsDefault = s
+	}
+
 	m.registry[id] = &RegisteredLoop{Name: id, EnvCfg: envCfg}
-	m.lggr.Debugf("Registered loopp %q with config %v, port %d", id, envCfg, envCfg.PrometheusPort)
 	return m.registry[id], nil
+}
+
+// Unregister remove a loop from the registry
+// Safe for concurrent use.
+func (m *LoopRegistry) Unregister(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	loop, exists := m.registry[id]
+	if !exists {
+		m.lggr.Debugf("Trying to unregistered a loop that is not registered %q", id)
+		return
+	}
+
+	freeport.Return([]int{loop.EnvCfg.PrometheusPort})
+	delete(m.registry, id)
+	m.lggr.Debugf("Unregistered loopp %q", id)
 }
 
 // Return slice sorted by plugin name. Safe for concurrent use.
 func (m *LoopRegistry) List() []*RegisteredLoop {
-	var registeredLoops []*RegisteredLoop
 	m.mu.Lock()
+	registeredLoops := make([]*RegisteredLoop, 0, len(m.registry))
 	for _, known := range m.registry {
 		registeredLoops = append(registeredLoops, known)
 	}

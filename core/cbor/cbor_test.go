@@ -23,7 +23,7 @@ func Test_ParseCBOR(t *testing.T) {
 	tests := []struct {
 		name        string
 		in          string
-		want        interface{}
+		want        any
 		wantErrored bool
 	}{
 		{
@@ -53,7 +53,7 @@ func Test_ParseCBOR(t *testing.T) {
 		{
 			"with address encoded",
 			`0x6d72656d6f7465436861696e4964186a6e6c69627261727956657273696f6e016f636f6e747261637441646472657373548bd112d3f8f92e41c861939545ad387307af97036d636f6e6669726d6174696f6e730a68626c6f636b4e756d69307831336261626264`,
-			map[string]interface{}{
+			map[string]any{
 				"blockNum":        "0x13babbd",
 				"confirmations":   uint64(10),
 				"contractAddress": address,
@@ -87,8 +87,8 @@ func Test_ParseCBOR(t *testing.T) {
 				// int(28948022309329048855892746252171976963317496166410141009864396001978282409983)
 				"ff" + // primitive(*)
 				"ff", // primitive(*)
-			map[string]interface{}{
-				"bignums": []interface{}{
+			map[string]any{
+				"bignums": []any{
 					testutils.MustParseBigInt(t, "18446744073709551616"),
 					testutils.MustParseBigInt(t, "28948022309329048855892746252171976963317496166410141009864396001978282409984"),
 					testutils.MustParseBigInt(t, "-18446744073709551617"),
@@ -120,8 +120,8 @@ func Test_ParseCBOR(t *testing.T) {
 				"3fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
 				// int(28948022309329048855892746252171976963317496166410141009864396001978282409983)
 				"ff", // primitive(*)
-			map[string]interface{}{
-				"bignums": []interface{}{
+			map[string]any{
+				"bignums": []any{
 					testutils.MustParseBigInt(t, "18446744073709551616"),
 					testutils.MustParseBigInt(t, "28948022309329048855892746252171976963317496166410141009864396001978282409984"),
 					testutils.MustParseBigInt(t, "-18446744073709551617"),
@@ -138,13 +138,13 @@ func Test_ParseCBOR(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			b, err := hexutil.Decode(test.in)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			json, err := ParseDietCBOR(b)
 			if test.wantErrored {
 				assert.Error(t, err)
 			} else {
-				assert.NoError(t, err)
+				require.NoError(t, err)
 				assert.Equal(t, test.want, json)
 			}
 		})
@@ -156,16 +156,16 @@ func Test_ParseCBORToStruct_Success(t *testing.T) {
 
 	hexCBOR := `0xbf6375726c781a68747470733a2f2f657468657270726963652e636f6d2f61706964706174689f66726563656e7463757364ffff000000`
 	bytesCBOR, err := hexutil.Decode(hexCBOR)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	parsed := struct {
-		Url  string   `cbor:"url"`
+		URL  string   `cbor:"url"`
 		Path []string `cbor:"path"`
 	}{}
 	err = ParseDietCBORToStruct(bytesCBOR, &parsed)
 
 	require.NoError(t, err)
-	require.Equal(t, "https://etherprice.com/api", parsed.Url)
+	require.Equal(t, "https://etherprice.com/api", parsed.URL)
 	require.Equal(t, []string{"recent", "usd"}, parsed.Path)
 }
 
@@ -174,11 +174,11 @@ func Test_ParseCBORToStruct_WrongFieldType(t *testing.T) {
 
 	hexCBOR := `0xbf6375726c781a68747470733a2f2f657468657270726963652e636f6d2f61706964706174689f66726563656e7463757364ffff000000`
 	bytesCBOR, err := hexutil.Decode(hexCBOR)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	parsed := struct {
-		Url  string `cbor:"url"`
-		Path []int  `cbor:"path"` // exect int but get string
+		URL  string `cbor:"url"`
+		Path []int  `cbor:"path"` // expect int but get string
 	}{}
 	err = ParseDietCBORToStruct(bytesCBOR, &parsed)
 
@@ -191,7 +191,7 @@ func Test_ParseCBORToStruct_BinaryStringOfWrongType(t *testing.T) {
 	// {"key":"value"} but with last byte replaced with invalid unicode (0x88)
 	hexCBOR := `0x636B65796576616C7588`
 	bytesCBOR, err := hexutil.Decode(hexCBOR)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	parsed := struct {
 		Key string `cbor:"key"`
@@ -257,8 +257,8 @@ func Test_autoAddMapDelimiters(t *testing.T) {
 	}
 }
 
-func jsonMustUnmarshal(t *testing.T, in string) interface{} {
-	var j interface{}
+func jsonMustUnmarshal(t *testing.T, in string) any {
+	var j any
 	err := json.Unmarshal([]byte(in), &j)
 	require.NoError(t, err)
 	return j
@@ -269,33 +269,33 @@ func TestCoerceInterfaceMapToStringMap(t *testing.T) {
 
 	tests := []struct {
 		name  string
-		input interface{}
-		want  interface{}
+		input any
+		want  any
 	}{
-		{"empty map", map[interface{}]interface{}{}, map[string]interface{}{}},
-		{"simple map", map[interface{}]interface{}{"key": "value"}, map[string]interface{}{"key": "value"}},
-		{"int map", map[int]interface{}{1: "value"}, map[int]interface{}{1: "value"}},
+		{"empty map", map[any]any{}, map[string]any{}},
+		{"simple map", map[any]any{"key": "value"}, map[string]any{"key": "value"}},
+		{"int map", map[int]any{1: "value"}, map[int]any{1: "value"}},
 		{
-			"nested string map map",
-			map[string]interface{}{"key": map[interface{}]interface{}{"nk": "nv"}},
-			map[string]interface{}{"key": map[string]interface{}{"nk": "nv"}},
+			"nested string map",
+			map[string]any{"key": map[any]any{"nk": "nv"}},
+			map[string]any{"key": map[string]any{"nk": "nv"}},
 		},
 		{
-			"nested map map",
-			map[interface{}]interface{}{"key": map[interface{}]interface{}{"nk": "nv"}},
-			map[string]interface{}{"key": map[string]interface{}{"nk": "nv"}},
+			"nested map",
+			map[any]any{"key": map[any]any{"nk": "nv"}},
+			map[string]any{"key": map[string]any{"nk": "nv"}},
 		},
 		{
 			"nested map array",
-			map[interface{}]interface{}{"key": []interface{}{1, "value"}},
-			map[string]interface{}{"key": []interface{}{1, "value"}},
+			map[any]any{"key": []any{1, "value"}},
+			map[string]any{"key": []any{1, "value"}},
 		},
-		{"empty array", []interface{}{}, []interface{}{}},
-		{"simple array", []interface{}{1, "value"}, []interface{}{1, "value"}},
+		{"empty array", []any{}, []any{}},
+		{"simple array", []any{1, "value"}, []any{1, "value"}},
 		{
 			"nested array map",
-			[]interface{}{map[interface{}]interface{}{"key": map[interface{}]interface{}{"nk": "nv"}}},
-			[]interface{}{map[string]interface{}{"key": map[string]interface{}{"nk": "nv"}}},
+			[]any{map[any]any{"key": map[any]any{"nk": "nv"}}},
+			[]any{map[string]any{"key": map[string]any{"nk": "nv"}}},
 		},
 	}
 
@@ -313,10 +313,10 @@ func TestCoerceInterfaceMapToStringMap_BadInputs(t *testing.T) {
 
 	tests := []struct {
 		name  string
-		input interface{}
+		input any
 	}{
-		{"error map", map[interface{}]interface{}{1: "value"}},
-		{"error array", []interface{}{map[interface{}]interface{}{1: "value"}}},
+		{"error map", map[any]any{1: "value"}},
+		{"error array", []any{map[any]any{1: "value"}}},
 	}
 
 	for _, test := range tests {
@@ -332,7 +332,7 @@ func TestJSON_CBOR(t *testing.T) {
 
 	tests := []struct {
 		name string
-		in   interface{}
+		in   any
 	}{
 		{"empty object", jsonMustUnmarshal(t, `{}`)},
 		{"array", jsonMustUnmarshal(t, `[1,2,3,4]`)},
@@ -350,7 +350,7 @@ func TestJSON_CBOR(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			encoded := mustMarshal(t, test.in)
 
-			var decoded interface{}
+			var decoded any
 			err := cbor.Unmarshal(encoded, &decoded)
 			require.NoError(t, err)
 
@@ -362,9 +362,9 @@ func TestJSON_CBOR(t *testing.T) {
 }
 
 // mustMarshal returns a bytes array of the JSON map or array encoded to CBOR.
-func mustMarshal(t *testing.T, j interface{}) []byte {
+func mustMarshal(t *testing.T, j any) []byte {
 	switch v := j.(type) {
-	case map[string]interface{}, []interface{}, nil:
+	case map[string]any, []any, nil:
 		b, err := cbor.Marshal(v)
 		if err != nil {
 			t.Fatalf("failed to marshal CBOR: %v", err)

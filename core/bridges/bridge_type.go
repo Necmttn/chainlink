@@ -21,15 +21,16 @@ type BridgeTypeRequest struct {
 	URL                    models.WebURL `json:"url"`
 	Confirmations          uint32        `json:"confirmations"`
 	MinimumContractPayment *assets.Link  `json:"minimumContractPayment"`
+	UseConnectionManager   bool          `json:"useConnectionManager"`
 }
 
 // GetID returns the ID of this structure for jsonapi serialization.
-func (bt BridgeTypeRequest) GetID() string {
+func (bt *BridgeTypeRequest) GetID() string {
 	return bt.Name.String()
 }
 
 // GetName returns the pluralized "type" of this structure for jsonapi serialization.
-func (bt BridgeTypeRequest) GetName() string {
+func (bt *BridgeTypeRequest) GetName() string {
 	return "bridges"
 }
 
@@ -48,26 +49,29 @@ type BridgeTypeAuthentication struct {
 	IncomingToken          string
 	OutgoingToken          string
 	MinimumContractPayment *assets.Link
+	UseConnectionManager   bool `json:"useConnectionManager"`
 }
 
 // BridgeType is used for external adapters and has fields for
 // the name of the adapter and its URL.
 type BridgeType struct {
-	Name                   BridgeName
-	URL                    models.WebURL
-	Confirmations          uint32
-	IncomingTokenHash      string
-	Salt                   string
-	OutgoingToken          string
-	MinimumContractPayment *assets.Link
-	CreatedAt              time.Time
-	UpdatedAt              time.Time
+	Name                   BridgeName    `db:"name"`
+	URL                    models.WebURL `db:"url"`
+	Confirmations          uint32        `db:"confirmations"`
+	IncomingTokenHash      string        `db:"incoming_token_hash"`
+	Salt                   string        `db:"salt"`
+	OutgoingToken          string        `db:"outgoing_token"`
+	MinimumContractPayment *assets.Link  `db:"minimum_contract_payment"`
+	CreatedAt              time.Time     `db:"created_at"`
+	UpdatedAt              time.Time     `db:"updated_at"`
+	UseConnectionManager   bool          `db:"use_connection_manager" json:"useConnectionManager"`
 }
 
 // NewBridgeType returns a bridge type authentication (with plaintext
 // password) and a bridge type (with hashed password, for persisting)
 func NewBridgeType(btr *BridgeTypeRequest) (*BridgeTypeAuthentication,
-	*BridgeType, error) {
+	*BridgeType, error,
+) {
 	incomingToken := utils.NewSecret(24)
 	outgoingToken := utils.NewSecret(24)
 	salt := utils.NewSecret(24)
@@ -78,21 +82,23 @@ func NewBridgeType(btr *BridgeTypeRequest) (*BridgeTypeAuthentication,
 	}
 
 	return &BridgeTypeAuthentication{
-			Name:                   btr.Name,
-			URL:                    btr.URL,
-			Confirmations:          btr.Confirmations,
-			IncomingToken:          incomingToken,
-			OutgoingToken:          outgoingToken,
-			MinimumContractPayment: btr.MinimumContractPayment,
-		}, &BridgeType{
-			Name:                   btr.Name,
-			URL:                    btr.URL,
-			Confirmations:          btr.Confirmations,
-			IncomingTokenHash:      hash,
-			Salt:                   salt,
-			OutgoingToken:          outgoingToken,
-			MinimumContractPayment: btr.MinimumContractPayment,
-		}, nil
+		Name:                   btr.Name,
+		URL:                    btr.URL,
+		Confirmations:          btr.Confirmations,
+		IncomingToken:          incomingToken,
+		OutgoingToken:          outgoingToken,
+		MinimumContractPayment: btr.MinimumContractPayment,
+		UseConnectionManager:   btr.UseConnectionManager,
+	}, &BridgeType{
+		Name:                   btr.Name,
+		URL:                    btr.URL,
+		Confirmations:          btr.Confirmations,
+		IncomingTokenHash:      hash,
+		Salt:                   salt,
+		OutgoingToken:          outgoingToken,
+		MinimumContractPayment: btr.MinimumContractPayment,
+		UseConnectionManager:   btr.UseConnectionManager,
+	}, nil
 }
 
 // AuthenticateBridgeType returns true if the passed token matches its
@@ -127,12 +133,12 @@ type BridgeMetaDataJSON struct {
 	Meta BridgeMetaData
 }
 
-func MarshalBridgeMetaData(latestAnswer *big.Int, updatedAt *big.Int) (map[string]interface{}, error) {
+func MarshalBridgeMetaData(latestAnswer, updatedAt *big.Int) (map[string]any, error) {
 	b, err := json.Marshal(&BridgeMetaData{LatestAnswer: latestAnswer, UpdatedAt: updatedAt})
 	if err != nil {
 		return nil, err
 	}
-	var mp map[string]interface{}
+	var mp map[string]any
 	err = json.Unmarshal(b, &mp)
 	if err != nil {
 		return nil, err
@@ -190,7 +196,7 @@ func (t BridgeName) Value() (driver.Value, error) {
 }
 
 // Scan reads the database value and returns an instance.
-func (t *BridgeName) Scan(value interface{}) error {
+func (t *BridgeName) Scan(value any) error {
 	temp, ok := value.(string)
 	if !ok {
 		return fmt.Errorf("unable to convert %v of %T to BridgeName", value, value)
@@ -198,4 +204,11 @@ func (t *BridgeName) Scan(value interface{}) error {
 
 	*t = BridgeName(temp)
 	return nil
+}
+
+type BridgeResponse struct {
+	DotID      string
+	SpecID     int32
+	Value      []byte
+	FinishedAt time.Time
 }

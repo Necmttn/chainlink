@@ -9,13 +9,12 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestUtils_NewBytes32ID(t *testing.T) {
@@ -35,13 +34,11 @@ func TestUtils_NewSecret(t *testing.T) {
 		{12, 16}, {24, 32}, {48, 64}, {96, 128},
 	}
 	for _, test := range tests {
-		test := test
-
 		t.Run(fmt.Sprintf("%d_%d", test.numOfBytes, test.wantStrLen), func(t *testing.T) {
 			t.Parallel()
 
 			secret := utils.NewSecret(test.numOfBytes)
-			assert.Equal(t, test.wantStrLen, len(secret))
+			assert.Len(t, secret, test.wantStrLen)
 		})
 	}
 }
@@ -59,8 +56,6 @@ func TestUtils_StringToHex(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
-
 		t.Run(test.utf8, func(t *testing.T) {
 			t.Parallel()
 
@@ -74,7 +69,7 @@ func TestUtils_DurationFromNow(t *testing.T) {
 
 	future := time.Now().Add(time.Second)
 	duration := utils.DurationFromNow(future)
-	assert.True(t, 0 < duration)
+	assert.Positive(t, duration)
 }
 
 func TestBoundedQueue(t *testing.T) {
@@ -174,7 +169,7 @@ func Test_WithJitter(t *testing.T) {
 
 	d := 10 * time.Second
 
-	for i := 0; i < 32; i++ {
+	for range 32 {
 		r := utils.WithJitter(d)
 		require.GreaterOrEqual(t, int(r), int(9*time.Second))
 		require.LessOrEqual(t, int(r), int(11*time.Second))
@@ -195,7 +190,7 @@ func TestHashPassword(t *testing.T) {
 	t.Parallel()
 
 	h, err := utils.HashPassword("Qwerty123!")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.NotEmpty(t, h)
 
 	ok := utils.CheckPasswordHash("Qwerty123!", h)
@@ -203,24 +198,6 @@ func TestHashPassword(t *testing.T) {
 
 	ok = utils.CheckPasswordHash("God", h)
 	assert.False(t, ok)
-}
-
-func TestBoxOutput(t *testing.T) {
-	t.Parallel()
-
-	output := utils.BoxOutput("some error %d %s", 123, "foo")
-	const expected = "\n" +
-		"↘↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↙\n" +
-		"→                      ←\n" +
-		"→  README README       ←\n" +
-		"→                      ←\n" +
-		"→  some error 123 foo  ←\n" +
-		"→                      ←\n" +
-		"→  README README       ←\n" +
-		"→                      ←\n" +
-		"↗↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↖\n" +
-		"\n"
-	assert.Equal(t, expected, output)
 }
 
 func TestISO8601UTC(t *testing.T) {
@@ -236,7 +213,7 @@ func TestFormatJSON(t *testing.T) {
 
 	json := `{"foo":123}`
 	formatted, err := utils.FormatJSON(json)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, "\"{\\\"foo\\\":123}\"", string(formatted))
 }
 
@@ -244,7 +221,7 @@ func TestMustUnmarshalToMap(t *testing.T) {
 	t.Parallel()
 
 	json := `{"foo":123.45}`
-	expected := make(map[string]interface{})
+	expected := make(map[string]any)
 	expected["foo"] = 123.45
 	m := utils.MustUnmarshalToMap(json)
 	assert.Equal(t, expected, m)
@@ -262,10 +239,10 @@ func TestSha256(t *testing.T) {
 	t.Parallel()
 
 	hexHash, err := utils.Sha256("test")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	hash, err := hex.DecodeString(hexHash)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Len(t, hash, 32)
 }
 
@@ -284,7 +261,7 @@ func TestWithCloseChan(t *testing.T) {
 		t.Parallel()
 
 		ch := make(chan struct{})
-		ctx, cancel := utils.WithCloseChan(testutils.Context(t), ch)
+		ctx, cancel := utils.WithCloseChan(t.Context(), ch)
 		defer cancel()
 
 		close(ch)
@@ -297,7 +274,7 @@ func TestWithCloseChan(t *testing.T) {
 
 		ch := make(chan struct{})
 		defer close(ch)
-		ctx, cancel := utils.WithCloseChan(testutils.Context(t), ch)
+		ctx, cancel := utils.WithCloseChan(t.Context(), ch)
 		cancel()
 
 		assertCtxCancelled(ctx, t)
@@ -308,7 +285,7 @@ func TestWithCloseChan(t *testing.T) {
 
 		ch := make(chan struct{})
 		defer close(ch)
-		pctx, pcancel := context.WithCancel(testutils.Context(t))
+		pctx, pcancel := context.WithCancel(t.Context())
 		ctx, cancel := utils.WithCloseChan(pctx, ch)
 		defer cancel()
 
@@ -387,42 +364,27 @@ func TestLeftPadBitString(t *testing.T) {
 	}
 }
 
-func TestKeyedMutex(t *testing.T) {
-	t.Parallel()
-
-	var km utils.KeyedMutex
-	unlock1 := km.LockInt64(1)
-	unlock2 := km.LockInt64(2)
-
-	awaiter := cltest.NewAwaiter()
-	go func() {
-		km.LockInt64(1)()
-		km.LockInt64(2)()
-		awaiter.ItHappened()
-	}()
-
-	unlock2()
-	unlock1()
-	awaiter.AwaitOrFail(t)
-}
-
 func TestValidateCronSchedule(t *testing.T) {
 	t.Parallel()
 
 	err := utils.ValidateCronSchedule("")
-	assert.Error(t, err)
+	require.Error(t, err)
 
 	err = utils.ValidateCronSchedule("CRON_TZ=UTC 5 * * * *")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	err = utils.ValidateCronSchedule("@every 1h30m")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	err = utils.ValidateCronSchedule("@every xyz")
 	assert.Error(t, err)
 }
 
 func TestPausableTicker(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
 	t.Parallel()
 
 	var counter atomic.Int32
@@ -431,10 +393,21 @@ func TestPausableTicker(t *testing.T) {
 	assert.Nil(t, pt.Ticks())
 	defer pt.Destroy()
 
+	done := make(chan struct{})
+	defer close(done)
+
 	followNTicks := func(n int32, awaiter cltest.Awaiter) {
-		for range pt.Ticks() {
-			if counter.Add(1) == n {
-				awaiter.ItHappened()
+		for {
+			select {
+			case <-done:
+				return
+			case _, ok := <-pt.Ticks():
+				if !ok {
+					return
+				}
+				if counter.Add(1) == n {
+					awaiter.ItHappened()
+				}
 			}
 		}
 	}
@@ -458,19 +431,32 @@ func TestPausableTicker(t *testing.T) {
 }
 
 func TestCronTicker(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
 	t.Parallel()
 
 	var counter atomic.Int32
 
 	ct, err := utils.NewCronTicker("@every 100ms")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	awaiter := cltest.NewAwaiter()
+	done := make(chan struct{})
 
 	go func() {
-		for range ct.Ticks() {
-			if counter.Add(1) == 2 {
-				awaiter.ItHappened()
+		for {
+			select {
+			case <-done:
+				return
+			case _, ok := <-ct.Ticks():
+				if !ok {
+					return
+				}
+				if counter.Add(1) == 2 {
+					awaiter.ItHappened()
+				}
 			}
 		}
 	}()
@@ -484,6 +470,7 @@ func TestCronTicker(t *testing.T) {
 	awaiter.AwaitOrFail(t)
 
 	assert.True(t, ct.Stop())
+	close(done)
 	c := counter.Load()
 	time.Sleep(1 * time.Second)
 	assert.Equal(t, c, counter.Load())
@@ -503,12 +490,12 @@ func TestErrorBuffer(t *testing.T) {
 		buff.Append(err2)
 		combined := buff.Flush()
 		errs := utils.UnwrapError(combined)
-		assert.Equal(t, 2, len(errs))
+		assert.Len(t, errs, 2)
 		assert.Equal(t, err1.Error(), errs[0].Error())
 		assert.Equal(t, err2.Error(), errs[1].Error())
 	})
 
-	t.Run("ovewrite oldest error when cap exceeded", func(t *testing.T) {
+	t.Run("overwrite oldest error when cap exceeded", func(t *testing.T) {
 		t.Parallel()
 		buff := utils.ErrorBuffer{}
 		buff.SetCap(2)
@@ -517,7 +504,7 @@ func TestErrorBuffer(t *testing.T) {
 		buff.Append(err3)
 		combined := buff.Flush()
 		errs := utils.UnwrapError(combined)
-		assert.Equal(t, 2, len(errs))
+		assert.Len(t, errs, 2)
 		assert.Equal(t, err2.Error(), errs[0].Error())
 		assert.Equal(t, err3.Error(), errs[1].Error())
 	})
@@ -531,14 +518,14 @@ func TestErrorBuffer(t *testing.T) {
 
 		combined := buff.Flush()
 		errs := utils.UnwrapError(combined)
-		assert.Equal(t, 20, len(errs))
+		assert.Len(t, errs, 20)
 		assert.Equal(t, "err#20", errs[19].Error())
 	})
 
 	t.Run("UnwrapError returns the a single element err array if passed err is not a joinedError", func(t *testing.T) {
 		t.Parallel()
 		errs := utils.UnwrapError(err1)
-		assert.Equal(t, 1, len(errs))
+		assert.Len(t, errs, 1)
 		assert.Equal(t, err1.Error(), errs[0].Error())
 	})
 
@@ -547,7 +534,6 @@ func TestErrorBuffer(t *testing.T) {
 		buff := utils.ErrorBuffer{}
 
 		combined := buff.Flush()
-		require.Nil(t, combined)
+		require.NoError(t, combined)
 	})
-
 }

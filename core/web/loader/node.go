@@ -6,7 +6,6 @@ import (
 	"github.com/graph-gophers/dataloader"
 
 	"github.com/smartcontractkit/chainlink-common/pkg/types"
-
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
 	"github.com/smartcontractkit/chainlink/v2/core/services/relay"
 )
@@ -20,10 +19,10 @@ func (b *nodeBatcher) loadByChainIDs(ctx context.Context, keys dataloader.Keys) 
 	keyOrder := make(map[string]int, len(keys))
 	// Collect the keys to search for
 	// note backward compatibility -- this only ever supported evm chains
-	evmrelayIDs := make([]relay.ID, 0, len(keys))
+	evmrelayIDs := make([]types.RelayID, 0, len(keys))
 
 	for ix, key := range keys {
-		rid := relay.ID{Network: relay.EVM, ChainID: key.String()}
+		rid := types.RelayID{Network: relay.NetworkEVM, ChainID: key.String()}
 		evmrelayIDs = append(evmrelayIDs, rid)
 		keyOrder[key.String()] = ix
 	}
@@ -35,7 +34,7 @@ func (b *nodeBatcher) loadByChainIDs(ctx context.Context, keys dataloader.Keys) 
 	// Generate a map of nodes to chainIDs
 	nodesForChain := map[string][]types.NodeStatus{}
 	for _, n := range allNodes {
-		nodesForChain[n.ChainID] = append(nodesForChain[n.ChainID], n)
+		nodesForChain[n.ChainID] = append(nodesForChain[n.ChainID], n.NodeStatus)
 	}
 
 	// Construct the output array of dataloader results

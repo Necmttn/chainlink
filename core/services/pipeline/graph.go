@@ -63,7 +63,7 @@ func (g *Graph) AddImplicitDependenciesAsEdges() {
 		for _, attr := range graphNode.Attributes() {
 			for _, item := range variableRegexp.FindAll([]byte(attr.Value), -1) {
 				expr := strings.TrimSpace(string(item[2 : len(item)-1]))
-				param := strings.Split(expr, ".")[0]
+				param, _, _ := strings.Cut(expr, ".")
 				params[param] = true
 			}
 		}
@@ -145,7 +145,7 @@ func (n *GraphNode) SetAttribute(attr encoding.Attribute) error {
 }
 
 func (n *GraphNode) Attributes() []encoding.Attribute {
-	var r []encoding.Attribute
+	r := make([]encoding.Attribute, 0, len(n.attrs))
 	for k, v := range n.attrs {
 		r = append(r, encoding.Attribute{Key: k, Value: v})
 	}
@@ -214,7 +214,6 @@ func Parse(text string) (*Pipeline, error) {
 	}
 	g := NewGraph()
 	err := g.UnmarshalText([]byte(text))
-
 	if err != nil {
 		return nil, err
 	}
@@ -227,13 +226,14 @@ func Parse(text string) (*Pipeline, error) {
 
 	// toposort all the nodes: dependencies ordered before outputs. This also does cycle checking for us.
 	nodes, err := topo.SortStabilized(g, nil)
-
 	if err != nil {
 		return nil, errors.Wrap(err, "Unable to topologically sort the graph, cycle detected")
 	}
 
 	// we need a temporary mapping of graph.IDs to positional ids after toposort
 	ids := make(map[int64]int)
+
+	resultIdxs := make(map[int32]struct{})
 
 	// use the new ordering as the id so that we can easily reproduce the original toposort
 	for id, node := range nodes {
@@ -249,6 +249,15 @@ func Parse(text string) (*Pipeline, error) {
 		task, err := UnmarshalTaskFromMap(TaskType(node.attrs["type"]), node.attrs, id, node.dotID)
 		if err != nil {
 			return nil, err
+		}
+
+		if task.OutputIndex() > 0 {
+			_, exists := resultIdxs[task.OutputIndex()]
+			if exists {
+				return nil, errors.New("duplicate sorting indexes detected")
+			}
+
+			resultIdxs[task.OutputIndex()] = struct{}{}
 		}
 
 		// re-link the edges

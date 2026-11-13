@@ -8,8 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	"github.com/stretchr/testify/assert"
-
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
+	"github.com/stretchr/testify/require"
 )
 
 func TestTxDBDriver(t *testing.T) {
@@ -20,26 +19,37 @@ func TestTxDBDriver(t *testing.T) {
 	}
 	// clean up, if previous tests failed
 	err := dropTable()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	_, err = db.Exec(`CREATE TABLE txdb_test (id TEXT NOT NULL)`)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	t.Cleanup(func() {
 		_ = dropTable()
 	})
 	_, err = db.Exec(`INSERT INTO txdb_test VALUES ($1)`, uuid.New().String())
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	ensureValuesPresent := func(t *testing.T, db *sqlx.DB) {
 		var ids []string
 		err = db.Select(&ids, `SELECT id from txdb_test`)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Len(t, ids, 1)
 	}
 
 	ensureValuesPresent(t, db)
+	t.Run("session has lock_timeout and idle_in_transaction_session_timeout set", func(t *testing.T) {
+		db2 := NewSqlxDB(t)
+		var lockTimeout string
+		require.NoError(t, db2.Get(&lockTimeout, "SHOW lock_timeout"))
+		require.NotEqual(t, "0", lockTimeout, "lock_timeout should be set to prevent indefinite lock waits between parallel tests")
+
+		var idleTimeout string
+		require.NoError(t, db2.Get(&idleTimeout, "SHOW idle_in_transaction_session_timeout"))
+		require.NotEqual(t, "0", idleTimeout, "idle_in_transaction_session_timeout should be set to prevent abandoned transactions from blocking other tests")
+	})
+
 	t.Run("Cancel of tx's context does not trigger rollback of driver's tx", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(testutils.Context(t))
+		ctx, cancel := context.WithCancel(t.Context())
 		_, err := db.BeginTx(ctx, nil)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		cancel()
 		// BeginTx spawns separate goroutine that rollbacks the tx and tries to close underlying connection, unless
 		// db driver says that connection is still active.

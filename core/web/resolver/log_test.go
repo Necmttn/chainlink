@@ -1,11 +1,12 @@
 package resolver
 
 import (
+	"context"
 	"testing"
 
 	gqlerrors "github.com/graph-gophers/graphql-go/errors"
 	"github.com/pkg/errors"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zapcore"
 
 	"github.com/smartcontractkit/chainlink/v2/core/config"
@@ -24,8 +25,8 @@ func TestResolver_SetSQLLogging(t *testing.T) {
 				}
 			}
 		}`
-	variables := map[string]interface{}{
-		"input": map[string]interface{}{
+	variables := map[string]any{
+		"input": map[string]any{
 			"enabled": true,
 		},
 	}
@@ -35,7 +36,7 @@ func TestResolver_SetSQLLogging(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.Mocks.cfg.On("SetLogSQL", true).Return(nil)
 				f.App.On("GetConfig").Return(f.Mocks.cfg)
 			},
@@ -79,7 +80,7 @@ func TestResolver_SQLLogging(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.Mocks.cfg.On("Database").Return(&databaseConfig{logSQL: false})
 				f.App.On("GetConfig").Return(f.Mocks.cfg)
 			},
@@ -119,14 +120,14 @@ func TestResolver_GlobalLogLevel(t *testing.T) {
 
 	var warnLvl zapcore.Level
 	err := warnLvl.UnmarshalText([]byte("warn"))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	testCases := []GQLTestCase{
 		unauthorizedTestCase(GQLTestCase{query: query}, "globalLogLevel"),
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.Mocks.cfg.On("Log").Return(&log{level: warnLvl})
 				f.App.On("GetConfig").Return(f.Mocks.cfg)
 			},
@@ -163,13 +164,13 @@ func TestResolver_SetGlobalLogLevel(t *testing.T) {
 				}
 			}
 		}`
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"level": LogLevelError,
 	}
 
 	var errorLvl zapcore.Level
 	err := errorLvl.UnmarshalText([]byte("error"))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	gError := errors.New("error")
 
@@ -178,7 +179,7 @@ func TestResolver_SetGlobalLogLevel(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.App.On("SetLogLevel", errorLvl).Return(nil)
 			},
 			query:     mutation,
@@ -195,7 +196,7 @@ func TestResolver_SetGlobalLogLevel(t *testing.T) {
 		{
 			name:          "generic error on SetLogLevel",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.App.On("SetLogLevel", errorLvl).Return(gError)
 			},
 			query:     mutation,
@@ -205,7 +206,7 @@ func TestResolver_SetGlobalLogLevel(t *testing.T) {
 				{
 					Extensions:    nil,
 					ResolverError: gError,
-					Path:          []interface{}{"setGlobalLogLevel"},
+					Path:          []any{"setGlobalLogLevel"},
 					Message:       gError.Error(),
 				},
 			},

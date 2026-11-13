@@ -7,7 +7,7 @@ import (
 	"github.com/pelletier/go-toml"
 	"github.com/pkg/errors"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils"
+	"github.com/smartcontractkit/chainlink-evm/pkg/utils"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 )
 
@@ -41,9 +41,18 @@ func ValidatedSpec(tomlString string) (job.Job, error) {
 	}
 
 	// Required fields
-	if spec.CoordinatorV1Address == nil && spec.CoordinatorV2Address == nil && spec.CoordinatorV2PlusAddress == nil {
+	if spec.CoordinatorV1Address != nil && spec.CoordinatorV1Address.Hex() != EmptyAddress {
 		return jb, errors.New(
-			`at least one of "coordinatorV1Address", "coordinatorV2Address" and "coordinatorV2PlusAddress" must be set`)
+			`coordinatorV1Address is no longer supported; use coordinatorV2PlusAddress`)
+	}
+	if spec.CoordinatorV2Address != nil && spec.CoordinatorV2Address.Hex() != EmptyAddress {
+		return jb, errors.New(
+			`coordinatorV2Address is no longer supported; use coordinatorV2PlusAddress`)
+	}
+	hasV2Plus := spec.CoordinatorV2PlusAddress != nil && spec.CoordinatorV2PlusAddress.Hex() != EmptyAddress
+	if !hasV2Plus {
+		return jb, errors.New(
+			`"coordinatorV2PlusAddress" must be set`)
 	}
 	if spec.BlockhashStoreAddress == "" {
 		return jb, notSet("blockhashStoreAddress")

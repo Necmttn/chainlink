@@ -1,20 +1,28 @@
 package plugins
 
 import (
+	"net/url"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zapcore"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/beholder"
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/types"
+	mercurytransmitter "github.com/smartcontractkit/chainlink-data-streams/llo/transmitter/dataengine"
+	coreconfig "github.com/smartcontractkit/chainlink/v2/core/config"
 )
 
 func TestPluginPortManager(t *testing.T) {
 	// register one
-	m := NewLoopRegistry(logger.TestLogger(t), nil)
+	m := NewTestLoopRegistry(logger.Test(t))
 	pFoo, err := m.Register("foo")
 	require.NoError(t, err)
 	require.Equal(t, "foo", pFoo.Name)
-	require.Greater(t, pFoo.EnvCfg.PrometheusPort, 0)
+	require.Positive(t, pFoo.EnvCfg.PrometheusPort)
 	// test duplicate
 	pNil, err := m.Register("foo")
 	require.ErrorIs(t, err, ErrExists)
@@ -26,37 +34,292 @@ func TestPluginPortManager(t *testing.T) {
 	require.Equal(t, pFoo.EnvCfg.PrometheusPort+1, pBar.EnvCfg.PrometheusPort)
 }
 
-// Mock tracing config
-type MockCfgTracing struct{}
+type mockCfgTracing struct{}
 
-func (m *MockCfgTracing) Attributes() map[string]string {
+func (m *mockCfgTracing) Attributes() map[string]string {
 	return map[string]string{"attribute": "value"}
 }
-func (m *MockCfgTracing) Enabled() bool           { return true }
-func (m *MockCfgTracing) NodeID() string          { return "" }
-func (m *MockCfgTracing) CollectorTarget() string { return "http://localhost:9000" }
-func (m *MockCfgTracing) SamplingRatio() float64  { return 0.1 }
-func (m *MockCfgTracing) TLSCertPath() string     { return "/path/to/cert.pem" }
-func (m *MockCfgTracing) Mode() string            { return "tls" }
+func (m *mockCfgTracing) Enabled() bool           { return true }
+func (m *mockCfgTracing) NodeID() string          { return "" }
+func (m *mockCfgTracing) CollectorTarget() string { return "http://localhost:9000" }
+func (m *mockCfgTracing) SamplingRatio() float64  { return 0.1 }
+func (m *mockCfgTracing) TLSCertPath() string     { return "/path/to/cert.pem" }
+func (m *mockCfgTracing) Mode() string            { return "tls" }
+
+type mockCfgApp struct {
+	coreconfig.AppConfig // nil; only ResourceAttributes is used
+}
+
+func (mockCfgApp) ResourceAttributes() map[string]string {
+	return map[string]string{"foo": "bar"}
+}
+
+type mockCfgTelemetry struct{}
+
+func (m mockCfgTelemetry) DurableEmitterMaxQueuePayloadBytes() int64 { return 1024 * 1024 }
+
+func (m mockCfgTelemetry) DurableEmitterInsertBatchFlushInterval() time.Duration {
+	return 50 * time.Millisecond
+}
+
+func (m mockCfgTelemetry) AuthHeadersTTL() time.Duration { return 10 * time.Minute }
+
+func (m mockCfgTelemetry) Enabled() bool { return true }
+
+func (m mockCfgTelemetry) InsecureConnection() bool { return true }
+
+func (m mockCfgTelemetry) CACertFile() string { return "path/to/cert.pem" }
+
+func (m mockCfgTelemetry) OtelExporterGRPCEndpoint() string { return "http://localhost:9001" }
+
+func (m mockCfgTelemetry) ResourceAttributes() map[string]string {
+	return map[string]string{"foo": "bar"}
+}
+
+func (m mockCfgTelemetry) TraceSampleRatio() float64 { return 0.42 }
+
+func (m mockCfgTelemetry) EmitterBatchProcessor() bool { return true }
+
+func (m mockCfgTelemetry) EmitterExportTimeout() time.Duration { return 1 * time.Second }
+
+func (m mockCfgTelemetry) ChipIngressEndpoint() string { return "example.com/chip-ingress" }
+
+func (m mockCfgTelemetry) DurableEmitterEnabled() bool { return true }
+
+func (m mockCfgTelemetry) DurableEmitterRetransmitBatchSize() int { return 500 }
+
+func (m mockCfgTelemetry) DurableEmitterEventTTL() time.Duration { return time.Hour }
+
+func (m mockCfgTelemetry) ChipIngressInsecureConnection() bool { return false }
+
+func (m mockCfgTelemetry) ChipIngressBatchEmitterEnabled() bool { return false }
+
+func (m mockCfgTelemetry) ChipIngressBufferSize() uint { return 1000 }
+
+func (m mockCfgTelemetry) ChipIngressMaxBatchSize() uint { return 500 }
+
+func (m mockCfgTelemetry) ChipIngressMaxConcurrentSends() int { return 10 }
+
+func (m mockCfgTelemetry) ChipIngressSendInterval() time.Duration { return 100 * time.Millisecond }
+
+func (m mockCfgTelemetry) ChipIngressSendTimeout() time.Duration { return 10 * time.Second }
+
+func (m mockCfgTelemetry) ChipIngressDrainTimeout() time.Duration { return 10 * time.Second }
+
+func (m mockCfgTelemetry) ChipIngressMaxGRPCRequestSize() int { return 10485760 }
+
+func (m mockCfgTelemetry) HeartbeatInterval() time.Duration {
+	return 5 * time.Second
+}
+
+func (m mockCfgTelemetry) LogStreamingEnabled() bool        { return false }
+func (m mockCfgTelemetry) LogLevel() zapcore.Level          { return zapcore.InfoLevel }
+func (m mockCfgTelemetry) LogBatchProcessor() bool          { return false }
+func (m mockCfgTelemetry) LogExportTimeout() time.Duration  { return 2 * time.Second }
+func (m mockCfgTelemetry) LogExportMaxBatchSize() int       { return 512 }
+func (m mockCfgTelemetry) LogExportInterval() time.Duration { return 5 * time.Second }
+func (m mockCfgTelemetry) LogMaxQueueSize() int             { return 2048 }
+
+func (m mockCfgTelemetry) MetricViewsDenyAttributes() []string {
+	return []string{"event_id"}
+}
+func (m mockCfgTelemetry) MetricCardinalityLimit() int { return 100000 }
+
+func (m mockCfgTelemetry) PrometheusBridge() coreconfig.PrometheusBridge {
+	return mockPrometheusBridge{}
+}
+
+type mockCfgMetering struct{}
+
+func (m mockCfgMetering) MeterRecordsEnabled() bool   { return true }
+func (m mockCfgMetering) MeterSnapshotsEnabled() bool { return true }
+func (m mockCfgMetering) Product() string             { return "cre" }
+func (m mockCfgMetering) Tenant() string              { return "mainline" }
+func (m mockCfgMetering) NumericTenantID() string     { return "42" }
+func (m mockCfgMetering) Environment() string         { return "production" }
+func (m mockCfgMetering) Zone() string                { return "wf-zone-a" }
+func (m mockCfgMetering) NodeID() string              { return "clp-cre-wf-zone-a-1" }
+
+type mockPrometheusBridge struct{}
+
+func (m mockPrometheusBridge) Enabled() bool { return true }
+
+func (m mockPrometheusBridge) Prefixes() []string { return nil }
+
+type mockCfgDatabase struct{}
+
+func (m mockCfgDatabase) Backup() coreconfig.Backup { panic("unimplemented") }
+
+func (m mockCfgDatabase) Listener() coreconfig.Listener { return mockCfgListener{} }
+
+func (m mockCfgDatabase) Lock() coreconfig.Lock { panic("unimplemented") }
+
+func (m mockCfgDatabase) DefaultIdleInTxSessionTimeout() time.Duration { return time.Hour }
+
+func (m mockCfgDatabase) DefaultLockTimeout() time.Duration { return time.Minute }
+
+func (m mockCfgDatabase) DefaultQueryTimeout() time.Duration { return time.Second }
+
+func (m mockCfgDatabase) DriverName() string { panic("unimplemented") }
+
+func (m mockCfgDatabase) LogSQL() bool { return true }
+
+func (m mockCfgDatabase) MaxIdleConns() int { return 99 }
+
+func (m mockCfgDatabase) MaxOpenConns() int { return 42 }
+
+func (m mockCfgDatabase) MigrateDatabase() bool { panic("unimplemented") }
+
+func (m mockCfgDatabase) URL() url.URL {
+	return url.URL{Scheme: "fake", Host: "database.url"}
+}
+
+type mockCfgListener struct{}
+
+func (l mockCfgListener) MaxReconnectDuration() time.Duration { panic("unimplemented") }
+
+func (l mockCfgListener) MinReconnectInterval() time.Duration { panic("unimplemented") }
+
+func (l mockCfgListener) FallbackPollInterval() time.Duration { return time.Microsecond }
+
+type mockCfgMercury struct{}
+
+func (m mockCfgMercury) Credentials(credName string) *types.MercuryCredentials { panic("implement me") }
+
+func (m mockCfgMercury) Cache() mercurytransmitter.MercuryCache {
+	return mockCfgCache{}
+}
+
+func (m mockCfgMercury) TLS() mercurytransmitter.MercuryTLS { panic("implement me") }
+
+func (m mockCfgMercury) Transmitter() mercurytransmitter.MercuryTransmitter {
+	return mockCfgTransmitter{}
+}
+
+func (m mockCfgMercury) VerboseLogging() bool {
+	return true
+}
+
+type mockCfgCache struct{}
+
+func (m mockCfgCache) LatestReportTTL() time.Duration {
+	return time.Microsecond
+}
+
+func (m mockCfgCache) MaxStaleAge() time.Duration {
+	return time.Nanosecond
+}
+
+func (m mockCfgCache) LatestReportDeadline() time.Duration {
+	return time.Millisecond
+}
+
+type mockCfgTransmitter struct{}
+
+func (t mockCfgTransmitter) Protocol() mercurytransmitter.MercuryTransmitterProtocol { return "foo" }
+
+func (t mockCfgTransmitter) TransmitQueueMaxSize() uint32 { return 42 }
+
+func (t mockCfgTransmitter) TransmitTimeout() time.Duration { return time.Second }
+
+func (t mockCfgTransmitter) TransmitConcurrency() uint32 { return 13 }
+
+func (t mockCfgTransmitter) ReaperFrequency() time.Duration { return time.Hour }
+
+func (t mockCfgTransmitter) ReaperMaxAge() time.Duration { return time.Minute }
 
 func TestLoopRegistry_Register(t *testing.T) {
-	mockCfgTracing := &MockCfgTracing{}
+	mockCfgDatabase := &mockCfgDatabase{}
+	mockCfgMercury := &mockCfgMercury{}
+	mockCfgTracing := &mockCfgTracing{}
+	mockCfgTelemetry := &mockCfgTelemetry{}
+	mockCfgMetering := &mockCfgMetering{}
 	registry := make(map[string]*RegisteredLoop)
 
 	// Create a LoopRegistry instance with mockCfgTracing
 	loopRegistry := &LoopRegistry{
-		lggr:       logger.TestLogger(t),
-		registry:   registry,
-		cfgTracing: mockCfgTracing,
+		registry:         registry,
+		lggr:             logger.Test(t),
+		appID:            "app-id",
+		featureLogPoller: true,
+		cfgDatabase:      mockCfgDatabase,
+		cfgMercury:       mockCfgMercury,
+		cfgTracing:       mockCfgTracing,
+		cfgTelemetry:     mockCfgTelemetry,
+		cfgApp:           mockCfgApp{},
+		cfgMetering:      mockCfgMetering,
 	}
 
 	// Test case 1: Register new loop
 	registeredLoop, err := loopRegistry.Register("testID")
-	require.Nil(t, err)
+	require.NoError(t, err)
 	require.Equal(t, "testID", registeredLoop.Name)
-	require.True(t, registeredLoop.EnvCfg.TracingEnabled)
-	require.Equal(t, "http://localhost:9000", registeredLoop.EnvCfg.TracingCollectorTarget)
-	require.Equal(t, map[string]string{"attribute": "value"}, registeredLoop.EnvCfg.TracingAttributes)
-	require.Equal(t, 0.1, registeredLoop.EnvCfg.TracingSamplingRatio)
-	require.Equal(t, "/path/to/cert.pem", registeredLoop.EnvCfg.TracingTLSCertPath)
+
+	envCfg := registeredLoop.EnvCfg
+
+	require.Equal(t, "app-id", envCfg.AppID)
+	require.Equal(t, (*commonconfig.SecretURL)(&url.URL{Scheme: "fake", Host: "database.url"}), envCfg.DatabaseURL)
+	require.Equal(t, time.Hour, envCfg.DatabaseIdleInTxSessionTimeout)
+	require.Equal(t, time.Minute, envCfg.DatabaseLockTimeout)
+	require.Equal(t, time.Second, envCfg.DatabaseQueryTimeout)
+	require.Equal(t, time.Microsecond, envCfg.DatabaseListenerFallbackPollInterval)
+	require.True(t, envCfg.DatabaseLogSQL)
+	require.Equal(t, 42, envCfg.DatabaseMaxOpenConns)
+	require.Equal(t, 99, envCfg.DatabaseMaxIdleConns)
+
+	require.True(t, envCfg.FeatureLogPoller)
+
+	require.Equal(t, time.Millisecond, envCfg.MercuryCacheLatestReportDeadline)
+	require.Equal(t, time.Microsecond, envCfg.MercuryCacheLatestReportTTL)
+	require.Equal(t, time.Nanosecond, envCfg.MercuryCacheMaxStaleAge)
+	require.Equal(t, "foo", envCfg.MercuryTransmitterProtocol)
+	require.Equal(t, uint32(42), envCfg.MercuryTransmitterTransmitQueueMaxSize)
+	require.Equal(t, time.Second, envCfg.MercuryTransmitterTransmitTimeout)
+	require.Equal(t, uint32(13), envCfg.MercuryTransmitterTransmitConcurrency)
+	require.Equal(t, time.Hour, envCfg.MercuryTransmitterReaperFrequency)
+	require.Equal(t, time.Minute, envCfg.MercuryTransmitterReaperMaxAge)
+	require.True(t, envCfg.MercuryVerboseLogging)
+
+	require.True(t, envCfg.TracingEnabled)
+	require.Equal(t, "http://localhost:9000", envCfg.TracingCollectorTarget)
+	require.Equal(t, map[string]string{"attribute": "value"}, envCfg.TracingAttributes)
+	require.InEpsilon(t, 0.1, envCfg.TracingSamplingRatio, 1e-9)
+	require.Equal(t, "/path/to/cert.pem", envCfg.TracingTLSCertPath)
+
+	require.True(t, envCfg.TelemetryEnabled)
+	require.True(t, envCfg.TelemetryInsecureConnection)
+	require.Equal(t, "path/to/cert.pem", envCfg.TelemetryCACertFile)
+	require.Equal(t, "http://localhost:9001", envCfg.TelemetryEndpoint)
+	require.Equal(t, beholder.OtelAttributes{"foo": "bar"}, envCfg.TelemetryAttributes)
+	require.InEpsilon(t, 0.42, envCfg.TelemetryTraceSampleRatio, 1e-9)
+	require.True(t, envCfg.TelemetryEmitterBatchProcessor)
+	require.Equal(t, 1*time.Second, envCfg.TelemetryEmitterExportTimeout)
+	require.False(t, envCfg.TelemetryLogStreamingEnabled)
+	require.Equal(t, zapcore.InfoLevel, envCfg.TelemetryLogLevel)
+	require.False(t, envCfg.TelemetryLogBatchProcessor)
+	require.Equal(t, 2*time.Second, envCfg.TelemetryLogExportTimeout)
+	require.Equal(t, 512, envCfg.TelemetryLogExportMaxBatchSize)
+	require.Equal(t, 5*time.Second, envCfg.TelemetryLogExportInterval)
+	require.Equal(t, 2048, envCfg.TelemetryLogMaxQueueSize)
+	require.True(t, envCfg.MeterRecordsEnabled)
+	require.True(t, envCfg.MeterSnapshotsEnabled)
+	require.Equal(t, "cre", envCfg.MeterProduct)
+	require.Equal(t, "mainline", envCfg.MeterTenant)
+	require.Equal(t, "42", envCfg.MeterNumericTenantID)
+	require.Equal(t, "production", envCfg.MeterEnvironment)
+	require.Equal(t, "wf-zone-a", envCfg.MeterZone)
+	require.Equal(t, "clp-cre-wf-zone-a-1", envCfg.MeterNodeID)
+	require.Equal(t, []string{"event_id"}, envCfg.TelemetryMetricViewsDenyAttributes)
+	require.NotNil(t, envCfg.TelemetryMetricCardinalityLimit)
+	require.Equal(t, 100000, *envCfg.TelemetryMetricCardinalityLimit)
+
+	require.Equal(t, "example.com/chip-ingress", envCfg.ChipIngressEndpoint)
+	require.False(t, envCfg.ChipIngressBatchEmitterEnabled)
+	require.Equal(t, uint(1000), envCfg.ChipIngressBufferSize)
+	require.Equal(t, uint(500), envCfg.ChipIngressMaxBatchSize)
+	require.Equal(t, 10, envCfg.ChipIngressMaxConcurrentSends)
+	require.Equal(t, 100*time.Millisecond, envCfg.ChipIngressSendInterval)
+	require.Equal(t, 10*time.Second, envCfg.ChipIngressSendTimeout)
+	require.Equal(t, 10*time.Second, envCfg.ChipIngressDrainTimeout)
+	require.Equal(t, 10485760, envCfg.ChipIngressMaxGRPCRequestSize)
 }

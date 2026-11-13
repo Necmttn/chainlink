@@ -3,27 +3,29 @@ package pipeline
 import (
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"strconv"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
 	"github.com/shopspring/decimal"
-	"go.uber.org/multierr"
 	"gopkg.in/guregu/null.v4"
 
-	"github.com/smartcontractkit/chainlink/v2/core/store/models"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-common/pkg/utils/jsonserializable"
 )
 
 type Spec struct {
-	ID                int32
-	DotDagSource      string          `json:"dotDagSource"`
-	CreatedAt         time.Time       `json:"-"`
-	MaxTaskDuration   models.Interval `json:"-"`
-	GasLimit          *uint32         `json:"-"`
-	ForwardingAllowed bool            `json:"-"`
+	ID int32
+	// DotDagSource is the pipeline graph in DOT notation. Bridge tasks may set
+	// checkRequired=true on a node to validate required JSON paths for cache fallback.
+	DotDagSource      string           `json:"dotDagSource"`
+	CreatedAt         time.Time        `json:"-"`
+	MaxTaskDuration   sqlutil.Interval `json:"-"`
+	GasLimit          *uint32          `json:"-"`
+	ForwardingAllowed bool             `json:"-"`
 
 	JobID   int32  `json:"-"`
 	JobName string `json:"-"`
@@ -44,30 +46,32 @@ func (s *Spec) ParsePipeline() (*Pipeline, error) {
 }
 
 type Run struct {
-	ID             int64            `json:"-"`
-	PipelineSpecID int32            `json:"-"`
-	PipelineSpec   Spec             `json:"pipelineSpec"`
-	Meta           JSONSerializable `json:"meta"`
+	ID             int64                             `json:"-"`
+	JobID          int32                             `json:"-"`
+	PipelineSpecID int32                             `json:"-"`
+	PruningKey     int32                             `json:"-"` // This currently refers to the upstream job ID
+	PipelineSpec   Spec                              `json:"pipelineSpec"`
+	Meta           jsonserializable.JSONSerializable `json:"meta"`
 	// The errors are only ever strings
 	// DB example: [null, null, "my error"]
-	AllErrors   RunErrors        `json:"all_errors"`
-	FatalErrors RunErrors        `json:"fatal_errors"`
-	Inputs      JSONSerializable `json:"inputs"`
+	AllErrors   RunErrors                         `json:"all_errors"`
+	FatalErrors RunErrors                         `json:"fatal_errors"`
+	Inputs      jsonserializable.JSONSerializable `json:"inputs"`
 	// Its expected that Output.Val is of type []interface{}.
 	// DB example: [1234, {"a": 10}, null]
-	Outputs          JSONSerializable `json:"outputs"`
-	CreatedAt        time.Time        `json:"createdAt"`
-	FinishedAt       null.Time        `json:"finishedAt"`
-	PipelineTaskRuns []TaskRun        `json:"taskRuns"`
-	State            RunStatus        `json:"state"`
+	Outputs          jsonserializable.JSONSerializable `json:"outputs"`
+	CreatedAt        time.Time                         `json:"createdAt"`
+	FinishedAt       null.Time                         `json:"finishedAt"`
+	PipelineTaskRuns []TaskRun                         `json:"taskRuns"`
+	State            RunStatus                         `json:"state"`
 
 	Pending bool
 	// FailSilently is used to signal that a task with the failEarly flag has failed, and we want to not put this in the db
 	FailSilently bool
 }
 
-func (r Run) GetID() string {
-	return fmt.Sprintf("%v", r.ID)
+func (r *Run) GetID() string {
+	return strconv.FormatInt(r.ID, 10)
 }
 
 func (r *Run) SetID(value string) error {
@@ -79,7 +83,7 @@ func (r *Run) SetID(value string) error {
 	return nil
 }
 
-func (r Run) HasFatalErrors() bool {
+func (r *Run) HasFatalErrors() bool {
 	for _, err := range r.FatalErrors {
 		if !err.IsZero() {
 			return true
@@ -88,7 +92,7 @@ func (r Run) HasFatalErrors() bool {
 	return false
 }
 
-func (r Run) HasErrors() bool {
+func (r *Run) HasErrors() bool {
 	for _, err := range r.AllErrors {
 		if !err.IsZero() {
 			return true
@@ -122,7 +126,7 @@ func (r *Run) StringOutputs() ([]*string, error) {
 	var outputs []*string
 	// Note for async jobs, Outputs can be nil/invalid
 	if r.Outputs.Valid {
-		outs, ok := r.Outputs.Val.([]interface{})
+		outs, ok := r.Outputs.Val.([]any)
 		if !ok {
 			return nil, fmt.Errorf("unable to process output type %T", r.Outputs.Val)
 		}
@@ -133,7 +137,7 @@ func (r *Run) StringOutputs() ([]*string, error) {
 				case string:
 					s := v
 					outputs = append(outputs, &s)
-				case map[string]interface{}:
+				case map[string]any:
 					b, _ := json.Marshal(v)
 					bs := string(b)
 					outputs = append(outputs, &bs)
@@ -199,13 +203,18 @@ func (r *Run) StringAllErrors() []*string {
 
 type RunErrors []null.String
 
-func (re *RunErrors) Scan(value interface{}) error {
+func (re *RunErrors) Scan(value any) error {
 	if value == nil {
+		*re = nil
 		return nil
 	}
 	bytes, ok := value.([]byte)
 	if !ok {
-		return errors.Errorf("RunErrors#Scan received a value of type %T", value)
+		return fmt.Errorf("RunErrors#Scan received unsupported value %v of type %T", value, value)
+	}
+	if len(bytes) == 0 {
+		*re = nil
+		return nil
 	}
 	return json.Unmarshal(bytes, re)
 }
@@ -226,8 +235,6 @@ func (re RunErrors) HasError() bool {
 	return false
 }
 
-// ToError coalesces all non-nil errors into a single error object.
-// This is useful for logging.
 func (re RunErrors) ToError() error {
 	toErr := func(ns null.String) error {
 		if !ns.IsZero() {
@@ -235,11 +242,11 @@ func (re RunErrors) ToError() error {
 		}
 		return nil
 	}
-	errs := []error{}
+	errs := make([]error, 0, len(re))
 	for _, e := range re {
 		errs = append(errs, toErr(e))
 	}
-	return multierr.Combine(errs...)
+	return errors.Join(errs...)
 }
 
 type ResumeRequest struct {
@@ -261,22 +268,22 @@ func (rr ResumeRequest) ToResult() (Result, error) {
 }
 
 type TaskRun struct {
-	ID            uuid.UUID        `json:"id"`
-	Type          TaskType         `json:"type"`
-	PipelineRun   Run              `json:"-"`
-	PipelineRunID int64            `json:"-"`
-	Output        JSONSerializable `json:"output"`
-	Error         null.String      `json:"error"`
-	CreatedAt     time.Time        `json:"createdAt"`
-	FinishedAt    null.Time        `json:"finishedAt"`
-	Index         int32            `json:"index"`
-	DotID         string           `json:"dotId"`
+	ID            uuid.UUID                         `json:"id"`
+	Type          TaskType                          `json:"type"`
+	PipelineRun   Run                               `json:"-"`
+	PipelineRunID int64                             `json:"-"`
+	Output        jsonserializable.JSONSerializable `json:"output"`
+	Error         null.String                       `json:"error"`
+	CreatedAt     time.Time                         `json:"createdAt"`
+	FinishedAt    null.Time                         `json:"finishedAt"`
+	Index         int32                             `json:"index"`
+	DotID         string                            `json:"dotId"`
 
 	// Used internally for sorting completed results
 	task Task
 }
 
-func (tr TaskRun) GetID() string {
+func (tr *TaskRun) GetID() string {
 	return fmt.Sprintf("%v", tr.ID)
 }
 
@@ -289,11 +296,11 @@ func (tr *TaskRun) SetID(value string) error {
 	return nil
 }
 
-func (tr TaskRun) GetDotID() string {
+func (tr *TaskRun) GetDotID() string {
 	return tr.DotID
 }
 
-func (tr TaskRun) Result() Result {
+func (tr *TaskRun) Result() Result {
 	var result Result
 	if !tr.Error.IsZero() {
 		result.Error = errors.New(tr.Error.ValueOrZero())

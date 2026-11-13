@@ -4,18 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"math/big"
 	"os"
 	"strings"
-
-	"github.com/smartcontractkit/chainlink/core/scripts/common/vrf/constants"
-	"github.com/smartcontractkit/chainlink/core/scripts/common/vrf/jobs"
-	"github.com/smartcontractkit/chainlink/core/scripts/common/vrf/model"
-	"github.com/smartcontractkit/chainlink/core/scripts/common/vrf/util"
-	evmtypes "github.com/smartcontractkit/chainlink/v2/core/chains/evm/types"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/vrf_coordinator_v2plus_interface"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -24,35 +18,45 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/shopspring/decimal"
 
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/vrfkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/vrfkey/secp256k1"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/generated/batch_blockhash_store"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/generated/blockhash_store"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/generated/link_token_interface"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/generated/vrf_coordinator_v2_5"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/generated/vrf_coordinator_v2plus_interface"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/generated/vrf_v2plus_sub_owner"
+	evmclient "github.com/smartcontractkit/chainlink-evm/pkg/client"
+	evmtypes "github.com/smartcontractkit/chainlink-evm/pkg/types"
 	helpers "github.com/smartcontractkit/chainlink/core/scripts/common"
-	evmclient "github.com/smartcontractkit/chainlink/v2/core/chains/evm/client"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/batch_blockhash_store"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/blockhash_store"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/link_token_interface"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/vrf_coordinator_v2_5"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/vrf_v2plus_sub_owner"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/vrfkey"
-	"github.com/smartcontractkit/chainlink/v2/core/services/signatures/secp256k1"
+	"github.com/smartcontractkit/chainlink/core/scripts/common/vrf/constants"
+	"github.com/smartcontractkit/chainlink/core/scripts/common/vrf/jobs"
+	"github.com/smartcontractkit/chainlink/core/scripts/common/vrf/model"
+	"github.com/smartcontractkit/chainlink/core/scripts/common/vrf/util"
 	"github.com/smartcontractkit/chainlink/v2/core/services/vrf/proof"
 )
 
 var coordinatorV2PlusABI = evmtypes.MustGetABI(vrf_coordinator_v2plus_interface.IVRFCoordinatorV2PlusInternalABI)
 
 type CoordinatorConfigV2Plus struct {
-	MinConfs               int
-	MaxGasLimit            int64
-	StalenessSeconds       int64
-	GasAfterPayment        int64
-	FallbackWeiPerUnitLink *big.Int
-	FeeConfig              vrf_coordinator_v2_5.VRFCoordinatorV25FeeConfig
+	MinConfs                          int
+	MaxGasLimit                       int64
+	StalenessSeconds                  int64
+	GasAfterPayment                   int64
+	FallbackWeiPerUnitLink            *big.Int
+	FulfillmentFlatFeeNativePPM       uint32
+	FulfillmentFlatFeeLinkDiscountPPM uint32
+	NativePremiumPercentage           uint8
+	LinkPremiumPercentage             uint8
 }
 
 func SmokeTestVRF(e helpers.Environment) {
 	smokeCmd := flag.NewFlagSet("smoke", flag.ExitOnError)
 
 	// required flags
+	coordinatorType := smokeCmd.String("coordinator-type", "", "Specify which coordinator type to use: layer1, arbitrum, optimism")
 	linkAddress := smokeCmd.String("link-address", "", "address of link token")
-	linkEthAddress := smokeCmd.String("link-eth-feed", "", "address of link eth feed")
+	linkNativeAddress := smokeCmd.String("link-native-feed", "", "address of link native feed")
 	bhsAddressStr := smokeCmd.String("bhs-address", "", "address of blockhash store")
 	batchBHSAddressStr := smokeCmd.String("batch-bhs-address", "", "address of batch blockhash store")
 	coordinatorAddressStr := smokeCmd.String("coordinator-address", "", "address of the vrf coordinator v2 contract")
@@ -66,8 +70,11 @@ func SmokeTestVRF(e helpers.Environment) {
 	maxGasLimit := smokeCmd.Int64("max-gas-limit", 2.5e6, "max gas limit")
 	stalenessSeconds := smokeCmd.Int64("staleness-seconds", 86400, "staleness in seconds")
 	gasAfterPayment := smokeCmd.Int64("gas-after-payment", 33285, "gas after payment calculation")
-	flatFeeLinkPPM := smokeCmd.Int64("flat-fee-link-ppm", 500, "fulfillment flat fee LINK ppm")
-	flatFeeEthPPM := smokeCmd.Int64("flat-fee-eth-ppm", 500, "fulfillment flat fee ETH ppm")
+	flatFeeNativePPM := smokeCmd.Int64("flat-fee-native-ppm", 500, "fulfillment flat fee Native ppm")
+	flatFeeLinkDiscountPPM := smokeCmd.Int64("flat-fee-link-discount-ppm", 100, "fulfillment flat fee discount for LINK payment denominated in native ppm")
+	nativePremiumPercentage := smokeCmd.Int64("native-premium-percentage", 1, "premium percentage for native payment")
+	linkPremiumPercentage := smokeCmd.Int64("link-premium-percentage", 1, "premium percentage for LINK payment")
+	gasLaneMaxGas := smokeCmd.Int64("gas-lane-max-gas", 1e12, "gas lane max gas price")
 
 	helpers.ParseArgs(
 		smokeCmd, os.Args[2:],
@@ -79,7 +86,6 @@ func SmokeTestVRF(e helpers.Environment) {
 	// generate VRF key
 	key, err := vrfkey.NewV2()
 	helpers.PanicErr(err)
-	fmt.Println("vrf private key:", hexutil.Encode(key.Raw()))
 	fmt.Println("vrf public key:", key.PublicKey.String())
 	fmt.Println("vrf key hash:", key.PublicKey.MustHash())
 
@@ -89,10 +95,10 @@ func SmokeTestVRF(e helpers.Environment) {
 		linkAddress = &address
 	}
 
-	if len(*linkEthAddress) == 0 {
-		fmt.Println("\nDeploying LINK/ETH Feed...")
+	if len(*linkNativeAddress) == 0 {
+		fmt.Println("\nDeploying LINK/Native Feed...")
 		address := helpers.DeployLinkEthFeed(e, *linkAddress, fallbackWeiPerUnitLink).String()
-		linkEthAddress = &address
+		linkNativeAddress = &address
 	}
 
 	var bhsContractAddress common.Address
@@ -113,8 +119,8 @@ func SmokeTestVRF(e helpers.Environment) {
 
 	var coordinatorAddress common.Address
 	if len(*coordinatorAddressStr) == 0 {
-		fmt.Println("\nDeploying Coordinator...")
-		coordinatorAddress = DeployCoordinator(e, *linkAddress, bhsContractAddress.String(), *linkEthAddress)
+		fmt.Printf("\nDeploying Coordinator [type=%s]...\n", *coordinatorType)
+		coordinatorAddress = DeployCoordinator(e, *linkAddress, bhsContractAddress.String(), *linkNativeAddress, *coordinatorType)
 	} else {
 		coordinatorAddress = common.HexToAddress(*coordinatorAddressStr)
 	}
@@ -135,15 +141,15 @@ func SmokeTestVRF(e helpers.Environment) {
 		SetCoordinatorConfig(
 			e,
 			*coordinator,
-			uint16(*minConfs),
-			uint32(*maxGasLimit),
-			uint32(*stalenessSeconds),
-			uint32(*gasAfterPayment),
+			uint16(*minConfs),         //nolint:gosec // min confs fits in uint16
+			uint32(*maxGasLimit),      //nolint:gosec // max gas limit fits in uint32
+			uint32(*stalenessSeconds), //nolint:gosec // staleness fits in uint32
+			uint32(*gasAfterPayment),  //nolint:gosec // gas after payment fits in uint32
 			fallbackWeiPerUnitLink,
-			vrf_coordinator_v2_5.VRFCoordinatorV25FeeConfig{
-				FulfillmentFlatFeeLinkPPM:   uint32(*flatFeeLinkPPM),
-				FulfillmentFlatFeeNativePPM: uint32(*flatFeeEthPPM),
-			},
+			uint32(*flatFeeNativePPM),       //nolint:gosec // flat fee fits in uint32
+			uint32(*flatFeeLinkDiscountPPM), //nolint:gosec // flat fee fits in uint32
+			uint8(*nativePremiumPercentage), //nolint:gosec // premium fits in uint8
+			uint8(*linkPremiumPercentage),   //nolint:gosec // premium fits in uint8
 		)
 	}
 
@@ -158,13 +164,12 @@ func SmokeTestVRF(e helpers.Environment) {
 	}
 	pubBytes, err := hex.DecodeString(uncompressed)
 	helpers.PanicErr(err)
-	pk, err := crypto.UnmarshalPubkey(pubBytes)
+	_, err = crypto.UnmarshalPubkey(pubBytes)
 	helpers.PanicErr(err)
-	var pkBytes []byte
-	if big.NewInt(0).Mod(pk.Y, big.NewInt(2)).Uint64() != 0 {
-		pkBytes = append(pk.X.Bytes(), 1)
-	} else {
-		pkBytes = append(pk.X.Bytes(), 0)
+	pkBytes := make([]byte, 33)
+	copy(pkBytes[:32], pubBytes[1:33])
+	if pubBytes[64]&1 != 0 {
+		pkBytes[32] = 1
 	}
 	var newPK secp256k1.PublicKey
 	copy(newPK[:], pkBytes)
@@ -183,7 +188,11 @@ func SmokeTestVRF(e helpers.Environment) {
 		panic(fmt.Sprintf("unexpected compressed public key %s, expected %s", compressedPkHex, key.PublicKey.String()))
 	}
 
-	kh1, err := coordinator.HashOfKey(nil, [2]*big.Int{pk.X, pk.Y})
+	point, err := key.PublicKey.Point()
+	helpers.PanicErr(err)
+	x, y := secp256k1.Coordinates(point)
+
+	kh1, err := coordinator.HashOfKey(nil, [2]*big.Int{x, y})
 	helpers.PanicErr(err)
 	fmt.Println("key hash from coordinator:", hexutil.Encode(kh1[:]))
 	if !bytes.Equal(kh1[:], keyHash[:]) {
@@ -191,12 +200,8 @@ func SmokeTestVRF(e helpers.Environment) {
 	}
 
 	fmt.Println("\nRegistering proving key...")
-	point, err := key.PublicKey.Point()
-	helpers.PanicErr(err)
-	x, y := secp256k1.Coordinates(point)
 	fmt.Println("proving key points x:", x, ", y:", y)
-	fmt.Println("proving key points from unmarshal:", pk.X, pk.Y)
-	tx, err := coordinator.RegisterProvingKey(e.Owner, [2]*big.Int{x, y})
+	tx, err := coordinator.RegisterProvingKey(e.Owner, [2]*big.Int{x, y}, uint64(*gasLaneMaxGas)) //nolint:gosec // gas lane max gas fits in uint64
 	helpers.PanicErr(err)
 	registerReceipt := helpers.ConfirmTXMined(context.Background(), e.Ec, tx, e.ChainID, "register proving key on", coordinatorAddress.String())
 	var provingKeyRegisteredLog *vrf_coordinator_v2_5.VRFCoordinatorV25ProvingKeyRegistered
@@ -218,21 +223,19 @@ func SmokeTestVRF(e helpers.Environment) {
 	fmt.Println("key hash registered:", hexutil.Encode(provingKeyRegisteredLog.KeyHash[:]))
 
 	fmt.Println("\nProving key registered, getting proving key hashes from deployed contract...")
-	_, _, provingKeyHashes, configErr := coordinator.GetRequestConfig(nil)
-	helpers.PanicErr(configErr)
-	fmt.Println("Key hash registered:", hexutil.Encode(provingKeyHashes[len(provingKeyHashes)-1][:]))
+	registeredKeyHash, err := coordinator.SProvingKeyHashes(nil, big.NewInt(0))
+	helpers.PanicErr(err)
+	fmt.Printf("Key hash registered: %x\n", registeredKeyHash)
 	ourKeyHash := key.PublicKey.MustHash()
-	if !bytes.Equal(provingKeyHashes[len(provingKeyHashes)-1][:], ourKeyHash[:]) {
-		panic(fmt.Sprintf("unexpected key hash %s, expected %s", hexutil.Encode(provingKeyHashes[len(provingKeyHashes)-1][:]), hexutil.Encode(ourKeyHash[:])))
+	if !bytes.Equal(registeredKeyHash[:], ourKeyHash[:]) {
+		panic(fmt.Sprintf("unexpected key hash %s, expected %s", hexutil.Encode(registeredKeyHash[:]), hexutil.Encode(ourKeyHash[:])))
 	}
 
 	fmt.Println("\nDeploying consumer...")
 	consumerAddress := EoaDeployConsumer(e, coordinatorAddress.String(), *linkAddress)
 
 	fmt.Println("\nAdding subscription...")
-	EoaCreateSub(e, *coordinator)
-
-	subID := FindSubscriptionID(e, coordinator)
+	subID, err := EoaCreateSub(e, *coordinator)
 	helpers.PanicErr(err)
 
 	fmt.Println("\nAdding consumer to subscription...")
@@ -253,7 +256,7 @@ func SmokeTestVRF(e helpers.Environment) {
 	fmt.Println(
 		"\nDeployment complete.",
 		"\nLINK Token contract address:", *linkAddress,
-		"\nLINK/ETH Feed contract address:", *linkEthAddress,
+		"\nLINK/Native Feed contract address:", *linkNativeAddress,
 		"\nBlockhash Store contract address:", bhsContractAddress,
 		"\nBatch Blockhash Store contract address:", batchBHSAddress,
 		"\nVRF Coordinator Address:", coordinatorAddress,
@@ -303,7 +306,7 @@ func SmokeTestVRF(e helpers.Environment) {
 		PreSeed:          preSeed,
 		BlockHash:        rwrLog.Raw.BlockHash,
 		BlockNum:         rwrLog.Raw.BlockNumber,
-		SubId:            rwrLog.SubId,
+		SubID:            rwrLog.SubId,
 		CallbackGasLimit: rwrLog.CallbackGasLimit,
 		NumWords:         rwrLog.NumWords,
 		Sender:           rwrLog.Sender,
@@ -347,7 +350,7 @@ func SmokeTestVRF(e helpers.Environment) {
 			GasPrice: tx.GasPrice(),
 		}
 		r, err := e.Ec.CallContract(context.Background(), call, receipt.BlockNumber)
-		fmt.Println("call contract", "r", r, "err", err)
+		fmt.Println("call contract", "r", string(r), "err", err)
 		rpcError, err := evmclient.ExtractRPCError(err)
 		fmt.Println("extracting rpc error", rpcError.String(), err)
 		os.Exit(1)
@@ -462,15 +465,48 @@ func sendTx(e helpers.Environment, to common.Address, data []byte) (*types.Recei
 		e.ChainID, "send tx", signedTx.Hash().String(), "to", to.String()), signedTx.Hash()
 }
 
+func sendNativeTokens(e helpers.Environment, to common.Address, amount *big.Int) (*types.Receipt, common.Hash) {
+	nonce, err := e.Ec.PendingNonceAt(context.Background(), e.Owner.From)
+	helpers.PanicErr(err)
+	gasPrice, err := e.Ec.SuggestGasPrice(context.Background())
+	helpers.PanicErr(err)
+	msg := ethereum.CallMsg{
+		From:     e.Owner.From,
+		To:       &to,
+		Value:    amount,
+		Gas:      0,
+		GasPrice: big.NewInt(0),
+		Data:     nil,
+	}
+	gasLimit, err := e.Ec.EstimateGas(context.Background(), msg)
+	helpers.PanicErr(err)
+	rawTx := types.NewTx(&types.LegacyTx{
+		Nonce:    nonce,
+		To:       &to,
+		Data:     nil,
+		Value:    amount,
+		Gas:      gasLimit,
+		GasPrice: gasPrice,
+	})
+	signedTx, err := e.Owner.Signer(e.Owner.From, rawTx)
+	helpers.PanicErr(err)
+	err = e.Ec.SendTransaction(context.Background(), signedTx)
+	helpers.PanicErr(err)
+	return helpers.ConfirmTXMined(context.Background(), e.Ec, signedTx,
+		e.ChainID, "send tx", signedTx.Hash().String(), "to", to.String()), signedTx.Hash()
+}
+
 func DeployUniverseViaCLI(e helpers.Environment) {
 	deployCmd := flag.NewFlagSet("deploy-universe", flag.ExitOnError)
 
 	// required flags
+	nativeOnly := deployCmd.Bool("native-only", false, "if true, link and link feed are not set up")
 	linkAddress := deployCmd.String("link-address", "", "address of link token")
-	linkEthAddress := deployCmd.String("link-eth-feed", "", "address of link eth feed")
+	linkNativeAddress := deployCmd.String("link-native-feed", "", "address of link native feed")
 	bhsContractAddressString := deployCmd.String("bhs-address", "", "address of BHS contract")
 	batchBHSAddressString := deployCmd.String("batch-bhs-address", "", "address of Batch BHS contract")
 	coordinatorAddressString := deployCmd.String("coordinator-address", "", "address of VRF Coordinator contract")
+	coordinatorType := deployCmd.String("coordinator-type", "", "Specify which coordinator type to use: layer1, arbitrum, optimism")
 	batchCoordinatorAddressString := deployCmd.String("batch-coordinator-address", "", "address Batch VRF Coordinator contract")
 	subscriptionBalanceJuelsString := deployCmd.String("subscription-balance", "1e19", "amount to fund subscription with Link token (Juels)")
 	subscriptionBalanceNativeWeiString := deployCmd.String("subscription-balance-native", "1e18", "amount to fund subscription with native token (Wei)")
@@ -480,6 +516,11 @@ func DeployUniverseViaCLI(e helpers.Environment) {
 	estimateGasMultiplier := deployCmd.Float64("estimate-gas-multiplier", 1.1, "")
 	pollPeriod := deployCmd.String("poll-period", "300ms", "")
 	requestTimeout := deployCmd.String("request-timeout", "30m0s", "")
+	bhsJobWaitBlocks := flag.Int("bhs-job-wait-blocks", 30, "")
+	bhsJobLookBackBlocks := flag.Int("bhs-job-look-back-blocks", 200, "")
+	bhsJobPollPeriod := flag.String("bhs-job-poll-period", "3s", "")
+	bhsJobRunTimeout := flag.String("bhs-job-run-timeout", "1m", "")
+	simulationBlock := deployCmd.String("simulation-block", "latest", "simulation block can be 'pending' or 'latest'")
 
 	// optional flags
 	fallbackWeiPerUnitLinkString := deployCmd.String("fallback-wei-per-unit-link", "6e16", "fallback wei/link ratio")
@@ -491,21 +532,42 @@ func DeployUniverseViaCLI(e helpers.Environment) {
 	maxGasLimit := deployCmd.Int64("max-gas-limit", constants.MaxGasLimit, "max gas limit")
 	stalenessSeconds := deployCmd.Int64("staleness-seconds", constants.StalenessSeconds, "staleness in seconds")
 	gasAfterPayment := deployCmd.Int64("gas-after-payment", constants.GasAfterPayment, "gas after payment calculation")
-	flatFeeLinkPPM := deployCmd.Int64("flat-fee-link-ppm", constants.FlatFeeLinkPPM, "fulfillment flat fee LINK ppm")
-	flatFeeEthPPM := deployCmd.Int64("flat-fee-eth-ppm", constants.FlatFeeNativePPM, "fulfillment flat fee ETH ppm")
+	flatFeeNativePPM := deployCmd.Int64("flat-fee-native-ppm", 500, "fulfillment flat fee Native ppm")
+	flatFeeLinkDiscountPPM := deployCmd.Int64("flat-fee-link-discount-ppm", 100, "fulfillment flat fee discount for LINK payment denominated in native ppm")
+	nativePremiumPercentage := deployCmd.Int64("native-premium-percentage", 1, "premium percentage for native payment")
+	linkPremiumPercentage := deployCmd.Int64("link-premium-percentage", 1, "premium percentage for LINK payment")
+	provingKeyMaxGasPriceString := deployCmd.String("proving-key-max-gas-price", "1e12", "gas lane max gas price")
+
+	// only necessary for Optimism coordinator contract
+	optimismL1GasFeeCalculationMode := deployCmd.Uint64("optimism-l1-fee-mode", 0, "Choose Optimism coordinator contract L1 fee calculation mode: 0, 1, 2")
+	optimismL1GasFeeCoefficient := deployCmd.Uint64("optimism-l1-fee-coefficient", 100, "Choose Optimism coordinator contract L1 fee coefficient percentage [1, 100]")
 
 	helpers.ParseArgs(
 		deployCmd, os.Args[2:],
 	)
 
+	if *coordinatorType != "layer1" && *coordinatorType != "arbitrum" && *coordinatorType != "optimism" {
+		panic(fmt.Sprintf("Invalid Coordinator type `%s`. Only `layer1`, `arbitrum` and `optimism` are supported", *coordinatorType))
+	}
+
+	if *nativeOnly {
+		if *linkAddress != "" || *linkNativeAddress != "" {
+			panic("native-only flag is set, but link address or link native address is provided")
+		}
+		if *subscriptionBalanceJuelsString != "0" {
+			panic("native-only flag is set, but link subscription balance is provided")
+		}
+	}
+
+	if *simulationBlock != "pending" && *simulationBlock != "latest" {
+		helpers.PanicErr(errors.New("simulation block must be 'pending' or 'latest'"))
+	}
+
 	fallbackWeiPerUnitLink := decimal.RequireFromString(*fallbackWeiPerUnitLinkString).BigInt()
 	subscriptionBalanceJuels := decimal.RequireFromString(*subscriptionBalanceJuelsString).BigInt()
 	subscriptionBalanceNativeWei := decimal.RequireFromString(*subscriptionBalanceNativeWeiString).BigInt()
-
-	feeConfig := vrf_coordinator_v2_5.VRFCoordinatorV25FeeConfig{
-		FulfillmentFlatFeeLinkPPM:   uint32(*flatFeeLinkPPM),
-		FulfillmentFlatFeeNativePPM: uint32(*flatFeeEthPPM),
-	}
+	fundingAmount := decimal.RequireFromString(*nodeSendingKeyFundingAmount).BigInt()
+	provingKeyMaxGasPrice := decimal.RequireFromString(*provingKeyMaxGasPriceString).BigInt()
 
 	var vrfPrimaryNodeSendingKeys []string
 	if len(*vrfPrimaryNodeSendingKeysString) > 0 {
@@ -514,7 +576,6 @@ func DeployUniverseViaCLI(e helpers.Environment) {
 
 	nodesMap := make(map[string]model.Node)
 
-	fundingAmount := decimal.RequireFromString(*nodeSendingKeyFundingAmount).BigInt()
 	nodesMap[model.VRFPrimaryNodeName] = model.Node{
 		SendingKeys:             util.MapToSendingKeyArr(vrfPrimaryNodeSendingKeys),
 		SendingKeyFundingAmount: fundingAmount,
@@ -527,7 +588,7 @@ func DeployUniverseViaCLI(e helpers.Environment) {
 
 	contractAddresses := model.ContractAddresses{
 		LinkAddress:             *linkAddress,
-		LinkEthAddress:          *linkEthAddress,
+		LinkEthAddress:          *linkNativeAddress,
 		BhsContractAddress:      bhsContractAddress,
 		BatchBHSAddress:         batchBHSAddress,
 		CoordinatorAddress:      coordinatorAddress,
@@ -535,12 +596,15 @@ func DeployUniverseViaCLI(e helpers.Environment) {
 	}
 
 	coordinatorConfig := CoordinatorConfigV2Plus{
-		MinConfs:               *minConfs,
-		MaxGasLimit:            *maxGasLimit,
-		StalenessSeconds:       *stalenessSeconds,
-		GasAfterPayment:        *gasAfterPayment,
-		FallbackWeiPerUnitLink: fallbackWeiPerUnitLink,
-		FeeConfig:              feeConfig,
+		MinConfs:                          *minConfs,
+		MaxGasLimit:                       *maxGasLimit,
+		StalenessSeconds:                  *stalenessSeconds,
+		GasAfterPayment:                   *gasAfterPayment,
+		FallbackWeiPerUnitLink:            fallbackWeiPerUnitLink,
+		FulfillmentFlatFeeNativePPM:       uint32(*flatFeeNativePPM),       //nolint:gosec // fee fits in uint32
+		FulfillmentFlatFeeLinkDiscountPPM: uint32(*flatFeeLinkDiscountPPM), //nolint:gosec // fee fits in uint32
+		NativePremiumPercentage:           uint8(*nativePremiumPercentage), //nolint:gosec // percentage fits in uint8
+		LinkPremiumPercentage:             uint8(*linkPremiumPercentage),   //nolint:gosec // percentage fits in uint8
 	}
 
 	vrfKeyRegistrationConfig := model.VRFKeyRegistrationConfig{
@@ -555,6 +619,13 @@ func DeployUniverseViaCLI(e helpers.Environment) {
 		RequestTimeout:                *requestTimeout,
 	}
 
+	bhsJobSpecConfig := model.BHSJobSpecConfig{
+		RunTimeout:     *bhsJobRunTimeout,
+		WaitBlocks:     *bhsJobWaitBlocks,
+		LookBackBlocks: *bhsJobLookBackBlocks,
+		PollPeriod:     *bhsJobPollPeriod,
+	}
+
 	VRFV2PlusDeployUniverse(
 		e,
 		subscriptionBalanceJuels,
@@ -562,8 +633,15 @@ func DeployUniverseViaCLI(e helpers.Environment) {
 		vrfKeyRegistrationConfig,
 		contractAddresses,
 		coordinatorConfig,
+		*nativeOnly,
 		nodesMap,
+		provingKeyMaxGasPrice.Uint64(),
 		coordinatorJobSpecConfig,
+		bhsJobSpecConfig,
+		*simulationBlock,
+		*coordinatorType,
+		uint8(*optimismL1GasFeeCalculationMode), //nolint:gosec // mode fits in uint8
+		uint8(*optimismL1GasFeeCoefficient),     //nolint:gosec // coefficient fits in uint8
 	)
 
 	vrfPrimaryNode := nodesMap[model.VRFPrimaryNodeName]
@@ -579,8 +657,15 @@ func VRFV2PlusDeployUniverse(e helpers.Environment,
 	vrfKeyRegistrationConfig model.VRFKeyRegistrationConfig,
 	contractAddresses model.ContractAddresses,
 	coordinatorConfig CoordinatorConfigV2Plus,
+	nativeOnly bool,
 	nodesMap map[string]model.Node,
+	provingKeyMaxGasPrice uint64,
 	coordinatorJobSpecConfig model.CoordinatorJobSpecConfig,
+	bhsJobSpecConfig model.BHSJobSpecConfig,
+	simulationBlock string,
+	coordinatorType string,
+	optimismL1FeeMode uint8,
+	optimismL1FeeCoefficient uint8,
 ) model.JobSpecs {
 	var compressedPkHex string
 	var keyHash common.Hash
@@ -593,13 +678,12 @@ func VRFV2PlusDeployUniverse(e helpers.Environment,
 		// Generate compressed public key and key hash
 		pubBytes, err := hex.DecodeString(vrfKeyRegistrationConfig.VRFKeyUncompressedPubKey)
 		helpers.PanicErr(err)
-		pk, err := crypto.UnmarshalPubkey(pubBytes)
+		_, err = crypto.UnmarshalPubkey(pubBytes)
 		helpers.PanicErr(err)
-		var pkBytes []byte
-		if big.NewInt(0).Mod(pk.Y, big.NewInt(2)).Uint64() != 0 {
-			pkBytes = append(pk.X.Bytes(), 1)
-		} else {
-			pkBytes = append(pk.X.Bytes(), 0)
+		pkBytes := make([]byte, 33)
+		copy(pkBytes[:32], pubBytes[1:33])
+		if pubBytes[64]&1 != 0 {
+			pkBytes[32] = 1
 		}
 		var newPK secp256k1.PublicKey
 		copy(newPK[:], pkBytes)
@@ -609,13 +693,13 @@ func VRFV2PlusDeployUniverse(e helpers.Environment,
 		helpers.PanicErr(err)
 	}
 
-	if len(contractAddresses.LinkAddress) == 0 {
+	if !nativeOnly && len(contractAddresses.LinkAddress) == 0 {
 		fmt.Println("\nDeploying LINK Token...")
 		contractAddresses.LinkAddress = helpers.DeployLinkToken(e).String()
 	}
 
-	if len(contractAddresses.LinkEthAddress) == 0 {
-		fmt.Println("\nDeploying LINK/ETH Feed...")
+	if !nativeOnly && len(contractAddresses.LinkEthAddress) == 0 {
+		fmt.Println("\nDeploying LINK/Native Feed...")
 		contractAddresses.LinkEthAddress = helpers.DeployLinkEthFeed(e, contractAddresses.LinkAddress, coordinatorConfig.FallbackWeiPerUnitLink).String()
 	}
 
@@ -630,8 +714,8 @@ func VRFV2PlusDeployUniverse(e helpers.Environment,
 	}
 
 	if contractAddresses.CoordinatorAddress.String() == "0x0000000000000000000000000000000000000000" {
-		fmt.Println("\nDeploying Coordinator...")
-		contractAddresses.CoordinatorAddress = DeployCoordinator(e, contractAddresses.LinkAddress, contractAddresses.BhsContractAddress.String(), contractAddresses.LinkEthAddress)
+		fmt.Printf("\nDeploying Coordinator [type=%s]...\n", coordinatorType)
+		contractAddresses.CoordinatorAddress = DeployCoordinator(e, contractAddresses.LinkAddress, contractAddresses.BhsContractAddress.String(), contractAddresses.LinkEthAddress, coordinatorType)
 	}
 
 	coordinator, err := vrf_coordinator_v2_5.NewVRFCoordinatorV25(contractAddresses.CoordinatorAddress, e.Ec)
@@ -646,13 +730,21 @@ func VRFV2PlusDeployUniverse(e helpers.Environment,
 	SetCoordinatorConfig(
 		e,
 		*coordinator,
-		uint16(coordinatorConfig.MinConfs),
-		uint32(coordinatorConfig.MaxGasLimit),
-		uint32(coordinatorConfig.StalenessSeconds),
-		uint32(coordinatorConfig.GasAfterPayment),
+		uint16(coordinatorConfig.MinConfs),    //nolint:gosec // min confs fits in uint16
+		uint32(coordinatorConfig.MaxGasLimit), //nolint:gosec // max gas limit fits in uint32
+		uint32(coordinatorConfig.StalenessSeconds), //nolint:gosec // staleness fits in uint32
+		uint32(coordinatorConfig.GasAfterPayment),  //nolint:gosec // gas after payment fits in uint32
 		coordinatorConfig.FallbackWeiPerUnitLink,
-		coordinatorConfig.FeeConfig,
+		coordinatorConfig.FulfillmentFlatFeeNativePPM,
+		coordinatorConfig.FulfillmentFlatFeeLinkDiscountPPM,
+		coordinatorConfig.NativePremiumPercentage,
+		coordinatorConfig.LinkPremiumPercentage,
 	)
+
+	if coordinatorType == "optimism" {
+		fmt.Println("\nSetting L1 gas fee calculation...")
+		SetCoordinatorL1FeeCalculation(e, contractAddresses.CoordinatorAddress, optimismL1FeeMode, optimismL1FeeCoefficient)
+	}
 
 	fmt.Println("\nConfig set, getting current config from deployed contract...")
 	PrintCoordinatorConfig(coordinator)
@@ -660,14 +752,14 @@ func VRFV2PlusDeployUniverse(e helpers.Environment,
 	if len(vrfKeyRegistrationConfig.VRFKeyUncompressedPubKey) > 0 {
 		fmt.Println("\nRegistering proving key...")
 
-		//NOTE - register proving key against EOA account, and not against Oracle's sending address in other to be able
+		// NOTE - register proving key against EOA account, and not against Oracle's sending address in other to be able
 		// easily withdraw funds from Coordinator contract back to EOA account
-		RegisterCoordinatorProvingKey(e, *coordinator, vrfKeyRegistrationConfig.VRFKeyUncompressedPubKey)
+		RegisterCoordinatorProvingKey(e, *coordinator, vrfKeyRegistrationConfig.VRFKeyUncompressedPubKey, provingKeyMaxGasPrice)
 
 		fmt.Println("\nProving key registered, getting proving key hashes from deployed contract...")
-		_, _, provingKeyHashes, configErr := coordinator.GetRequestConfig(nil)
-		helpers.PanicErr(configErr)
-		fmt.Println("Key hash registered:", hex.EncodeToString(provingKeyHashes[0][:]))
+		registeredKeyHash, err2 := coordinator.SProvingKeyHashes(nil, big.NewInt(0))
+		helpers.PanicErr(err2)
+		fmt.Println("Key hash registered:", hex.EncodeToString(registeredKeyHash[:]))
 	} else {
 		fmt.Println("NOT registering proving key - you must do this eventually in order to fully deploy VRF!")
 	}
@@ -676,9 +768,7 @@ func VRFV2PlusDeployUniverse(e helpers.Environment,
 	consumerAddress := EoaV2PlusLoadTestConsumerWithMetricsDeploy(e, contractAddresses.CoordinatorAddress.String())
 
 	fmt.Println("\nAdding subscription...")
-	EoaCreateSub(e, *coordinator)
-
-	subID := FindSubscriptionID(e, coordinator)
+	subID, err := EoaCreateSub(e, *coordinator)
 	helpers.PanicErr(err)
 
 	fmt.Println("\nAdding consumer to subscription...")
@@ -704,19 +794,19 @@ func VRFV2PlusDeployUniverse(e helpers.Environment,
 
 	formattedVrfV2PlusPrimaryJobSpec := fmt.Sprintf(
 		jobs.VRFV2PlusJobFormatted,
-		contractAddresses.CoordinatorAddress,                                                        //coordinatorAddress
-		contractAddresses.BatchCoordinatorAddress,                                                   //batchCoordinatorAddress
-		coordinatorJobSpecConfig.BatchFulfillmentEnabled,                                            //batchFulfillmentEnabled
-		coordinatorJobSpecConfig.BatchFulfillmentGasMultiplier,                                      //batchFulfillmentGasMultiplier
-		strings.Join(util.MapToAddressArr(nodesMap[model.VRFPrimaryNodeName].SendingKeys), "\",\""), //fromAddresses
-		compressedPkHex,            //publicKey
-		coordinatorConfig.MinConfs, //minIncomingConfirmations
-		e.ChainID,                  //evmChainID
-		strings.Join(util.MapToAddressArr(nodesMap[model.VRFPrimaryNodeName].SendingKeys), "\",\""), //fromAddresses
-		coordinatorJobSpecConfig.PollPeriod,     //pollPeriod
-		coordinatorJobSpecConfig.RequestTimeout, //requestTimeout
+		contractAddresses.CoordinatorAddress,                   // coordinatorAddress
+		contractAddresses.BatchCoordinatorAddress,              // batchCoordinatorAddress
+		coordinatorJobSpecConfig.BatchFulfillmentEnabled,       // batchFulfillmentEnabled
+		coordinatorJobSpecConfig.BatchFulfillmentGasMultiplier, // batchFulfillmentGasMultiplier
+		compressedPkHex,            // publicKey
+		coordinatorConfig.MinConfs, // minIncomingConfirmations
+		e.ChainID,                  // evmChainID
+		strings.Join(util.MapToAddressArr(nodesMap[model.VRFPrimaryNodeName].SendingKeys), "\",\""), // fromAddresses
+		coordinatorJobSpecConfig.PollPeriod,     // pollPeriod
+		coordinatorJobSpecConfig.RequestTimeout, // requestTimeout
 		contractAddresses.CoordinatorAddress,
-		coordinatorJobSpecConfig.EstimateGasMultiplier, //estimateGasMultiplier
+		coordinatorJobSpecConfig.EstimateGasMultiplier, // estimateGasMultiplier
+		simulationBlock,
 		func() string {
 			if keys := nodesMap[model.VRFPrimaryNodeName].SendingKeys; len(keys) > 0 {
 				return keys[0].Address
@@ -725,22 +815,24 @@ func VRFV2PlusDeployUniverse(e helpers.Environment,
 		}(),
 		contractAddresses.CoordinatorAddress,
 		contractAddresses.CoordinatorAddress,
+		simulationBlock,
 	)
 
 	formattedVrfV2PlusBackupJobSpec := fmt.Sprintf(
 		jobs.VRFV2PlusJobFormatted,
-		contractAddresses.CoordinatorAddress,                   //coordinatorAddress
-		contractAddresses.BatchCoordinatorAddress,              //batchCoordinatorAddress
-		coordinatorJobSpecConfig.BatchFulfillmentEnabled,       //batchFulfillmentEnabled
-		coordinatorJobSpecConfig.BatchFulfillmentGasMultiplier, //batchFulfillmentGasMultiplier
-		compressedPkHex, //publicKey
-		100,             //minIncomingConfirmations
-		e.ChainID,       //evmChainID
-		strings.Join(util.MapToAddressArr(nodesMap[model.VRFBackupNodeName].SendingKeys), "\",\""), //fromAddresses
-		coordinatorJobSpecConfig.PollPeriod,     //pollPeriod
-		coordinatorJobSpecConfig.RequestTimeout, //requestTimeout
+		contractAddresses.CoordinatorAddress,                   // coordinatorAddress
+		contractAddresses.BatchCoordinatorAddress,              // batchCoordinatorAddress
+		coordinatorJobSpecConfig.BatchFulfillmentEnabled,       // batchFulfillmentEnabled
+		coordinatorJobSpecConfig.BatchFulfillmentGasMultiplier, // batchFulfillmentGasMultiplier
+		compressedPkHex, // publicKey
+		100,             // minIncomingConfirmations
+		e.ChainID,       // evmChainID
+		strings.Join(util.MapToAddressArr(nodesMap[model.VRFBackupNodeName].SendingKeys), "\",\""), // fromAddresses
+		coordinatorJobSpecConfig.PollPeriod,     // pollPeriod
+		coordinatorJobSpecConfig.RequestTimeout, // requestTimeout
 		contractAddresses.CoordinatorAddress,
-		coordinatorJobSpecConfig.EstimateGasMultiplier, //estimateGasMultiplier
+		coordinatorJobSpecConfig.EstimateGasMultiplier, // estimateGasMultiplier
+		simulationBlock,
 		func() string {
 			if keys := nodesMap[model.VRFPrimaryNodeName].SendingKeys; len(keys) > 0 {
 				return keys[0].Address
@@ -749,41 +841,48 @@ func VRFV2PlusDeployUniverse(e helpers.Environment,
 		}(),
 		contractAddresses.CoordinatorAddress,
 		contractAddresses.CoordinatorAddress,
+		simulationBlock,
 	)
 
 	formattedBHSJobSpec := fmt.Sprintf(
 		jobs.BHSPlusJobFormatted,
-		contractAddresses.CoordinatorAddress, //coordinatorAddress
-		30,                                   //waitBlocks
-		200,                                  //lookbackBlocks
-		contractAddresses.BhsContractAddress, //bhs address
-		e.ChainID,                            //chain id
-		strings.Join(util.MapToAddressArr(nodesMap[model.BHSNodeName].SendingKeys), "\",\""), //sending addresses
+		contractAddresses.CoordinatorAddress, // coordinatorAddress
+		contractAddresses.CoordinatorAddress, // coordinatorAddress
+		bhsJobSpecConfig.WaitBlocks,          // waitBlocks
+		bhsJobSpecConfig.LookBackBlocks,      // lookbackBlocks
+		contractAddresses.BhsContractAddress, // bhs address
+		bhsJobSpecConfig.PollPeriod,          // pollPeriod
+		bhsJobSpecConfig.RunTimeout,          // runTimeout
+		e.ChainID,                            // chain id
+		strings.Join(util.MapToAddressArr(nodesMap[model.BHSNodeName].SendingKeys), "\",\""), // sending addresses
 	)
 
 	formattedBHSBackupJobSpec := fmt.Sprintf(
 		jobs.BHSPlusJobFormatted,
-		contractAddresses.CoordinatorAddress, //coordinatorAddress
-		100,                                  //waitBlocks
-		200,                                  //lookbackBlocks
-		contractAddresses.BhsContractAddress, //bhs adreess
-		e.ChainID,                            //chain id
-		strings.Join(util.MapToAddressArr(nodesMap[model.BHSBackupNodeName].SendingKeys), "\",\""), //sending addresses
+		contractAddresses.CoordinatorAddress, // coordinatorAddress
+		contractAddresses.CoordinatorAddress, // coordinatorAddress
+		100,                                  // waitBlocks
+		200,                                  // lookbackBlocks
+		contractAddresses.BhsContractAddress, // bhs adreess
+		bhsJobSpecConfig.PollPeriod,          // pollPeriod
+		bhsJobSpecConfig.RunTimeout,          // runTimeout
+		e.ChainID,                            // chain id
+		strings.Join(util.MapToAddressArr(nodesMap[model.BHSBackupNodeName].SendingKeys), "\",\""), // sending addresses
 	)
 
 	formattedBHFJobSpec := fmt.Sprintf(
 		jobs.BHFPlusJobFormatted,
-		contractAddresses.CoordinatorAddress, //coordinatorAddress
-		contractAddresses.BhsContractAddress, //bhs adreess
-		contractAddresses.BatchBHSAddress,    //batchBHS
-		e.ChainID,                            //chain id
-		strings.Join(util.MapToAddressArr(nodesMap[model.BHFNodeName].SendingKeys), "\",\""), //sending addresses
+		contractAddresses.CoordinatorAddress, // coordinatorAddress
+		contractAddresses.BhsContractAddress, // bhs adreess
+		contractAddresses.BatchBHSAddress,    // batchBHS
+		e.ChainID,                            // chain id
+		strings.Join(util.MapToAddressArr(nodesMap[model.BHFNodeName].SendingKeys), "\",\""), // sending addresses
 	)
 
 	fmt.Println(
 		"\nDeployment complete.",
 		"\nLINK Token contract address:", contractAddresses.LinkAddress,
-		"\nLINK/ETH Feed contract address:", contractAddresses.LinkEthAddress,
+		"\nLINK/Native Feed contract address:", contractAddresses.LinkEthAddress,
 		"\nBlockhash Store contract address:", contractAddresses.BhsContractAddress,
 		"\nBatch Blockhash Store contract address:", contractAddresses.BatchBHSAddress,
 		"\nVRF Coordinator Address:", contractAddresses.CoordinatorAddress,
@@ -793,7 +892,7 @@ func VRFV2PlusDeployUniverse(e helpers.Environment,
 		"\nVRF Subscription LINK Balance:", *subscriptionBalanceJuels,
 		"\nVRF Subscription Native Balance:", *subscriptionBalanceNativeWei,
 		"\nPossible VRF Request command: ",
-		fmt.Sprintf("go run . eoa-load-test-request-with-metrics --consumer-address=%s --sub-id=%d --key-hash=%s --request-confirmations %d --requests 1 --runs 1 --cb-gas-limit 1_000_000", consumerAddress, subID, keyHash, coordinatorConfig.MinConfs),
+		fmt.Sprintf("go run . eoa-load-test-request-with-metrics --consumer-address=%s --sub-id=%d --key-hash=%s --request-confirmations %d --native-payment-enabled=true --requests 1 --runs 1 --cb-gas-limit 1_000_000", consumerAddress, subID, keyHash, coordinatorConfig.MinConfs),
 		"\nRetrieve Request Status: ",
 		fmt.Sprintf("go run . eoa-load-test-read-metrics --consumer-address=%s", consumerAddress),
 		"\nA node can now be configured to run a VRF job with the below job spec :\n",
@@ -811,66 +910,153 @@ func VRFV2PlusDeployUniverse(e helpers.Environment,
 
 func DeployWrapperUniverse(e helpers.Environment) {
 	cmd := flag.NewFlagSet("wrapper-universe-deploy", flag.ExitOnError)
+	wrapperType := cmd.String("wrapper-type", "", "Specify which wrapper type to use: layer1, arbitrum, optimism")
 	linkAddress := cmd.String("link-address", "", "address of link token")
-	linkETHFeedAddress := cmd.String("link-eth-feed", "", "address of link-eth-feed")
-	coordinatorAddress := cmd.String("coordinator-address", "", "address of the vrf coordinator v2 contract")
+	linkNativeFeedAddress := cmd.String("link-native-feed", "", "address of link-native-feed")
+	coordinatorAddress := cmd.String("coordinator-address", "", "address of the vrf coordinator v2plus contract")
+	subscriptionID := cmd.String("subscription-id", "", "subscription ID for the wrapper")
 	wrapperGasOverhead := cmd.Uint("wrapper-gas-overhead", 50_000, "amount of gas overhead in wrapper fulfillment")
-	coordinatorGasOverhead := cmd.Uint("coordinator-gas-overhead", 52_000, "amount of gas overhead in coordinator fulfillment")
-	wrapperPremiumPercentage := cmd.Uint("wrapper-premium-percentage", 25, "gas premium charged by wrapper")
+	coordinatorGasOverheadNative := cmd.Uint("coordinator-gas-overhead-native", 52_000, "amount of gas overhead in coordinator fulfillment for native payment")
+	coordinatorGasOverheadLink := cmd.Uint("coordinator-gas-overhead-link", 74_000, "amount of gas overhead in coordinator fulfillment for link payment")
+	coordinatorGasOverheadPerWord := cmd.Uint("coordinator-gas-overhead-per-word", 0, "amount of gas overhead per word in coordinator fulfillment")
+	wrapperNativePremiumPercentage := cmd.Uint("wrapper-native-premium-percentage", 25, "gas premium charged by wrapper for native payment")
+	wrapperLinkPremiumPercentage := cmd.Uint("wrapper-link-premium-percentage", 25, "gas premium charged by wrapper for link payment")
 	keyHash := cmd.String("key-hash", "", "the keyhash that wrapper requests should use")
 	maxNumWords := cmd.Uint("max-num-words", 10, "the keyhash that wrapper requests should use")
-	subFunding := cmd.String("sub-funding", "10000000000000000000", "amount to fund the subscription with")
-	consumerFunding := cmd.String("consumer-funding", "10000000000000000000", "amount to fund the consumer with")
+	subFundingLink := cmd.String("sub-funding-link", "10000000000000000000", "amount in LINK to fund the subscription with")
+	subFundingNative := cmd.String("sub-funding-native", "10000000000000000000", "amount in native to fund the subscription with")
+	consumerFundingLink := cmd.String("consumer-funding-link", "10000000000000000000", "amount in LINK to fund the consumer with")
+	consumerFundingNative := cmd.String("consumer-funding-native", "10000000000000000000", "amount in native to fund the consumer with")
 	fallbackWeiPerUnitLink := cmd.String("fallback-wei-per-unit-link", "", "the fallback wei per unit link")
 	stalenessSeconds := cmd.Uint("staleness-seconds", 86400, "the number of seconds of staleness to allow")
-	fulfillmentFlatFeeLinkPPM := cmd.Uint("fulfillment-flat-fee-link-ppm", 500, "the link flat fee in ppm to charge for fulfillment")
-	fulfillmentFlatFeeNativePPM := cmd.Uint("fulfillment-flat-fee-native-ppm", 500, "the native flat fee in ppm to charge for fulfillment")
-	helpers.ParseArgs(cmd, os.Args[2:], "link-address", "link-eth-feed", "coordinator-address", "key-hash", "fallback-wei-per-unit-link")
+	fulfillmentFlatFeeNativePPM := cmd.Uint("fulfillment-flat-fee-native-ppm", 500, "the native flat fee in ppm to charge for fulfillment denominated in native")
+	fulfillmentFlatFeeLinkDiscountPPM := cmd.Uint("fulfillment-flat-fee-link-discount-ppm", 500, "the link flat fee discount in ppm to charge for fulfillment denominated in native")
+	// only necessary for Optimism coordinator contract
+	optimismL1GasFeeCalculationMode := cmd.Uint64("optimism-l1-fee-mode", 0, "Choose Optimism coordinator contract L1 fee calculation mode: 0, 1, 2")
+	optimismL1GasFeeCoefficient := cmd.Uint64("optimism-l1-fee-coefficient", 100, "Choose Optimism coordinator contract L1 fee coefficient percentage [1, 100]")
+	helpers.ParseArgs(cmd, os.Args[2:], "wrapper-type", "link-address", "link-native-feed", "coordinator-address", "key-hash", "fallback-wei-per-unit-link")
 
-	amount, s := big.NewInt(0).SetString(*subFunding, 10)
-	if !s {
-		panic(fmt.Sprintf("failed to parse top up amount '%s'", *subFunding))
+	if *wrapperType != "layer1" && *wrapperType != "arbitrum" && *wrapperType != "optimism" {
+		panic(fmt.Sprintf("Invalid Wrapper type `%s`. Only `layer1`, `arbitrum` and `optimism` are supported", *wrapperType))
 	}
 
-	wrapper, subID := WrapperDeploy(e,
+	subAmountLink, s := big.NewInt(0).SetString(*subFundingLink, 10)
+	if !s {
+		panic(fmt.Sprintf("failed to parse subscription top up amount '%s'", *subFundingLink))
+	}
+
+	subAmountNative, s := big.NewInt(0).SetString(*subFundingNative, 10)
+	if !s {
+		panic(fmt.Sprintf("failed to parse subscription top up amount '%s'", *subFundingNative))
+	}
+
+	consumerAmountLink, s := big.NewInt(0).SetString(*consumerFundingLink, 10)
+	if !s {
+		panic(fmt.Sprintf("failed to parse consumer top up amount '%s'", *consumerFundingLink))
+	}
+
+	consumerAmountNative, s := big.NewInt(0).SetString(*consumerFundingNative, 10)
+	if !s {
+		panic(fmt.Sprintf("failed to parse consumer top up amount '%s'", *consumerFundingNative))
+	}
+
+	coordinator, err := vrf_coordinator_v2_5.NewVRFCoordinatorV25(common.HexToAddress(*coordinatorAddress), e.Ec)
+	helpers.PanicErr(err)
+
+	var subID *big.Int
+	if *subscriptionID == "" {
+		subID, err = EoaCreateSub(e, *coordinator)
+		helpers.PanicErr(err)
+		fmt.Println("Created subscription ID:", subID)
+	} else {
+		subID = parseSubID(*subscriptionID)
+		fmt.Println("Using existing subscription ID:", subID)
+	}
+
+	fmt.Println()
+
+	wrapper := WrapperDeploy(e,
 		common.HexToAddress(*linkAddress),
-		common.HexToAddress(*linkETHFeedAddress),
-		common.HexToAddress(*coordinatorAddress))
+		common.HexToAddress(*linkNativeFeedAddress),
+		common.HexToAddress(*coordinatorAddress),
+		subID,
+		*wrapperType,
+	)
+
+	fmt.Println("Deployed wrapper:", wrapper.String())
+	fmt.Println("Wrapper type:", *wrapperType)
+	fmt.Println()
 
 	WrapperConfigure(e,
 		wrapper,
 		*wrapperGasOverhead,
-		*coordinatorGasOverhead,
-		*wrapperPremiumPercentage,
+		*coordinatorGasOverheadNative,
+		*coordinatorGasOverheadLink,
+		*coordinatorGasOverheadPerWord,
+		*wrapperNativePremiumPercentage,
+		*wrapperLinkPremiumPercentage,
 		*keyHash,
 		*maxNumWords,
 		decimal.RequireFromString(*fallbackWeiPerUnitLink).BigInt(),
-		uint32(*stalenessSeconds),
-		uint32(*fulfillmentFlatFeeLinkPPM),
-		uint32(*fulfillmentFlatFeeNativePPM),
+		uint32(*stalenessSeconds),                  //nolint:gosec // staleness fits in uint32
+		uint32(*fulfillmentFlatFeeNativePPM),       //nolint:gosec // fee fits in uint32
+		uint32(*fulfillmentFlatFeeLinkDiscountPPM), //nolint:gosec // fee fits in uint32
 	)
+
+	fmt.Println("Configured wrapper")
+	fmt.Println()
+
+	if *wrapperType == "optimism" {
+		WrapperSetL1FeeCalculation(e, wrapper, uint8(*optimismL1GasFeeCalculationMode), uint8(*optimismL1GasFeeCoefficient)) //nolint:gosec // parameters fit in uint8
+		fmt.Println("Set L1 gas fee calculation")
+		fmt.Println()
+	}
 
 	consumer := WrapperConsumerDeploy(e,
 		common.HexToAddress(*linkAddress),
 		wrapper)
 
-	coordinator, err := vrf_coordinator_v2_5.NewVRFCoordinatorV25(common.HexToAddress(*coordinatorAddress), e.Ec)
-	helpers.PanicErr(err)
+	fmt.Println("Deployed wrapper consumer:", consumer.String())
+	fmt.Println()
 
-	EoaFundSubWithLink(e, *coordinator, *linkAddress, amount, subID)
+	// for v2plus we need to add wrapper as a consumer to the subscription
+	EoaAddConsumerToSub(e, *coordinator, subID, wrapper.String())
+
+	fmt.Println("Added wrapper as the subscription consumer")
+	fmt.Println()
 
 	link, err := link_token_interface.NewLinkToken(common.HexToAddress(*linkAddress), e.Ec)
 	helpers.PanicErr(err)
-	consumerAmount, s := big.NewInt(0).SetString(*consumerFunding, 10)
-	if !s {
-		panic(fmt.Sprintf("failed to parse top up amount '%s'", *consumerFunding))
-	}
 
-	tx, err := link.Transfer(e.Owner, consumer, consumerAmount)
+	tx, err := link.Transfer(e.Owner, consumer, consumerAmountLink)
 	helpers.PanicErr(err)
 	helpers.ConfirmTXMined(context.Background(), e.Ec, tx, e.ChainID, "link transfer to consumer")
 
-	fmt.Println("wrapper universe deployment complete")
-	fmt.Println("wrapper address:", wrapper.String())
-	fmt.Println("wrapper consumer address:", consumer.String())
+	sendNativeTokens(e, consumer, consumerAmountNative)
+
+	fmt.Println("Funded wrapper consumer")
+	fmt.Println()
+
+	EoaFundSubWithLink(e, *coordinator, *linkAddress, subAmountLink, subID)
+	// e.Owner.Value is hardcoded inside this helper function, make sure to run it as the last one in the script
+	EoaFundSubWithNative(e, common.HexToAddress(*coordinatorAddress), subID, subAmountNative)
+
+	fmt.Println("Funded wrapper subscription")
+	fmt.Println()
+
+	fmt.Println("Wrapper universe deployment complete")
+	fmt.Println("Wrapper address:", wrapper.String())
+	fmt.Println("Wrapper type:", *wrapperType)
+	fmt.Println("Wrapper consumer address:", consumer.String())
+	fmt.Println("Wrapper subscription ID:", subID)
+	fmt.Printf("Send native request example: go run . wrapper-consumer-request --consumer-address=%s --cb-gas-limit=1000000 --native-payment=true\n", consumer.String())
+	fmt.Printf("Send LINK request example: go run . wrapper-consumer-request --consumer-address=%s --cb-gas-limit=1000000 --native-payment=false\n", consumer.String())
+}
+
+func parseSubID(subID string) *big.Int {
+	parsedSubID, ok := new(big.Int).SetString(subID, 10)
+	if !ok {
+		helpers.PanicErr(fmt.Errorf("sub ID %s cannot be parsed", subID))
+	}
+	return parsedSubID
 }

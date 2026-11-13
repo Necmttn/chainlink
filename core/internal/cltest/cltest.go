@@ -15,46 +15,64 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/ethereum/go-ethereum/accounts/abi/bind/backends"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethclient/simulated"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/securecookie"
 	"github.com/gorilla/sessions"
+	"github.com/jmoiron/sqlx"
 	"github.com/manyminds/api2go/jsonapi"
 	"github.com/onsi/gomega"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
-	"github.com/jmoiron/sqlx"
-
 	ocrtypes "github.com/smartcontractkit/libocr/offchainreporting/types"
+	"github.com/smartcontractkit/libocr/offchainreporting2plus/ocr3_1types"
 
-	"github.com/smartcontractkit/chainlink-common/pkg/loop"
-	"github.com/smartcontractkit/chainlink-common/pkg/utils/mailbox"
-
-	"github.com/smartcontractkit/chainlink/v2/common/client"
-	commonmocks "github.com/smartcontractkit/chainlink/v2/common/types/mocks"
-	"github.com/smartcontractkit/chainlink/v2/core/auth"
+	commonkeystore "github.com/smartcontractkit/chainlink-common/keystore"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/aptoskey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/csakey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ethkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ocr2key"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ocrkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/p2pkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/solkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/starkkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/stellarkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/suikey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/tonkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/tronkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/vrfkey"
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities/registry"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-common/pkg/utils/tests"
+	"github.com/smartcontractkit/chainlink-common/pkg/workflows/dontime"
+	"github.com/smartcontractkit/chainlink-data-streams/llo/retirement"
+	"github.com/smartcontractkit/chainlink-data-streams/mercury/wsrpc"
+	"github.com/smartcontractkit/chainlink-data-streams/mercury/wsrpc/cache"
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
+	evmclient "github.com/smartcontractkit/chainlink-evm/pkg/client"
+	"github.com/smartcontractkit/chainlink-evm/pkg/client/clienttest"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr"
+	evmtypes "github.com/smartcontractkit/chainlink-evm/pkg/types"
+	evmutils "github.com/smartcontractkit/chainlink-evm/pkg/utils"
+	"github.com/smartcontractkit/chainlink-framework/multinode"
 	"github.com/smartcontractkit/chainlink/v2/core/bridges"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/assets"
-	evmclient "github.com/smartcontractkit/chainlink/v2/core/chains/evm/client"
-	evmclimocks "github.com/smartcontractkit/chainlink/v2/core/chains/evm/client/mocks"
-	evmconfig "github.com/smartcontractkit/chainlink/v2/core/chains/evm/config"
-	httypes "github.com/smartcontractkit/chainlink/v2/core/chains/evm/headtracker/types"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/txmgr"
-	evmtypes "github.com/smartcontractkit/chainlink/v2/core/chains/evm/types"
-	evmutils "github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils"
-	ubig "github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities/confidentialrelay"
+	remotetypes "github.com/smartcontractkit/chainlink/v2/core/capabilities/remote/types"
 	"github.com/smartcontractkit/chainlink/v2/core/cmd"
+	"github.com/smartcontractkit/chainlink/v2/core/config/env"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/evmtest"
@@ -63,35 +81,22 @@ import (
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/logger/audit"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/v2/core/services/cre"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/cosmoskey"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/csakey"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/dkgencryptkey"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/dkgsignkey"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ocr2key"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ocrkey"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/p2pkey"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/solkey"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/starkkey"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/vrfkey"
+	"github.com/smartcontractkit/chainlink/v2/core/services/llo"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ocr2"
+	p2ptypes "github.com/smartcontractkit/chainlink/v2/core/services/p2p/types"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pg"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
-	"github.com/smartcontractkit/chainlink/v2/core/services/relay/evm/mercury/wsrpc"
-	"github.com/smartcontractkit/chainlink/v2/core/services/relay/evm/mercury/wsrpc/cache"
-	"github.com/smartcontractkit/chainlink/v2/core/services/webhook"
+	"github.com/smartcontractkit/chainlink/v2/core/services/standardcapabilities"
+	"github.com/smartcontractkit/chainlink/v2/core/services/workflows/metering"
+	wftypes "github.com/smartcontractkit/chainlink/v2/core/services/workflows/types"
 	clsessions "github.com/smartcontractkit/chainlink/v2/core/sessions"
-	"github.com/smartcontractkit/chainlink/v2/core/static"
 	"github.com/smartcontractkit/chainlink/v2/core/store/models"
-	"github.com/smartcontractkit/chainlink/v2/core/utils"
 	"github.com/smartcontractkit/chainlink/v2/core/web"
 	webauth "github.com/smartcontractkit/chainlink/v2/core/web/auth"
 	webpresenters "github.com/smartcontractkit/chainlink/v2/core/web/presenters"
-	"github.com/smartcontractkit/chainlink/v2/plugins"
-
-	// Force import of pgtest to ensure that txdb is registered as a DB driver
-	_ "github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
 )
 
 const (
@@ -118,16 +123,18 @@ var (
 	DefaultP2PPeerID p2pkey.PeerID
 	FixtureChainID   = *testutils.FixtureChainID
 
-	DefaultCosmosKey     = cosmoskey.MustNewInsecure(keystest.NewRandReaderFromSeed(KeyBigIntSeed))
-	DefaultCSAKey        = csakey.MustNewV2XXXTestingOnly(big.NewInt(KeyBigIntSeed))
-	DefaultOCRKey        = ocrkey.MustNewV2XXXTestingOnly(big.NewInt(KeyBigIntSeed))
-	DefaultOCR2Key       = ocr2key.MustNewInsecure(keystest.NewRandReaderFromSeed(KeyBigIntSeed), "evm")
-	DefaultP2PKey        = p2pkey.MustNewV2XXXTestingOnly(big.NewInt(KeyBigIntSeed))
-	DefaultSolanaKey     = solkey.MustNewInsecure(keystest.NewRandReaderFromSeed(KeyBigIntSeed))
-	DefaultStarkNetKey   = starkkey.MustNewInsecure(keystest.NewRandReaderFromSeed(KeyBigIntSeed))
-	DefaultVRFKey        = vrfkey.MustNewV2XXXTestingOnly(big.NewInt(KeyBigIntSeed))
-	DefaultDKGSignKey    = dkgsignkey.MustNewXXXTestingOnly(big.NewInt(KeyBigIntSeed))
-	DefaultDKGEncryptKey = dkgencryptkey.MustNewXXXTestingOnly(big.NewInt(KeyBigIntSeed))
+	DefaultCSAKey      = csakey.MustNewV2XXXTestingOnly(big.NewInt(KeyBigIntSeed))
+	DefaultOCRKey      = ocrkey.MustNewV2XXXTestingOnly(big.NewInt(KeyBigIntSeed))
+	DefaultOCR2Key     = ocr2key.MustNewInsecure(keystest.NewRandReaderFromSeed(KeyBigIntSeed), "evm")
+	DefaultP2PKey      = p2pkey.MustNewV2XXXTestingOnly(big.NewInt(KeyBigIntSeed))
+	DefaultSolanaKey   = solkey.MustNewInsecure(keystest.NewRandReaderFromSeed(KeyBigIntSeed))
+	DefaultStarkNetKey = starkkey.MustNewInsecure(keystest.NewRandReaderFromSeed(KeyBigIntSeed))
+	DefaultAptosKey    = aptoskey.MustNewInsecure(keystest.NewRandReaderFromSeed(KeyBigIntSeed))
+	DefaultTronKey     = tronkey.MustNewInsecure(keystest.NewRandReaderFromSeed(KeyBigIntSeed))
+	DefaultTONKey      = tonkey.MustNewInsecure(keystest.NewRandReaderFromSeed(KeyBigIntSeed))
+	DefaultSuiKey      = suikey.MustNewInsecure(keystest.NewRandReaderFromSeed(KeyBigIntSeed))
+	DefaultStellarKey  = stellarkey.MustNewInsecure(keystest.NewRandReaderFromSeed(KeyBigIntSeed))
+	DefaultVRFKey      = vrfkey.MustNewV2XXXTestingOnly(big.NewInt(KeyBigIntSeed))
 )
 
 func init() {
@@ -149,6 +156,7 @@ func init() {
 	}
 }
 
+// Deprecated: use rand/v2
 func NewRandomPositiveInt64() int64 {
 	id := rand.Int63()
 	return id
@@ -165,39 +173,20 @@ func MustRandomBytes(t *testing.T, l int) (b []byte) {
 	return b
 }
 
-type JobPipelineV2TestHelper struct {
-	Prm pipeline.ORM
-	Jrm job.ORM
-	Pr  pipeline.Runner
-}
-
-type JobPipelineConfig interface {
-	pipeline.Config
-	MaxSuccessfulRuns() uint64
-}
-
-func NewJobPipelineV2(t testing.TB, cfg pipeline.BridgeConfig, jpcfg JobPipelineConfig, dbCfg pg.QConfig, legacyChains legacyevm.LegacyChainContainer, db *sqlx.DB, keyStore keystore.Master, restrictedHTTPClient, unrestrictedHTTPClient *http.Client) JobPipelineV2TestHelper {
-	lggr := logger.TestLogger(t)
-	prm := pipeline.NewORM(db, lggr, dbCfg, jpcfg.MaxSuccessfulRuns())
-	btORM := bridges.NewORM(db, lggr, dbCfg)
-	jrm := job.NewORM(db, prm, btORM, keyStore, lggr, dbCfg)
-	pr := pipeline.NewRunner(prm, btORM, jpcfg, cfg, legacyChains, keyStore.Eth(), keyStore.VRF(), lggr, restrictedHTTPClient, unrestrictedHTTPClient)
-	return JobPipelineV2TestHelper{
-		prm,
-		jrm,
-		pr,
-	}
+func FormatWithPrefixedChainID(chainID, id string) string {
+	return fmt.Sprintf("%s/%s", chainID, id)
 }
 
 // TestApplication holds the test application and test servers
 type TestApplication struct {
 	t testing.TB
-	*chainlink.ChainlinkApplication
-	Logger  logger.Logger
-	Server  *httptest.Server
-	Started bool
-	Backend *backends.SimulatedBackend
-	Keys    []ethkey.KeyV2
+	*chainlink.Node
+	Logger             logger.Logger
+	Server             *httptest.Server
+	Started            bool
+	Backend            *simulated.Backend
+	Keys               []ethkey.KeyV2
+	CapabilityRegistry *registry.Registry
 }
 
 // NewApplicationEVMDisabled creates a new application with default config but EVM disabled
@@ -205,14 +194,19 @@ type TestApplication struct {
 func NewApplicationEVMDisabled(t *testing.T) *TestApplication {
 	t.Helper()
 
-	c := configtest.NewGeneralConfig(t, nil)
+	c := configtest.NewGeneralConfig(t, func(config *chainlink.Config, secrets *chainlink.Secrets) {
+		f := false
+		for _, c := range config.EVM {
+			c.Enabled = &f
+		}
+	})
 
 	return NewApplicationWithConfig(t, c)
 }
 
 // NewApplication creates a New TestApplication along with a NewConfig
 // It mocks the keystore with no keys or accounts by default
-func NewApplication(t testing.TB, flagsAndDeps ...interface{}) *TestApplication {
+func NewApplication(t testing.TB, flagsAndDeps ...any) *TestApplication {
 	t.Helper()
 
 	c := configtest.NewGeneralConfig(t, nil)
@@ -222,7 +216,7 @@ func NewApplication(t testing.TB, flagsAndDeps ...interface{}) *TestApplication 
 
 // NewApplicationWithKey creates a new TestApplication along with a new config
 // It uses the native keystore and will load any keys that are in the database
-func NewApplicationWithKey(t *testing.T, flagsAndDeps ...interface{}) *TestApplication {
+func NewApplicationWithKey(t *testing.T, flagsAndDeps ...any) *TestApplication {
 	t.Helper()
 
 	config := configtest.NewGeneralConfig(t, nil)
@@ -231,13 +225,13 @@ func NewApplicationWithKey(t *testing.T, flagsAndDeps ...interface{}) *TestAppli
 
 // NewApplicationWithConfigAndKey creates a new TestApplication with the given testorm
 // it will also provide an unlocked account on the keystore
-func NewApplicationWithConfigAndKey(t testing.TB, c chainlink.GeneralConfig, flagsAndDeps ...interface{}) *TestApplication {
+func NewApplicationWithConfigAndKey(t testing.TB, c chainlink.GeneralConfig, flagsAndDeps ...any) *TestApplication {
+	ctx := t.Context()
 	app := NewApplicationWithConfig(t, c, flagsAndDeps...)
 
-	chainID := *ubig.New(&FixtureChainID)
+	chainID := *sqlutil.New(&FixtureChainID)
 	for _, dep := range flagsAndDeps {
-		switch v := dep.(type) {
-		case *ubig.Big:
+		if v, ok := dep.(*sqlutil.Big); ok {
 			chainID = *v
 		}
 	}
@@ -248,43 +242,22 @@ func NewApplicationWithConfigAndKey(t testing.TB, c chainlink.GeneralConfig, fla
 	} else {
 		id, ks := chainID.ToInt(), app.KeyStore.Eth()
 		for _, k := range app.Keys {
-			ks.XXXTestingOnlyAdd(k)
-			require.NoError(t, ks.Add(k.Address, id))
-			require.NoError(t, ks.Enable(k.Address, id))
+			ks.XXXTestingOnlyAdd(ctx, k)
+			require.NoError(t, ks.Add(ctx, k.Address, id))
+			require.NoError(t, ks.Enable(ctx, k.Address, id))
 		}
 	}
 
 	return app
 }
 
-func setKeys(t testing.TB, app *TestApplication, flagsAndDeps ...interface{}) (chainID ubig.Big) {
-	require.NoError(t, app.KeyStore.Unlock(Password))
-
-	for _, dep := range flagsAndDeps {
-		switch v := dep.(type) {
-		case ethkey.KeyV2:
-			app.Keys = append(app.Keys, v)
-		case p2pkey.KeyV2:
-			require.NoError(t, app.GetKeyStore().P2P().Add(v))
-		case csakey.KeyV2:
-			require.NoError(t, app.GetKeyStore().CSA().Add(v))
-		case ocr2key.KeyBundle:
-			require.NoError(t, app.GetKeyStore().OCR2().Add(v))
-		}
-	}
-
-	return
-}
-
-const (
-	UseRealExternalInitiatorManager = "UseRealExternalInitiatorManager"
-)
-
 // NewApplicationWithConfig creates a New TestApplication with specified test config.
 // This should only be used in full integration tests. For controller tests, see NewApplicationEVMDisabled.
-func NewApplicationWithConfig(t testing.TB, cfg chainlink.GeneralConfig, flagsAndDeps ...interface{}) *TestApplication {
+func NewApplicationWithConfig(t testing.TB, cfg chainlink.GeneralConfig, flagsAndDeps ...any) *TestApplication {
 	t.Helper()
 	testutils.SkipShortDB(t)
+
+	ctx := t.Context()
 
 	var lggr logger.Logger
 	for _, dep := range flagsAndDeps {
@@ -298,9 +271,9 @@ func NewApplicationWithConfig(t testing.TB, cfg chainlink.GeneralConfig, flagsAn
 		lggr = logger.TestLogger(t)
 	}
 
-	var auditLogger audit.AuditLogger
+	var auditLogger audit.Logger
 	for _, dep := range flagsAndDeps {
-		audLgger, is := dep.(audit.AuditLogger)
+		audLgger, is := dep.(audit.Logger)
 		if is {
 			auditLogger = audLgger
 			break
@@ -311,35 +284,82 @@ func NewApplicationWithConfig(t testing.TB, cfg chainlink.GeneralConfig, flagsAn
 		auditLogger = audit.NoopLogger
 	}
 
-	url := cfg.Database().URL()
-	db, err := pg.NewConnection(url.String(), cfg.Database().Dialect(), cfg.Database())
-	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, db.Close()) })
-
-	var ethClient evmclient.Client
-	var externalInitiatorManager webhook.ExternalInitiatorManager
-	externalInitiatorManager = &webhook.NullExternalInitiatorManager{}
-	var useRealExternalInitiatorManager bool
-
-	for _, flag := range flagsAndDeps {
-		switch dep := flag.(type) {
-		case evmclient.Client:
-			ethClient = dep
-		case webhook.ExternalInitiatorManager:
-			externalInitiatorManager = dep
-		default:
-			switch flag {
-			case UseRealExternalInitiatorManager:
-				externalInitiatorManager = webhook.NewExternalInitiatorManager(db, clhttptest.NewTestLocalOnlyHTTPClient(), lggr, cfg.Database())
-			}
-
+	var newOracleFactoryFn standardcapabilities.NewOracleFactoryFn
+	for _, dep := range flagsAndDeps {
+		factoryFn, _ := dep.(standardcapabilities.NewOracleFactoryFn)
+		if factoryFn != nil {
+			newOracleFactoryFn = factoryFn
+			break
 		}
 	}
 
-	keyStore := keystore.NewInMemory(db, utils.FastScryptParams, lggr, cfg.Database())
+	var lloKVFactory ocr3_1types.KeyValueDatabaseFactory
+	var lloNetWrapper ocr2.LLONetworkEndpointWrapper
+	for _, dep := range flagsAndDeps {
+		if f, ok := dep.(ocr3_1types.KeyValueDatabaseFactory); ok {
+			lloKVFactory = f
+		}
+		if w, ok := dep.(ocr2.LLONetworkEndpointWrapper); ok {
+			lloNetWrapper = w
+		}
+	}
 
-	mailMon := mailbox.NewMonitor(cfg.AppID().String(), lggr.Named("Mailbox"))
-	loopRegistry := plugins.NewLoopRegistry(lggr, nil)
+	var capabilitiesRegistry *registry.Registry
+	capabilitiesRegistry = registry.NewRegistry(lggr)
+	for _, dep := range flagsAndDeps {
+		registry, _ := dep.(*registry.Registry)
+		if registry != nil {
+			capabilitiesRegistry = registry
+		}
+	}
+
+	var dispatcher remotetypes.Dispatcher
+	for _, dep := range flagsAndDeps {
+		dispatcher, _ = dep.(remotetypes.Dispatcher)
+		if dispatcher != nil {
+			break
+		}
+	}
+
+	var sharedPeer p2ptypes.SharedPeer
+	for _, dep := range flagsAndDeps {
+		peerWrapper, _ := dep.(p2ptypes.PeerWrapper)
+		if peerWrapper != nil {
+			sharedPeer = sharedPeerFromPeer{Peer: peerWrapper.GetPeer()}
+			break
+		}
+	}
+
+	var syncerFetcherFunc wftypes.FetcherFunc
+	for _, dep := range flagsAndDeps {
+		syncerFetcherFunc, _ = dep.(wftypes.FetcherFunc)
+		if syncerFetcherFunc != nil {
+			break
+		}
+	}
+
+	var billingClient metering.BillingClient
+	for _, dep := range flagsAndDeps {
+		billingClient, _ = dep.(metering.BillingClient)
+		if billingClient != nil {
+			break
+		}
+	}
+
+	url := cfg.Database().URL()
+	db, err := pg.NewConnection(ctx, url.String(), cfg.Database().DriverName(), cfg.Database())
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, db.Close()) })
+
+	ds := sqlutil.WrapDataSource(db, lggr, sqlutil.TimeoutHook(cfg.Database().DefaultQueryTimeout))
+
+	var ethClient evmclient.Client
+
+	for _, flag := range flagsAndDeps {
+		if dep, ok := flag.(evmclient.Client); ok {
+			ethClient = dep
+		}
+	}
 
 	mercuryPool := wsrpc.NewPool(lggr, cache.Config{
 		LatestReportTTL:      cfg.Mercury().Cache().LatestReportTTL(),
@@ -347,90 +367,82 @@ func NewApplicationWithConfig(t testing.TB, cfg chainlink.GeneralConfig, flagsAn
 		LatestReportDeadline: cfg.Mercury().Cache().LatestReportDeadline(),
 	})
 
-	relayerFactory := chainlink.RelayerFactory{
-		Logger:       lggr,
-		LoopRegistry: loopRegistry,
-		GRPCOpts:     loop.GRPCOpts{},
-		MercuryPool:  mercuryPool,
-	}
+	c := clhttptest.NewTestLocalOnlyHTTPClient()
 
-	evmOpts := chainlink.EVMFactoryConfig{
-		ChainOpts: legacyevm.ChainOpts{
-			AppConfig: cfg,
-			MailMon:   mailMon,
-			DB:        db,
-		},
-		CSAETHKeystore: keyStore,
-	}
-
-	if cfg.EVMEnabled() {
+	var evmFactoryConfigFn func(config *chainlink.EVMFactoryConfig)
+	// TODO BCF-2513 Stop injecting ethClient via override, instead use httptest.
+	if cfg.EVMEnabled() && env.EVMPlugin.Cmd.Get() == "" {
 		if ethClient == nil {
 			ethClient = evmclient.NewNullClient(evmtest.MustGetDefaultChainID(t, cfg.EVMConfigs()), lggr)
 		}
-		chainId := ethClient.ConfiguredChainID()
-		evmOpts.GenEthClient = func(_ *big.Int) evmclient.Client {
-			if chainId.Cmp(evmtest.MustGetDefaultChainID(t, cfg.EVMConfigs())) != 0 {
-				t.Fatalf("expected eth client ChainID %d to match evm config chain id %d", chainId, evmtest.MustGetDefaultChainID(t, cfg.EVMConfigs()))
+		chainID := ethClient.ConfiguredChainID()
+		evmFactoryConfigFn = func(fc *chainlink.EVMFactoryConfig) {
+			fc.GenEthClient = func(_ *big.Int) evmclient.Client {
+				if chainID.Cmp(evmtest.MustGetDefaultChainID(t, cfg.EVMConfigs())) != 0 {
+					t.Fatalf("expected eth client ChainID %d to match evm config chain id %d", chainID, evmtest.MustGetDefaultChainID(t, cfg.EVMConfigs()))
+				}
+				return ethClient
 			}
-			return ethClient
+		}
+	}
+	keyStore := keystore.NewInMemory(ds, commonkeystore.FastScryptParams, lggr.Infof)
+	require.NoError(t, keyStore.Unlock(ctx, Password))
+	logPubKeys(t, keyStore)
+
+	for _, dep := range flagsAndDeps {
+		switch v := dep.(type) {
+		case p2pkey.KeyV2:
+			require.NoError(t, keyStore.P2P().Add(ctx, v))
+		case csakey.KeyV2:
+			require.NoError(t, keyStore.CSA().Add(ctx, v))
+		case ocr2key.KeyBundle:
+			require.NoError(t, keyStore.OCR2().Add(ctx, v))
 		}
 	}
 
-	testCtx := testutils.Context(t)
-	// evm alway enabled for backward compatibility
-	initOps := []chainlink.CoreRelayerChainInitFunc{chainlink.InitEVM(testCtx, relayerFactory, evmOpts)}
-
-	if cfg.CosmosEnabled() {
-		cosmosCfg := chainlink.CosmosFactoryConfig{
-			Keystore:    keyStore.Cosmos(),
-			TOMLConfigs: cfg.CosmosConfigs(),
-			DB:          db,
-			QConfig:     cfg.Database(),
-		}
-		initOps = append(initOps, chainlink.InitCosmos(testCtx, relayerFactory, cosmosCfg))
-	}
-	if cfg.SolanaEnabled() {
-		solanaCfg := chainlink.SolanaFactoryConfig{
-			Keystore:    keyStore.Solana(),
-			TOMLConfigs: cfg.SolanaConfigs(),
-		}
-		initOps = append(initOps, chainlink.InitSolana(testCtx, relayerFactory, solanaCfg))
-	}
-	if cfg.StarkNetEnabled() {
-		starkCfg := chainlink.StarkNetFactoryConfig{
-			Keystore:    keyStore.StarkNet(),
-			TOMLConfigs: cfg.StarknetConfigs(),
-		}
-		initOps = append(initOps, chainlink.InitStarknet(testCtx, relayerFactory, starkCfg))
-
-	}
-	relayChainInterops, err := chainlink.NewCoreRelayerChainInteroperators(initOps...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := clhttptest.NewTestLocalOnlyHTTPClient()
-	appInstance, err := chainlink.NewApplication(chainlink.ApplicationOpts{
-		Config:                     cfg,
-		MailMon:                    mailMon,
-		SqlxDB:                     db,
-		KeyStore:                   keyStore,
-		RelayerChainInteroperators: relayChainInterops,
-		Logger:                     lggr,
+	appInstance, err := chainlink.NewApplication(ctx, chainlink.ApplicationOpts{
+		Opts: cre.Opts{
+			CapabilitiesRegistry:   capabilitiesRegistry,
+			ExecutionHandlers:      &confidentialrelay.ExecutionHandlers{},
+			CapabilitiesDispatcher: dispatcher,
+			CapabilitiesSharedPeer: sharedPeer,
+			FetcherFunc:            syncerFetcherFunc,
+			BillingClient:          billingClient,
+			UseLocalTimeProvider:   cfg.CRE().UseLocalTimeProvider(),
+		},
+		Config:   cfg,
+		DS:       ds,
+		KeyStore: keyStore,
+		Logger:   lggr,
+		// Don't use global registry here since otherwise multiple apps can create name conflicts.
+		// Could also potentially give a mock registry to test prometheus.
+		Registerer:                 prometheus.NewRegistry(),
 		AuditLogger:                auditLogger,
 		CloseLogger:                lggr.Sync,
-		ExternalInitiatorManager:   externalInitiatorManager,
 		RestrictedHTTPClient:       c,
 		UnrestrictedHTTPClient:     c,
 		SecretGenerator:            MockSecretGenerator{},
-		LoopRegistry:               plugins.NewLoopRegistry(lggr, nil),
 		MercuryPool:                mercuryPool,
+		NewOracleFactoryFn:         newOracleFactoryFn,
+		RetirementReportCache:      retirement.NewRetirementReportCache(lggr, ds),
+		LLOTransmissionReaper:      llo.NewTransmissionReaper(ds, lggr, cfg.Mercury().Transmitter().ReaperFrequency(), cfg.Mercury().Transmitter().ReaperMaxAge()),
+		EVMFactoryConfigFn:         evmFactoryConfigFn,
+		DonTimeStore:               dontime.NewStore(dontime.DefaultRequestTimeout),
+		LLOKeyValueDatabaseFactory: lloKVFactory,
+		LLONetworkEndpointWrapper:  lloNetWrapper,
 	})
+
 	require.NoError(t, err)
-	app := appInstance.(*chainlink.ChainlinkApplication)
+	app := appInstance.(*chainlink.Node)
 	ta := &TestApplication{
-		t:                    t,
-		ChainlinkApplication: app,
-		Logger:               lggr,
+		t:      t,
+		Node:   app,
+		Logger: lggr,
+	}
+	for _, dep := range flagsAndDeps {
+		if k, ok := dep.(ethkey.KeyV2); ok {
+			ta.Keys = append(ta.Keys, k)
+		}
 	}
 
 	srvr := httptest.NewUnstartedServer(web.Router(t, app, nil))
@@ -438,38 +450,159 @@ func NewApplicationWithConfig(t testing.TB, cfg chainlink.GeneralConfig, flagsAn
 	srvr.Start()
 	ta.Server = srvr
 
-	if !useRealExternalInitiatorManager {
-		app.ExternalInitiatorManager = externalInitiatorManager
-	}
-
-	setKeys(t, ta, flagsAndDeps...)
-
 	return ta
 }
 
-func NewEthMocksWithDefaultChain(t testing.TB) (c *evmclimocks.Client) {
+func logPubKeys(t testing.TB, kr keystore.Master) {
+	ctx := t.Context()
+	csas, err := kr.CSA().GetAll()
+	require.NoError(t, err)
+	csaIDs := make([]string, 0, len(csas))
+	for _, CSAKey := range csas {
+		csaIDs = append(csaIDs, CSAKey.ID())
+	}
+	eths, err := kr.Eth().GetAll(ctx)
+	require.NoError(t, err)
+	ethIDs := make([]string, 0, len(eths))
+	for _, ETHKey := range eths {
+		ethIDs = append(ethIDs, ETHKey.ID())
+	}
+	ocrs, err := kr.OCR().GetAll()
+	require.NoError(t, err)
+	ocrIDs := make([]string, 0, len(ocrs))
+	for _, OCRKey := range ocrs {
+		ocrIDs = append(ocrIDs, OCRKey.ID())
+	}
+	ocr2s, err := kr.OCR2().GetAll()
+	require.NoError(t, err)
+	ocr2IDs := make([]string, 0, len(ocr2s))
+	for _, OCR2Key := range ocr2s {
+		ocr2IDs = append(ocr2IDs, OCR2Key.ID())
+	}
+	p2ps, err := kr.P2P().GetAll()
+	require.NoError(t, err)
+	p2pIDs := make([]string, 0, len(p2ps))
+	for _, P2PKey := range p2ps {
+		p2pIDs = append(p2pIDs, P2PKey.ID())
+	}
+	solanas, err := kr.Solana().GetAll()
+	require.NoError(t, err)
+	solanaIDs := make([]string, 0, len(solanas))
+	for _, solanaKey := range solanas {
+		solanaIDs = append(solanaIDs, solanaKey.ID())
+	}
+	starknets, err := kr.StarkNet().GetAll()
+	require.NoError(t, err)
+	starknetIDs := make([]string, 0, len(starknets))
+	for _, starkkey := range starknets {
+		starknetIDs = append(starknetIDs, starkkey.ID())
+	}
+	aptoses, err := kr.Aptos().GetAll()
+	require.NoError(t, err)
+	aptosIDs := make([]string, 0, len(aptoses))
+	for _, aptosKey := range aptoses {
+		aptosIDs = append(aptosIDs, aptosKey.ID())
+	}
+	trons, err := kr.Tron().GetAll()
+	require.NoError(t, err)
+	tronIDs := make([]string, 0, len(trons))
+	for _, tronKey := range trons {
+		tronIDs = append(tronIDs, tronKey.ID())
+	}
+	tons, err := kr.TON().GetAll()
+	require.NoError(t, err)
+	tonIDs := make([]string, 0, len(tons))
+	for _, tonKey := range tons {
+		tonIDs = append(tonIDs, tonKey.ID())
+	}
+	suies, err := kr.Sui().GetAll()
+	require.NoError(t, err)
+	suiIDs := make([]string, 0, len(suies))
+	for _, suiKey := range suies {
+		suiIDs = append(suiIDs, suiKey.ID())
+	}
+	vrfs, err := kr.VRF().GetAll()
+	require.NoError(t, err)
+	vrfIDs := make([]string, 0, len(vrfs))
+	for _, VRFKey := range vrfs {
+		vrfIDs = append(vrfIDs, VRFKey.ID())
+	}
+	wfs, err := kr.Workflow().GetAll()
+	require.NoError(t, err)
+	workflowIDs := make([]string, len(wfs))
+	i := 0
+	for _, workflowKey := range wfs {
+		workflowIDs[i] = workflowKey.ID()
+		i++
+	}
+	lggr := logger.TestLogger(t)
+	if len(csaIDs) > 0 {
+		lggr.Infow(fmt.Sprintf("Unlocked %d CSA keys", len(csaIDs)), "keys", csaIDs)
+	}
+	if len(ethIDs) > 0 {
+		lggr.Infow(fmt.Sprintf("Unlocked %d ETH keys", len(ethIDs)), "keys", ethIDs)
+	}
+	if len(ocrIDs) > 0 {
+		lggr.Infow(fmt.Sprintf("Unlocked %d OCR keys", len(ocrIDs)), "keys", ocrIDs)
+	}
+	if len(ocr2IDs) > 0 {
+		lggr.Infow(fmt.Sprintf("Unlocked %d OCR2 keys", len(ocr2IDs)), "keys", ocr2IDs)
+	}
+	if len(p2pIDs) > 0 {
+		lggr.Infow(fmt.Sprintf("Unlocked %d P2P keys", len(p2pIDs)), "keys", p2pIDs)
+	}
+	if len(solanaIDs) > 0 {
+		lggr.Infow(fmt.Sprintf("Unlocked %d Solana keys", len(solanaIDs)), "keys", solanaIDs)
+	}
+	if len(starknetIDs) > 0 {
+		lggr.Infow(fmt.Sprintf("Unlocked %d StarkNet keys", len(starknetIDs)), "keys", starknetIDs)
+	}
+	if len(aptosIDs) > 0 {
+		lggr.Infow(fmt.Sprintf("Unlocked %d Aptos keys", len(aptosIDs)), "keys", aptosIDs)
+	}
+	if len(tronIDs) > 0 {
+		lggr.Infow(fmt.Sprintf("Unlocked %d Tron keys", len(tronIDs)), "keys", tronIDs)
+	}
+	if len(tonIDs) > 0 {
+		lggr.Infow(fmt.Sprintf("Unlocked %d TON keys", len(tonIDs)), "keys", tonIDs)
+	}
+	if len(suiIDs) > 0 {
+		lggr.Infow(fmt.Sprintf("Unlocked %d Sui keys", len(suiIDs)), "keys", suiIDs)
+	}
+	if len(vrfIDs) > 0 {
+		lggr.Infow(fmt.Sprintf("Unlocked %d VRF keys", len(vrfIDs)), "keys", vrfIDs)
+	}
+	if len(workflowIDs) > 0 {
+		lggr.Infow(fmt.Sprintf("Unlocked %d Workflow keys", len(workflowIDs)), "keys", workflowIDs)
+	}
+}
+
+func NewEthMocksWithDefaultChain(t testing.TB) (c *clienttest.Client) {
 	testutils.SkipShortDB(t)
 	c = NewEthMocks(t)
 	c.On("ConfiguredChainID").Return(&FixtureChainID).Maybe()
-	return
+	return c
 }
 
-func NewEthMocks(t testing.TB) *evmclimocks.Client {
-	return evmclimocks.NewClient(t)
+func NewEthMocks(t testing.TB) *clienttest.Client {
+	return clienttest.NewClient(t)
 }
 
-func NewEthMocksWithStartupAssertions(t testing.TB) *evmclimocks.Client {
-	testutils.SkipShort(t, "long test")
+func NewEthMocksWithStartupAssertions(t testing.TB) *clienttest.Client {
+	tests.SkipShort(t, "long test")
 	c := NewEthMocks(t)
+	chHead := make(<-chan *evmtypes.Head)
 	c.On("Dial", mock.Anything).Maybe().Return(nil)
-	c.On("SubscribeNewHead", mock.Anything, mock.Anything).Maybe().Return(EmptyMockSubscription(t), nil)
+	c.On("SubscribeToHeads", mock.Anything).Maybe().Return(chHead, EmptyMockSubscription(t), nil)
 	c.On("SendTransaction", mock.Anything, mock.Anything).Maybe().Return(nil)
-	c.On("HeadByNumber", mock.Anything, (*big.Int)(nil)).Maybe().Return(Head(0), nil)
+	c.On("HeadByNumber", mock.Anything, mock.Anything).Maybe().Return(Head(0), nil)
 	c.On("ConfiguredChainID").Maybe().Return(&FixtureChainID)
-	c.On("CallContract", mock.Anything, mock.Anything, mock.Anything).Maybe().Return([]byte{}, nil)
 	c.On("SubscribeFilterLogs", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(nil, errors.New("mocked"))
 	c.On("CodeAt", mock.Anything, mock.Anything, mock.Anything).Maybe().Return([]byte{}, nil)
+	c.On("NonceAt", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(uint64(0), nil)
+	c.On("PendingNonceAt", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(uint64(0), nil)
 	c.On("Close").Maybe().Return()
+	c.On("BatchCallContext", mock.Anything, mock.Anything).Maybe().Return(nil)
 
 	block := &types.Header{
 		Number: big.NewInt(100),
@@ -480,18 +613,20 @@ func NewEthMocksWithStartupAssertions(t testing.TB) *evmclimocks.Client {
 }
 
 // NewEthMocksWithTransactionsOnBlocksAssertions sets an Eth mock with transactions on blocks
-func NewEthMocksWithTransactionsOnBlocksAssertions(t testing.TB) *evmclimocks.Client {
-	testutils.SkipShort(t, "long test")
+func NewEthMocksWithTransactionsOnBlocksAssertions(t testing.TB) *clienttest.Client {
+	tests.SkipShort(t, "long test")
 	c := NewEthMocks(t)
+	chHead := make(<-chan *evmtypes.Head)
 	c.On("Dial", mock.Anything).Maybe().Return(nil)
-	c.On("SubscribeNewHead", mock.Anything, mock.Anything).Maybe().Return(EmptyMockSubscription(t), nil)
+	c.On("SubscribeToHeads", mock.Anything).Maybe().Return(chHead, EmptyMockSubscription(t), nil)
 	c.On("SendTransaction", mock.Anything, mock.Anything).Maybe().Return(nil)
-	c.On("SendTransactionReturnCode", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(client.Successful, nil)
+	c.On("SendTransactionReturnCode", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(multinode.Successful, nil)
 	// Construct chain
 	h2 := Head(2)
 	h1 := HeadWithHash(1, h2.ParentHash)
 	h0 := HeadWithHash(0, h1.ParentHash)
 	c.On("HeadByNumber", mock.Anything, (*big.Int)(nil)).Maybe().Return(h2, nil)
+	c.On("HeadByNumber", mock.Anything, big.NewInt(0)).Maybe().Return(h0, nil) // finalized block
 	c.On("HeadByHash", mock.Anything, h1.Hash).Maybe().Return(h1, nil)
 	c.On("HeadByHash", mock.Anything, h0.Hash).Maybe().Return(h0, nil)
 	c.On("BatchCallContext", mock.Anything, mock.Anything).Maybe().Return(nil).Run(func(args mock.Arguments) {
@@ -526,16 +661,21 @@ func NewEthMocksWithTransactionsOnBlocksAssertions(t testing.TB) *evmclimocks.Cl
 func (ta *TestApplication) Start(ctx context.Context) error {
 	ta.t.Helper()
 	ta.Started = true
-	err := ta.ChainlinkApplication.KeyStore.Unlock(Password)
+	err := ta.KeyStore.Unlock(ctx, Password)
 	if err != nil {
 		return err
 	}
 
-	err = ta.ChainlinkApplication.Start(ctx)
+	err = ta.Node.Start(ctx)
 	if err != nil {
 		return err
 	}
-	ta.t.Cleanup(func() { require.NoError(ta.t, ta.Stop()) })
+	ta.t.Cleanup(func() {
+		err := ta.Stop()
+		if err != nil && !strings.Contains(err.Error(), "stopped") {
+			require.NoError(ta.t, err)
+		}
+	})
 	return nil
 }
 
@@ -551,7 +691,7 @@ func (ta *TestApplication) Stop() error {
 	// We would prefer to invoke a method on an interface that
 	// cleans up only in test.
 	// FIXME: TestApplication probably needs to simply be removed
-	err := ta.ChainlinkApplication.StopIfStarted()
+	err := ta.StopIfStarted()
 	if ta.Server != nil {
 		ta.Server.Close()
 	}
@@ -559,17 +699,18 @@ func (ta *TestApplication) Stop() error {
 }
 
 func (ta *TestApplication) MustSeedNewSession(email string) (id string) {
+	ctx := ta.t.Context()
 	session := NewSession()
 	ta.Logger.Infof("TestApplication creating session (id: %s, email: %s, last used: %s)", session.ID, email, session.LastUsed.String())
-	err := ta.GetSqlxDB().Get(&id, `INSERT INTO sessions (id, email, last_used, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id`, session.ID, email, session.LastUsed)
+	err := ta.GetDB().GetContext(ctx, &id, `INSERT INTO sessions (id, email, last_used, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id`, session.ID, email, session.LastUsed)
 	require.NoError(ta.t, err)
 	return id
 }
 
 // ImportKey adds private key to the application keystore and database
-func (ta *TestApplication) Import(content string) {
-	require.NoError(ta.t, ta.KeyStore.Unlock(Password))
-	_, err := ta.KeyStore.Eth().Import([]byte(content), Password, &FixtureChainID)
+func (ta *TestApplication) Import(ctx context.Context, content string) {
+	require.NoError(ta.t, ta.KeyStore.Unlock(ctx, Password))
+	_, err := ta.KeyStore.Eth().Import(ctx, []byte(content), Password, &FixtureChainID)
 	require.NoError(ta.t, err)
 }
 
@@ -580,6 +721,7 @@ type User struct {
 
 func (ta *TestApplication) NewHTTPClient(user *User) HTTPClientCleaner {
 	ta.t.Helper()
+	ctx := ta.t.Context()
 
 	if user == nil {
 		user = &User{}
@@ -596,7 +738,7 @@ func (ta *TestApplication) NewHTTPClient(user *User) HTTPClientCleaner {
 	u, err := clsessions.NewUser(user.Email, Password, user.Role)
 	require.NoError(ta.t, err)
 
-	err = ta.BasicAdminUsersORM().CreateUser(&u)
+	err = ta.BasicAdminUsersORM().CreateUser(ctx, &u)
 	require.NoError(ta.t, err)
 
 	sessionID := ta.MustSeedNewSession(user.Email)
@@ -620,7 +762,7 @@ func (ta *TestApplication) NewShellAndRenderer() (*cmd.Shell, *RendererMock) {
 		Renderer:                       r,
 		Config:                         ta.GetConfig(),
 		Logger:                         lggr,
-		AppFactory:                     seededAppFactory{ta.ChainlinkApplication},
+		AppFactory:                     seededAppFactory{ta.Node},
 		FallbackAPIInitializer:         NewMockAPIInitializer(ta.t),
 		Runner:                         EmptyRunner{},
 		HTTP:                           hc.HTTPClient,
@@ -639,7 +781,7 @@ func (ta *TestApplication) NewAuthenticatingShell(prompter cmd.Prompter) *cmd.Sh
 		Renderer:                       &RendererMock{},
 		Config:                         ta.GetConfig(),
 		Logger:                         lggr,
-		AppFactory:                     seededAppFactory{ta.ChainlinkApplication},
+		AppFactory:                     seededAppFactory{ta.Node},
 		FallbackAPIInitializer:         NewMockAPIInitializer(ta.t),
 		Runner:                         EmptyRunner{},
 		HTTP:                           cmd.NewAuthenticatedHTTPClient(ta.Logger, ta.NewClientOpts(), cookieAuth, clsessions.SessionRequest{}),
@@ -652,9 +794,11 @@ func (ta *TestApplication) NewAuthenticatingShell(prompter cmd.Prompter) *cmd.Sh
 }
 
 // NewKeyStore returns a new, unlocked keystore
-func NewKeyStore(t testing.TB, db *sqlx.DB, cfg pg.QConfig) keystore.Master {
-	keystore := keystore.NewInMemory(db, utils.FastScryptParams, logger.TestLogger(t), cfg)
-	require.NoError(t, keystore.Unlock(Password))
+func NewKeyStore(t testing.TB, ds sqlutil.DataSource) keystore.Master {
+	ctx := t.Context()
+	keystore := keystore.NewInMemory(ds, commonkeystore.FastScryptParams, logger.TestLogger(t).Infof)
+	require.NoError(t, keystore.Unlock(ctx, Password))
+	logPubKeys(t, keystore)
 	return keystore
 }
 
@@ -692,27 +836,27 @@ type HTTPClientCleaner struct {
 }
 
 func (r *HTTPClientCleaner) Get(path string, headers ...map[string]string) (*http.Response, func()) {
-	resp, err := r.HTTPClient.Get(testutils.Context(r.t), path, headers...)
+	resp, err := r.HTTPClient.Get(r.t.Context(), path, headers...)
 	return bodyCleaner(r.t, resp, err)
 }
 
 func (r *HTTPClientCleaner) Post(path string, body io.Reader) (*http.Response, func()) {
-	resp, err := r.HTTPClient.Post(testutils.Context(r.t), path, body)
+	resp, err := r.HTTPClient.Post(r.t.Context(), path, body)
 	return bodyCleaner(r.t, resp, err)
 }
 
 func (r *HTTPClientCleaner) Put(path string, body io.Reader) (*http.Response, func()) {
-	resp, err := r.HTTPClient.Put(testutils.Context(r.t), path, body)
+	resp, err := r.HTTPClient.Put(r.t.Context(), path, body)
 	return bodyCleaner(r.t, resp, err)
 }
 
 func (r *HTTPClientCleaner) Patch(path string, body io.Reader, headers ...map[string]string) (*http.Response, func()) {
-	resp, err := r.HTTPClient.Patch(testutils.Context(r.t), path, body, headers...)
+	resp, err := r.HTTPClient.Patch(r.t.Context(), path, body, headers...)
 	return bodyCleaner(r.t, resp, err)
 }
 
 func (r *HTTPClientCleaner) Delete(path string) (*http.Response, func()) {
-	resp, err := r.HTTPClient.Delete(testutils.Context(r.t), path)
+	resp, err := r.HTTPClient.Delete(r.t.Context(), path)
 	return bodyCleaner(r.t, resp, err)
 }
 
@@ -733,16 +877,11 @@ func ParseResponseBody(t testing.TB, resp *http.Response) []byte {
 }
 
 // ParseJSONAPIResponse parses the response and returns the JSONAPI resource.
-func ParseJSONAPIResponse(t testing.TB, resp *http.Response, resource interface{}) error {
+func ParseJSONAPIResponse(t testing.TB, resp *http.Response, resource any) {
 	t.Helper()
 
 	input := ParseResponseBody(t, resp)
-	err := jsonapi.Unmarshal(input, resource)
-	if err != nil {
-		return fmt.Errorf("web: unable to unmarshal data, %+v", err)
-	}
-
-	return nil
+	require.NoError(t, jsonapi.Unmarshal(input, resource))
 }
 
 // ParseJSONAPIResponseMeta parses the bytes of the root document and returns a
@@ -776,13 +915,12 @@ func CreateJobViaWeb(t testing.TB, app *TestApplication, request []byte) job.Job
 	t.Helper()
 
 	client := app.NewHTTPClient(nil)
-	resp, cleanup := client.Post("/v2/jobs", bytes.NewBuffer(request))
+	resp, cleanup := client.Post("/v2/jobs", bytes.NewBuffer(request)) //nolint:bodyclose // body closed via deferred cleanup()
 	defer cleanup()
 	AssertServerResponse(t, resp, http.StatusOK)
 
 	var createdJob job.Job
-	err := ParseJSONAPIResponse(t, resp, &createdJob)
-	require.NoError(t, err)
+	ParseJSONAPIResponse(t, resp, &createdJob)
 	return createdJob
 }
 
@@ -790,13 +928,12 @@ func CreateJobViaWeb2(t testing.TB, app *TestApplication, spec string) webpresen
 	t.Helper()
 
 	client := app.NewHTTPClient(nil)
-	resp, cleanup := client.Post("/v2/jobs", bytes.NewBufferString(spec))
+	resp, cleanup := client.Post("/v2/jobs", bytes.NewBufferString(spec)) //nolint:bodyclose // body closed via deferred cleanup()
 	defer cleanup()
 	AssertServerResponse(t, resp, http.StatusOK)
 
 	var jobResponse webpresenters.JobResource
-	err := ParseJSONAPIResponse(t, resp, &jobResponse)
-	require.NoError(t, err)
+	ParseJSONAPIResponse(t, resp, &jobResponse)
 	return jobResponse
 }
 
@@ -804,7 +941,7 @@ func DeleteJobViaWeb(t testing.TB, app *TestApplication, jobID int32) {
 	t.Helper()
 
 	client := app.NewHTTPClient(nil)
-	resp, cleanup := client.Delete(fmt.Sprintf("/v2/jobs/%v", jobID))
+	resp, cleanup := client.Delete(fmt.Sprintf("/v2/jobs/%v", jobID)) //nolint:bodyclose // body closed via deferred cleanup()
 	defer cleanup()
 	AssertServerResponse(t, resp, http.StatusNoContent)
 }
@@ -817,48 +954,21 @@ func AwaitJobActive(t testing.TB, jobSpawner job.Spawner, jobID int32, waitFor t
 	}, waitFor, 100*time.Millisecond)
 }
 
-func CreateJobRunViaExternalInitiatorV2(
+func CreateJobRunViaUserByID(
 	t testing.TB,
 	app *TestApplication,
-	jobID uuid.UUID,
-	eia auth.Token,
-	body string,
-) webpresenters.PipelineRunResource {
-	t.Helper()
-
-	headers := make(map[string]string)
-	headers[static.ExternalInitiatorAccessKeyHeader] = eia.AccessKey
-	headers[static.ExternalInitiatorSecretHeader] = eia.Secret
-
-	url := app.Server.URL + "/v2/jobs/" + jobID.String() + "/runs"
-	bodyBuf := bytes.NewBufferString(body)
-	resp, cleanup := UnauthenticatedPost(t, url, bodyBuf, headers)
-	defer cleanup()
-	AssertServerResponse(t, resp, 200)
-	var pr webpresenters.PipelineRunResource
-	err := ParseJSONAPIResponse(t, resp, &pr)
-	require.NoError(t, err)
-
-	// assert.Equal(t, j.ID, pr.JobSpecID)
-	return pr
-}
-
-func CreateJobRunViaUser(
-	t testing.TB,
-	app *TestApplication,
-	jobID uuid.UUID,
+	jobID int32,
 	body string,
 ) webpresenters.PipelineRunResource {
 	t.Helper()
 
 	bodyBuf := bytes.NewBufferString(body)
 	client := app.NewHTTPClient(nil)
-	resp, cleanup := client.Post("/v2/jobs/"+jobID.String()+"/runs", bodyBuf)
+	resp, cleanup := client.Post("/v2/jobs/"+strconv.Itoa(int(jobID))+"/runs", bodyBuf) //nolint:bodyclose // body closed via deferred cleanup()
 	defer cleanup()
 	AssertServerResponse(t, resp, 200)
 	var pr webpresenters.PipelineRunResource
-	err := ParseJSONAPIResponse(t, resp, &pr)
-	require.NoError(t, err)
+	ParseJSONAPIResponse(t, resp, &pr)
 
 	return pr
 }
@@ -872,12 +982,11 @@ func CreateExternalInitiatorViaWeb(
 	t.Helper()
 
 	client := app.NewHTTPClient(nil)
-	resp, cleanup := client.Post("/v2/external_initiators", bytes.NewBufferString(payload))
+	resp, cleanup := client.Post("/v2/external_initiators", bytes.NewBufferString(payload)) //nolint:bodyclose // body closed via deferred cleanup()
 	defer cleanup()
 	AssertServerResponse(t, resp, http.StatusCreated)
 	ei := &webpresenters.ExternalInitiatorAuthentication{}
-	err := ParseJSONAPIResponse(t, resp, ei)
-	require.NoError(t, err)
+	ParseJSONAPIResponse(t, resp, ei)
 
 	return ei
 }
@@ -891,34 +1000,38 @@ const (
 
 // WaitForSpecErrorV2 polls until the passed in jobID has count number
 // of job spec errors.
-func WaitForSpecErrorV2(t *testing.T, db *sqlx.DB, jobID int32, count int) []job.SpecError {
+func WaitForSpecErrorV2(t *testing.T, ds sqlutil.DataSource, jobID int32, count int) []job.SpecError {
 	t.Helper()
+	ctx := t.Context()
 
 	g := gomega.NewWithT(t)
 	var jse []job.SpecError
-	g.Eventually(func() []job.SpecError {
-		err := db.Select(&jse, `SELECT * FROM job_spec_errors WHERE job_id = $1`, jobID)
+	if !g.Eventually(func() []job.SpecError {
+		err := ds.SelectContext(ctx, &jse, `SELECT * FROM job_spec_errors WHERE job_id = $1`, jobID)
 		assert.NoError(t, err)
 		return jse
-	}, testutils.WaitTimeout(t), DBPollingInterval).Should(gomega.HaveLen(count))
+	}, testutils.WaitTimeout(t), DBPollingInterval).Should(gomega.HaveLen(count)) {
+		t.Fatal()
+	}
 	return jse
 }
 
-func WaitForPipelineError(t testing.TB, nodeID int, jobID int32, expectedPipelineRuns int, expectedTaskRuns int, jo job.ORM, timeout, poll time.Duration) []pipeline.Run {
+func WaitForPipelineError(t testing.TB, nodeID int, jobID int32, expectedPipelineRuns, expectedTaskRuns int, jo job.ORM, timeout, poll time.Duration) []pipeline.Run {
 	t.Helper()
 	return WaitForPipeline(t, nodeID, jobID, expectedPipelineRuns, expectedTaskRuns, jo, timeout, poll, pipeline.RunStatusErrored)
 }
-func WaitForPipelineComplete(t testing.TB, nodeID int, jobID int32, expectedPipelineRuns int, expectedTaskRuns int, jo job.ORM, timeout, poll time.Duration) []pipeline.Run {
+
+func WaitForPipelineComplete(t testing.TB, nodeID int, jobID int32, expectedPipelineRuns, expectedTaskRuns int, jo job.ORM, timeout, poll time.Duration) []pipeline.Run {
 	t.Helper()
 	return WaitForPipeline(t, nodeID, jobID, expectedPipelineRuns, expectedTaskRuns, jo, timeout, poll, pipeline.RunStatusCompleted)
 }
 
-func WaitForPipeline(t testing.TB, nodeID int, jobID int32, expectedPipelineRuns int, expectedTaskRuns int, jo job.ORM, timeout, poll time.Duration, state pipeline.RunStatus) []pipeline.Run {
+func WaitForPipeline(t testing.TB, nodeID int, jobID int32, expectedPipelineRuns, expectedTaskRuns int, jo job.ORM, timeout, poll time.Duration, state pipeline.RunStatus) []pipeline.Run {
 	t.Helper()
 
 	var pr []pipeline.Run
 	gomega.NewWithT(t).Eventually(func() bool {
-		prs, _, err := jo.PipelineRuns(&jobID, 0, 1000)
+		prs, _, err := jo.PipelineRuns(t.Context(), &jobID, 0, 1000)
 		require.NoError(t, err)
 
 		var matched []pipeline.Run
@@ -952,13 +1065,14 @@ func WaitForPipeline(t testing.TB, nodeID int, jobID int32, expectedPipelineRuns
 }
 
 // AssertPipelineRunsStays asserts that the number of pipeline runs for a particular job remains at the provided values
-func AssertPipelineRunsStays(t testing.TB, pipelineSpecID int32, db *sqlx.DB, want int) []pipeline.Run {
+func AssertPipelineRunsStays(t testing.TB, pipelineSpecID int32, db sqlutil.DataSource, want int) []pipeline.Run {
 	t.Helper()
+	ctx := t.Context()
 	g := gomega.NewWithT(t)
 
 	var prs []pipeline.Run
 	g.Consistently(func() []pipeline.Run {
-		err := db.Select(&prs, `SELECT * FROM pipeline_runs WHERE pipeline_spec_id = $1`, pipelineSpecID)
+		err := db.SelectContext(ctx, &prs, `SELECT * FROM pipeline_runs WHERE pipeline_spec_id = $1`, pipelineSpecID)
 		assert.NoError(t, err)
 		return prs
 	}, AssertNoActionTimeout, DBPollingInterval).Should(gomega.HaveLen(want))
@@ -969,40 +1083,24 @@ func AssertPipelineRunsStays(t testing.TB, pipelineSpecID int32, db *sqlx.DB, wa
 func AssertEthTxAttemptCountStays(t testing.TB, txStore txmgr.TestEvmTxStore, want int) []int64 {
 	g := gomega.NewWithT(t)
 
-	var txaIds []int64
+	var txaIDs []int64
 	g.Consistently(func() []txmgr.TxAttempt {
-		attempts, err := txStore.GetAllTxAttempts(testutils.Context(t))
+		attempts, err := txStore.GetAllTxAttempts(t.Context())
 		assert.NoError(t, err)
 		return attempts
 	}, AssertNoActionTimeout, DBPollingInterval).Should(gomega.HaveLen(want))
-	return txaIds
+	return txaIDs
 }
 
-// Head given the value convert it into an Head
-func Head(val interface{}) *evmtypes.Head {
-	var h evmtypes.Head
-	time := uint64(0)
-	switch t := val.(type) {
-	case int:
-		h = evmtypes.NewHead(big.NewInt(int64(t)), evmutils.NewHash(), evmutils.NewHash(), time, ubig.New(&FixtureChainID))
-	case uint64:
-		h = evmtypes.NewHead(big.NewInt(int64(t)), evmutils.NewHash(), evmutils.NewHash(), time, ubig.New(&FixtureChainID))
-	case int64:
-		h = evmtypes.NewHead(big.NewInt(t), evmutils.NewHash(), evmutils.NewHash(), time, ubig.New(&FixtureChainID))
-	case *big.Int:
-		h = evmtypes.NewHead(t, evmutils.NewHash(), evmutils.NewHash(), time, ubig.New(&FixtureChainID))
-	default:
-		panic(fmt.Sprintf("Could not convert %v of type %T to Head", val, val))
-	}
+// Head return a new head with the given number.
+func Head(num int64) *evmtypes.Head {
+	h := evmtypes.NewHead(big.NewInt(num), evmutils.NewHash(), evmutils.NewHash(), sqlutil.New(&FixtureChainID))
 	return &h
 }
 
 func HeadWithHash(n int64, hash common.Hash) *evmtypes.Head {
-	var h evmtypes.Head
-	time := uint64(0)
-	h = evmtypes.NewHead(big.NewInt(n), hash, evmutils.NewHash(), time, ubig.New(&FixtureChainID))
+	h := evmtypes.NewHead(big.NewInt(n), hash, evmutils.NewHash(), sqlutil.New(&FixtureChainID))
 	return &h
-
 }
 
 // LegacyTransactionsFromGasPrices returns transactions matching the given gas prices
@@ -1018,27 +1116,13 @@ func LegacyTransactionsFromGasPricesTxType(code evmtypes.TxType, gasPrices ...in
 	return txs
 }
 
-// DynamicFeeTransactionsFromTipCaps returns EIP-1559 transactions with the
-// given TipCaps (FeeCap is arbitrary)
-func DynamicFeeTransactionsFromTipCaps(tipCaps ...int64) []evmtypes.Transaction {
-	return DynamicFeeTransactionsFromTipCapsTxType(0x02, tipCaps...)
-}
-
-func DynamicFeeTransactionsFromTipCapsTxType(code evmtypes.TxType, tipCaps ...int64) []evmtypes.Transaction {
-	txs := make([]evmtypes.Transaction, len(tipCaps))
-	for i, tipCap := range tipCaps {
-		txs[i] = evmtypes.Transaction{Type: code, MaxPriorityFeePerGas: assets.NewWeiI(tipCap), GasLimit: 42, MaxFeePerGas: assets.GWei(5000)}
-	}
-	return txs
-}
-
 type TransactionReceipter interface {
 	TransactionReceipt(context.Context, common.Hash) (*types.Receipt, error)
 }
 
 func RequireTxSuccessful(t testing.TB, client TransactionReceipter, txHash common.Hash) *types.Receipt {
 	t.Helper()
-	r, err := client.TransactionReceipt(testutils.Context(t), txHash)
+	r, err := client.TransactionReceipt(t.Context(), txHash)
 	require.NoError(t, err)
 	require.NotNil(t, r)
 	require.Equal(t, uint64(1), r.Status)
@@ -1075,7 +1159,7 @@ func AssertServerResponse(t testing.TB, resp *http.Response, expectedStatusCode 
 }
 
 func DecodeSessionCookie(value string) (string, error) {
-	var decrypted map[interface{}]interface{}
+	var decrypted map[any]any
 	codecs := securecookie.CodecsFromPairs([]byte(SessionSecret))
 	err := securecookie.DecodeMulti(webauth.SessionName, value, &decrypted, codecs...)
 	if err != nil {
@@ -1089,7 +1173,7 @@ func DecodeSessionCookie(value string) (string, error) {
 }
 
 func MustGenerateSessionCookie(t testing.TB, value string) *http.Cookie {
-	decrypted := map[interface{}]interface{}{webauth.SessionIDKey: value}
+	decrypted := map[any]any{webauth.SessionIDKey: value}
 	codecs := securecookie.CodecsFromPairs([]byte(SessionSecret))
 	encoded, err := securecookie.EncodeMulti(webauth.SessionName, decrypted, codecs...)
 	if err != nil {
@@ -1118,11 +1202,11 @@ func UnauthenticatedGet(t testing.TB, url string, headers map[string]string) (*h
 	return unauthenticatedHTTP(t, "GET", url, nil, headers)
 }
 
-func unauthenticatedHTTP(t testing.TB, method string, url string, body io.Reader, headers map[string]string) (*http.Response, func()) {
+func unauthenticatedHTTP(t testing.TB, method, url string, body io.Reader, headers map[string]string) (*http.Response, func()) {
 	t.Helper()
 
 	client := clhttptest.NewTestLocalOnlyHTTPClient()
-	request, err := http.NewRequestWithContext(testutils.Context(t), method, url, body)
+	request, err := http.NewRequestWithContext(t.Context(), method, url, body)
 	require.NoError(t, err)
 	request.Header.Set("Content-Type", "application/json")
 	for key, value := range headers {
@@ -1149,11 +1233,12 @@ func NewSession(optionalSessionID ...string) clsessions.Session {
 	return session
 }
 
-func AllExternalInitiators(t testing.TB, db *sqlx.DB) []bridges.ExternalInitiator {
+func AllExternalInitiators(t testing.TB, ds sqlutil.DataSource) []bridges.ExternalInitiator {
 	t.Helper()
+	ctx := t.Context()
 
 	var all []bridges.ExternalInitiator
-	err := db.Select(&all, `SELECT * FROM external_initiators`)
+	err := ds.SelectContext(ctx, &all, `SELECT * FROM external_initiators`)
 	require.NoError(t, err)
 	return all
 }
@@ -1193,27 +1278,6 @@ func (a Awaiter) AwaitOrFail(t testing.TB, durationParams ...time.Duration) {
 	}
 }
 
-func CallbackOrTimeout(t testing.TB, msg string, callback func(), durationParams ...time.Duration) {
-	t.Helper()
-
-	duration := 100 * time.Millisecond
-	if len(durationParams) > 0 {
-		duration = durationParams[0]
-	}
-
-	done := make(chan struct{})
-	go func() {
-		callback()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(duration):
-		t.Fatalf("CallbackOrTimeout: %s timed out", msg)
-	}
-}
-
 func MustParseURL(t testing.TB, input string) *url.URL {
 	return testutils.MustParseURL(t, input)
 }
@@ -1227,19 +1291,19 @@ type EthereumLogIterator interface{ Next() bool }
 // It returns the logs as a slice of blank interface{}s, and if rv is non-nil,
 // it must be a pointer to a slice for elements of the same type as the logs,
 // in which case GetLogs will append the logs to it.
-func GetLogs(t *testing.T, rv interface{}, logs EthereumLogIterator) []interface{} {
+func GetLogs(t *testing.T, rv any, logs EthereumLogIterator) []any {
 	v := reflect.ValueOf(rv)
 	require.True(t, rv == nil ||
-		v.Kind() == reflect.Ptr && v.Elem().Kind() == reflect.Slice,
+		v.Kind() == reflect.Pointer && v.Elem().Kind() == reflect.Slice,
 		"must pass a slice to receive logs")
 	var e reflect.Value
 	if rv != nil {
 		e = v.Elem()
 	}
-	var irv []interface{}
+	var irv []any
 	for logs.Next() {
 		log := reflect.Indirect(reflect.ValueOf(logs)).FieldByName("Event")
-		if v.Kind() == reflect.Ptr {
+		if v.Kind() == reflect.Pointer {
 			e.Set(reflect.Append(e, log))
 		}
 		irv = append(irv, log.Interface())
@@ -1268,276 +1332,55 @@ func MustBytesToConfigDigest(t *testing.T, b []byte) ocrtypes.ConfigDigest {
 
 // MockApplicationEthCalls mocks all calls made by the chainlink application as
 // standard when starting and stopping
-func MockApplicationEthCalls(t *testing.T, app *TestApplication, ethClient *evmclimocks.Client, sub *commonmocks.Subscription) {
+func MockApplicationEthCalls(t *testing.T, app *TestApplication, ethClient *clienttest.Client, sub *clienttest.Subscription) {
 	t.Helper()
 
 	// Start
 	ethClient.On("Dial", mock.Anything).Return(nil)
-	ethClient.On("SubscribeNewHead", mock.Anything, mock.Anything).Return(sub, nil).Maybe()
+	ethClient.On("SubscribeToHeads", mock.Anything).Return(make(<-chan *evmtypes.Head), sub, nil).Maybe()
 	ethClient.On("ConfiguredChainID", mock.Anything).Return(evmtest.MustGetDefaultChainID(t, app.GetConfig().EVMConfigs()), nil)
 	ethClient.On("PendingNonceAt", mock.Anything, mock.Anything).Return(uint64(0), nil).Maybe()
 	ethClient.On("HeadByNumber", mock.Anything, mock.Anything).Return(nil, nil).Maybe()
 	ethClient.On("Close").Return().Maybe()
 }
 
-func BatchElemMatchesParams(req rpc.BatchElem, arg interface{}, method string) bool {
-	return req.Method == method &&
-		len(req.Args) == 1 && req.Args[0] == arg
+func AssertCount(t testing.TB, ds sqlutil.DataSource, tableName string, expected int64) {
+	testutils.AssertCount(t, ds, tableName, expected)
 }
 
-func BatchElemMustMatchParams(t *testing.T, req rpc.BatchElem, hash common.Hash, method string) {
+func WaitForCount(t *testing.T, ds sqlutil.DataSource, tableName string, want int64) {
 	t.Helper()
-	if !BatchElemMatchesParams(req, hash, method) {
-		t.Fatalf("Batch hash %v does not match expected %v", req.Args[0], hash)
-	}
-}
-
-// SimulateIncomingHeads spawns a goroutine which sends a stream of heads and closes the returned channel when finished.
-func SimulateIncomingHeads(t *testing.T, heads []*evmtypes.Head, headTrackables ...httypes.HeadTrackable) (done chan struct{}) {
-	// Build the full chain of heads
-	ctx := testutils.Context(t)
-	done = make(chan struct{})
-	go func(t *testing.T) {
-		defer close(done)
-		ticker := time.NewTicker(250 * time.Millisecond)
-		defer ticker.Stop()
-
-		for _, h := range heads {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				t.Logf("Sending head: %d", h.Number)
-				for _, ht := range headTrackables {
-					ht.OnNewLongestChain(ctx, h)
-				}
-			}
-		}
-	}(t)
-	return done
-}
-
-// Blocks - a helper logic to construct a range of linked heads
-// and an ability to fork and create logs from them
-type Blocks struct {
-	t       *testing.T
-	Hashes  []common.Hash
-	mHashes map[int64]common.Hash
-	Heads   map[int64]*evmtypes.Head
-}
-
-func (b *Blocks) LogOnBlockNum(i uint64, addr common.Address) types.Log {
-	return RawNewRoundLog(b.t, addr, b.Hashes[i], i, 0, false)
-}
-
-func (b *Blocks) LogOnBlockNumRemoved(i uint64, addr common.Address) types.Log {
-	return RawNewRoundLog(b.t, addr, b.Hashes[i], i, 0, true)
-}
-
-func (b *Blocks) LogOnBlockNumWithIndex(i uint64, logIndex uint, addr common.Address) types.Log {
-	return RawNewRoundLog(b.t, addr, b.Hashes[i], i, logIndex, false)
-}
-
-func (b *Blocks) LogOnBlockNumWithIndexRemoved(i uint64, logIndex uint, addr common.Address) types.Log {
-	return RawNewRoundLog(b.t, addr, b.Hashes[i], i, logIndex, true)
-}
-
-func (b *Blocks) LogOnBlockNumWithTopics(i uint64, logIndex uint, addr common.Address, topics []common.Hash) types.Log {
-	return RawNewRoundLogWithTopics(b.t, addr, b.Hashes[i], i, logIndex, false, topics)
-}
-
-func (b *Blocks) HashesMap() map[int64]common.Hash {
-	return b.mHashes
-}
-
-func (b *Blocks) Head(number uint64) *evmtypes.Head {
-	return b.Heads[int64(number)]
-}
-
-func (b *Blocks) ForkAt(t *testing.T, blockNum int64, numHashes int) *Blocks {
-	forked := NewBlocks(t, len(b.Heads)+numHashes)
-	if _, exists := forked.Heads[blockNum]; !exists {
-		t.Fatalf("Not enough length for block num: %v", blockNum)
-	}
-
-	for i := int64(0); i < blockNum; i++ {
-		forked.Heads[i] = b.Heads[i]
-	}
-
-	forked.Heads[blockNum].ParentHash = b.Heads[blockNum].ParentHash
-	forked.Heads[blockNum].Parent = b.Heads[blockNum].Parent
-	return forked
-}
-
-func (b *Blocks) NewHead(number uint64) *evmtypes.Head {
-	parentNumber := number - 1
-	parent, ok := b.Heads[int64(parentNumber)]
-	if !ok {
-		b.t.Fatalf("Can't find parent block at index: %v", parentNumber)
-	}
-	head := &evmtypes.Head{
-		Number:     parent.Number + 1,
-		Hash:       evmutils.NewHash(),
-		ParentHash: parent.Hash,
-		Parent:     parent,
-		Timestamp:  time.Unix(parent.Number+1, 0),
-		EVMChainID: ubig.New(&FixtureChainID),
-	}
-	return head
-}
-
-// Slice returns a slice of heads from number i to j. Set j < 0 for all remaining.
-func (b *Blocks) Slice(i, j int) []*evmtypes.Head {
-	b.t.Logf("Slicing heads from %v to %v...", i, j)
-
-	if j > 0 && j-i > len(b.Heads) {
-		b.t.Fatalf("invalid configuration: too few blocks %d for range length %d", len(b.Heads), j-i)
-	}
-	return b.slice(i, j)
-}
-
-func (b *Blocks) slice(i, j int) (heads []*evmtypes.Head) {
-	if j > 0 {
-		heads = make([]*evmtypes.Head, 0, j-i)
-	}
-	for n := i; j < 0 || n < j; n++ {
-		h, ok := b.Heads[int64(n)]
-		if !ok {
-			if j < 0 {
-				break // done
-			}
-			b.t.Fatalf("invalid configuration: block %d not found", n)
-		}
-		heads = append(heads, h)
-	}
-	return
-}
-
-func NewBlocks(t *testing.T, numHashes int) *Blocks {
-	hashes := make([]common.Hash, 0)
-	heads := make(map[int64]*evmtypes.Head)
-	for i := int64(0); i < int64(numHashes); i++ {
-		hash := evmutils.NewHash()
-		hashes = append(hashes, hash)
-
-		heads[i] = &evmtypes.Head{Hash: hash, Number: i, Timestamp: time.Unix(i, 0), EVMChainID: ubig.New(&FixtureChainID)}
-		if i > 0 {
-			parent := heads[i-1]
-			heads[i].Parent = parent
-			heads[i].ParentHash = parent.Hash
-		}
-	}
-
-	hashesMap := make(map[int64]common.Hash)
-	for i := 0; i < len(hashes); i++ {
-		hashesMap[int64(i)] = hashes[i]
-	}
-
-	return &Blocks{
-		t:       t,
-		Hashes:  hashes,
-		mHashes: hashesMap,
-		Heads:   heads,
-	}
-}
-
-// HeadBuffer - stores heads in sequence, with increasing timestamps
-type HeadBuffer struct {
-	t     *testing.T
-	Heads []*evmtypes.Head
-}
-
-func NewHeadBuffer(t *testing.T) *HeadBuffer {
-	return &HeadBuffer{
-		t:     t,
-		Heads: make([]*evmtypes.Head, 0),
-	}
-}
-
-func (hb *HeadBuffer) Append(head *evmtypes.Head) {
-	cloned := &evmtypes.Head{
-		Number:     head.Number,
-		Hash:       head.Hash,
-		ParentHash: head.ParentHash,
-		Parent:     head.Parent,
-		Timestamp:  time.Unix(int64(len(hb.Heads)), 0),
-		EVMChainID: head.EVMChainID,
-	}
-	hb.Heads = append(hb.Heads, cloned)
-}
-
-type HeadTrackableFunc func(context.Context, *evmtypes.Head)
-
-func (fn HeadTrackableFunc) OnNewLongestChain(ctx context.Context, head *evmtypes.Head) {
-	fn(ctx, head)
-}
-
-type testifyExpectationsAsserter interface {
-	AssertExpectations(t mock.TestingT) bool
-}
-
-type fakeT struct{}
-
-func (ft fakeT) Logf(format string, args ...interface{})   {}
-func (ft fakeT) Errorf(format string, args ...interface{}) {}
-func (ft fakeT) FailNow()                                  {}
-
-func EventuallyExpectationsMet(t *testing.T, mock testifyExpectationsAsserter, timeout time.Duration, interval time.Duration) {
-	t.Helper()
-
-	chTimeout := time.After(timeout)
-	for {
-		var ft fakeT
-		success := mock.AssertExpectations(ft)
-		if success {
-			return
-		}
-		select {
-		case <-chTimeout:
-			mock.AssertExpectations(t)
-			t.FailNow()
-		default:
-			time.Sleep(interval)
-		}
-	}
-}
-
-func AssertCount(t *testing.T, db *sqlx.DB, tableName string, expected int64) {
-	testutils.AssertCount(t, db, tableName, expected)
-}
-
-func WaitForCount(t *testing.T, db *sqlx.DB, tableName string, want int64) {
-	t.Helper()
-	g := gomega.NewWithT(t)
+	ctx := t.Context()
 	var count int64
 	var err error
-	g.Eventually(func() int64 {
-		err = db.Get(&count, fmt.Sprintf(`SELECT count(*) FROM %s;`, tableName))
+	require.Eventually(t, func() bool {
+		err = ds.GetContext(ctx, &count, fmt.Sprintf(`SELECT count(*) FROM %s;`, tableName))
 		assert.NoError(t, err)
-		return count
-	}, testutils.WaitTimeout(t), DBPollingInterval).Should(gomega.Equal(want))
+		return count == want
+	}, testutils.WaitTimeout(t), DBPollingInterval)
 }
 
-func AssertCountStays(t testing.TB, db *sqlx.DB, tableName string, want int64) {
+func AssertCountStays(t testing.TB, ds sqlutil.DataSource, tableName string, want int64) {
 	t.Helper()
+	ctx := t.Context()
 	g := gomega.NewWithT(t)
 	var count int64
 	var err error
 	g.Consistently(func() int64 {
-		err = db.Get(&count, fmt.Sprintf(`SELECT count(*) FROM %s`, tableName))
+		err = ds.GetContext(ctx, &count, "SELECT count(*) FROM "+tableName)
 		assert.NoError(t, err)
 		return count
 	}, AssertNoActionTimeout, DBPollingInterval).Should(gomega.Equal(want))
 }
 
-func AssertRecordEventually(t *testing.T, db *sqlx.DB, model interface{}, stmt string, check func() bool) {
+func AssertRecordEventually(t *testing.T, ds sqlutil.DataSource, model any, stmt string, check func() bool) {
 	t.Helper()
-	g := gomega.NewWithT(t)
-	g.Eventually(func() bool {
-		err := db.Get(model, stmt)
+	ctx := t.Context()
+	require.Eventually(t, func() bool {
+		err := ds.GetContext(ctx, model, stmt)
 		require.NoError(t, err, "unable to find record in DB")
 		return check()
-	}, testutils.WaitTimeout(t), DBPollingInterval).Should(gomega.BeTrue())
+	}, testutils.WaitTimeout(t), DBPollingInterval)
 }
 
 func MustWebURL(t *testing.T, s string) *models.WebURL {
@@ -1546,25 +1389,26 @@ func MustWebURL(t *testing.T, s string) *models.WebURL {
 	return (*models.WebURL)(uri)
 }
 
-func NewTestChainScopedConfig(t testing.TB) evmconfig.ChainScopedConfig {
-	cfg := configtest.NewGeneralConfig(t, nil)
-	return evmtest.NewChainScopedConfig(t, cfg)
-}
-
-func NewTestTxStore(t *testing.T, db *sqlx.DB, cfg pg.QConfig) txmgr.TestEvmTxStore {
-	return txmgr.NewTxStore(db, logger.TestLogger(t), cfg)
-}
-
 // ClearDBTables deletes all rows from the given tables
 func ClearDBTables(t *testing.T, db *sqlx.DB, tables ...string) {
 	tx, err := db.Beginx()
 	require.NoError(t, err)
 
 	for _, table := range tables {
-		_, err = tx.Exec(fmt.Sprintf("DELETE FROM %s", table))
+		_, err = tx.Exec("DELETE FROM " + table)
 		require.NoError(t, err)
 	}
 
 	err = tx.Commit()
 	require.NoError(t, err)
+}
+
+// sharedPeerFromPeer adapts a p2ptypes.Peer to a p2ptypes.SharedPeer for tests
+// that inject a peer wrapper; DON-based connection updates are a no-op.
+type sharedPeerFromPeer struct {
+	p2ptypes.Peer
+}
+
+func (s sharedPeerFromPeer) UpdateConnectionsByDONs(_ context.Context, _ []p2ptypes.DonPair, _ p2ptypes.StreamConfig) error {
+	return nil
 }

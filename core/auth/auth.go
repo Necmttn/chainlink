@@ -1,20 +1,25 @@
 package auth
 
 import (
+	"crypto/sha3"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"hash"
 
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
-
-	"github.com/pkg/errors"
-	"golang.org/x/crypto/sha3"
 )
 
 var (
-	// ErrorAuthFailed is a generic authentication failed - but not because of
+	// ErrAuthFailed is a generic authentication failed - but not because of
 	// some system failure on our behalf (i.e. HTTP 5xx), more detail is not
 	// given
-	ErrorAuthFailed = errors.New("Authentication failed")
+	ErrAuthFailed = errors.New("authentication failed")
+
+	// ErrorAuthFailed is retained for backward compatibility.
+	//
+	// Deprecated: use ErrAuthFailed instead.
+	ErrorAuthFailed = ErrAuthFailed //nolint:errname // backward compatibility
 )
 
 // Token is used for API authentication.
@@ -48,16 +53,16 @@ func NewToken() *Token {
 }
 
 func hashInput(ta *Token, salt string) []byte {
-	return []byte(fmt.Sprintf("v0-%s-%s-%s", ta.AccessKey, ta.Secret, salt))
+	return fmt.Appendf(nil, "v0-%s-%s-%s", ta.AccessKey, ta.Secret, salt)
 }
 
 // HashedSecret generates a hashed password for an external initiator
 // authentication
 func HashedSecret(ta *Token, salt string) (string, error) {
-	hasher := sha3.New256()
+	hasher := hash.Hash(sha3.New256())
 	_, err := hasher.Write(hashInput(ta, salt))
 	if err != nil {
-		return "", errors.Wrap(err, "error writing external initiator authentication to hasher")
+		return "", fmt.Errorf("error writing external initiator authentication to hasher: %w", err)
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }

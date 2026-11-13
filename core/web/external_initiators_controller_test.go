@@ -3,41 +3,25 @@ package web_test
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"net/http"
+	"strconv"
 	"testing"
-
-	"github.com/smartcontractkit/chainlink/v2/core/bridges"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
-	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
-	"github.com/smartcontractkit/chainlink/v2/core/web"
-	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 
 	"github.com/manyminds/api2go/jsonapi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink/v2/core/bridges"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
+	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/v2/core/web"
+	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 )
 
 func TestValidateExternalInitiator(t *testing.T) {
 	t.Parallel()
-
-	db := pgtest.NewSqlxDB(t)
-	cfg := pgtest.NewQConfig(true)
-	orm := bridges.NewORM(db, logger.TestLogger(t), cfg)
-
-	url := cltest.WebURL(t, "https://a.web.url")
-
-	//  Add duplicate
-	exi := bridges.ExternalInitiator{
-		Name: "duplicate",
-		URL:  &url,
-	}
-
-	assert.NoError(t, orm.CreateExternalInitiator(&exi))
 
 	tests := []struct {
 		name      string
@@ -55,10 +39,21 @@ func TestValidateExternalInitiator(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			var exr bridges.ExternalInitiatorRequest
+			t.Parallel()
+			ctx := t.Context()
+			db := pgtest.NewSqlxDB(t)
+			orm := bridges.NewORM(db)
 
-			assert.NoError(t, json.Unmarshal([]byte(test.input), &exr))
-			result := web.ValidateExternalInitiator(&exr, orm)
+			url := cltest.WebURL(t, "https://a.web.url")
+			exi := bridges.ExternalInitiator{
+				Name: "duplicate",
+				URL:  &url,
+			}
+			require.NoError(t, orm.CreateExternalInitiator(ctx, &exi))
+
+			var exr bridges.ExternalInitiatorRequest
+			require.NoError(t, json.Unmarshal([]byte(test.input), &exr))
+			result := web.ValidateExternalInitiator(ctx, &exr, orm)
 
 			cltest.AssertError(t, test.wantError, result)
 		})
@@ -70,14 +65,14 @@ func TestExternalInitiatorsController_Index(t *testing.T) {
 
 	app := cltest.NewApplicationWithConfig(t,
 		configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-			c.JobPipeline.ExternalInitiatorsEnabled = ptr(true)
+			c.JobPipeline.ExternalInitiatorsEnabled = new(true)
 		}))
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	client := app.NewHTTPClient(nil)
 
-	db := app.GetSqlxDB()
-	borm := bridges.NewORM(db, logger.TestLogger(t), app.GetConfig().Database())
+	db := app.GetDB()
+	borm := bridges.NewORM(db)
 
 	eiFoo := cltest.MustInsertExternalInitiatorWithOpts(t, borm, cltest.ExternalInitiatorOpts{
 		NamePrefix:    "foo",
@@ -102,12 +97,12 @@ func TestExternalInitiatorsController_Index(t *testing.T) {
 	var links jsonapi.Links
 	var eis []presenters.ExternalInitiatorResource
 	err = web.ParsePaginatedResponse(body, &eis, &links)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.NotEmpty(t, links["next"].Href)
 	assert.Empty(t, links["prev"].Href)
 
 	assert.Len(t, eis, 1)
-	assert.Equal(t, fmt.Sprintf("%d", eiBar.ID), eis[0].ID)
+	assert.Equal(t, strconv.FormatInt(eiBar.ID, 10), eis[0].ID)
 	assert.Equal(t, eiBar.Name, eis[0].Name)
 	assert.Nil(t, eis[0].URL)
 	assert.Equal(t, eiBar.AccessKey, eis[0].AccessKey)
@@ -119,12 +114,12 @@ func TestExternalInitiatorsController_Index(t *testing.T) {
 
 	eis = []presenters.ExternalInitiatorResource{}
 	err = web.ParsePaginatedResponse(cltest.ParseResponseBody(t, resp), &eis, &links)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Empty(t, links["next"])
 	assert.NotEmpty(t, links["prev"])
 
 	assert.Len(t, eis, 1)
-	assert.Equal(t, fmt.Sprintf("%d", eiFoo.ID), eis[0].ID)
+	assert.Equal(t, strconv.FormatInt(eiFoo.ID, 10), eis[0].ID)
 	assert.Equal(t, eiFoo.Name, eis[0].Name)
 	assert.Equal(t, eiFoo.URL.String(), eis[0].URL.String())
 	assert.Equal(t, eiFoo.AccessKey, eis[0].AccessKey)
@@ -136,9 +131,9 @@ func TestExternalInitiatorsController_Create_success(t *testing.T) {
 
 	app := cltest.NewApplicationWithConfig(t,
 		configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-			c.JobPipeline.ExternalInitiatorsEnabled = ptr(true)
+			c.JobPipeline.ExternalInitiatorsEnabled = new(true)
 		}))
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	client := app.NewHTTPClient(nil)
 
@@ -148,8 +143,7 @@ func TestExternalInitiatorsController_Create_success(t *testing.T) {
 	t.Cleanup(cleanup)
 	cltest.AssertServerResponse(t, resp, http.StatusCreated)
 	ei := &presenters.ExternalInitiatorAuthentication{}
-	err := cltest.ParseJSONAPIResponse(t, resp, ei)
-	require.NoError(t, err)
+	cltest.ParseJSONAPIResponse(t, resp, ei)
 
 	assert.Equal(t, "bitcoin", ei.Name)
 	assert.Equal(t, "http://without.a.name", ei.URL.String())
@@ -164,9 +158,9 @@ func TestExternalInitiatorsController_Create_without_URL(t *testing.T) {
 
 	app := cltest.NewApplicationWithConfig(t,
 		configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-			c.JobPipeline.ExternalInitiatorsEnabled = ptr(true)
+			c.JobPipeline.ExternalInitiatorsEnabled = new(true)
 		}))
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	client := app.NewHTTPClient(nil)
 
@@ -176,11 +170,10 @@ func TestExternalInitiatorsController_Create_without_URL(t *testing.T) {
 	t.Cleanup(cleanup)
 	cltest.AssertServerResponse(t, resp, 201)
 	ei := &presenters.ExternalInitiatorAuthentication{}
-	err := cltest.ParseJSONAPIResponse(t, resp, ei)
-	require.NoError(t, err)
+	cltest.ParseJSONAPIResponse(t, resp, ei)
 
 	assert.Equal(t, "no-url", ei.Name)
-	assert.Equal(t, "", ei.URL.String())
+	assert.Empty(t, ei.URL.String())
 	assert.NotEmpty(t, ei.AccessKey)
 	assert.NotEmpty(t, ei.Secret)
 	assert.NotEmpty(t, ei.OutgoingToken)
@@ -192,9 +185,9 @@ func TestExternalInitiatorsController_Create_invalid(t *testing.T) {
 
 	app := cltest.NewApplicationWithConfig(t,
 		configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-			c.JobPipeline.ExternalInitiatorsEnabled = ptr(true)
+			c.JobPipeline.ExternalInitiatorsEnabled = new(true)
 		}))
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	client := app.NewHTTPClient(nil)
 
@@ -210,14 +203,14 @@ func TestExternalInitiatorsController_Delete(t *testing.T) {
 
 	app := cltest.NewApplicationWithConfig(t,
 		configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-			c.JobPipeline.ExternalInitiatorsEnabled = ptr(true)
+			c.JobPipeline.ExternalInitiatorsEnabled = new(true)
 		}))
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	exi := bridges.ExternalInitiator{
 		Name: "abracadabra",
 	}
-	err := app.BridgeORM().CreateExternalInitiator(&exi)
+	err := app.BridgeORM().CreateExternalInitiator(t.Context(), &exi)
 	require.NoError(t, err)
 
 	client := app.NewHTTPClient(nil)
@@ -232,9 +225,9 @@ func TestExternalInitiatorsController_DeleteNotFound(t *testing.T) {
 
 	app := cltest.NewApplicationWithConfig(t,
 		configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-			c.JobPipeline.ExternalInitiatorsEnabled = ptr(true)
+			c.JobPipeline.ExternalInitiatorsEnabled = new(true)
 		}))
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	client := app.NewHTTPClient(nil)
 
@@ -254,6 +247,7 @@ func TestExternalInitiatorsController_DeleteNotFound(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.Name, func(t *testing.T) {
+			t.Parallel()
 			resp, cleanup := client.Delete(test.URL)
 			t.Cleanup(cleanup)
 			assert.Equal(t, http.StatusText(http.StatusNotFound), http.StatusText(resp.StatusCode))

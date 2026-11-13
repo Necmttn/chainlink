@@ -2,22 +2,32 @@ package feeds
 
 import (
 	"context"
+	"fmt"
+	"math"
 
 	"github.com/google/uuid"
 
-	pb "github.com/smartcontractkit/chainlink/v2/core/services/feeds/proto"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	pb "github.com/smartcontractkit/chainlink-protos/orchestrator/feedsmanager"
+)
+
+const (
+	MaxJobRunsLimit     = 100
+	DefaultJobRunsLimit = 50
 )
 
 // RPCHandlers define handlers for RPC method calls from the Feeds Manager
 type RPCHandlers struct {
 	svc            Service
 	feedsManagerID int64
+	lggr           logger.SugaredLogger
 }
 
-func NewRPCHandlers(svc Service, feedsManagerID int64) *RPCHandlers {
+func NewRPCHandlers(svc Service, feedsManagerID int64, lggr logger.Logger) *RPCHandlers {
 	return &RPCHandlers{
 		svc:            svc,
 		feedsManagerID: feedsManagerID,
+		lggr:           logger.Sugared(lggr).Named("RPCHandlers"),
 	}
 }
 
@@ -28,11 +38,16 @@ func (h *RPCHandlers) ProposeJob(ctx context.Context, req *pb.ProposeJobRequest)
 		return nil, err
 	}
 
+	version := req.GetVersion()
+	if version > math.MaxInt32 || version < math.MinInt32 {
+		return nil, fmt.Errorf("job proposal version %d is out of int32 range", version)
+	}
+
 	_, err = h.svc.ProposeJob(ctx, &ProposeJobArgs{
 		Spec:           req.GetSpec(),
 		FeedsManagerID: h.feedsManagerID,
 		RemoteUUID:     remoteUUID,
-		Version:        int32(req.GetVersion()),
+		Version:        int32(version),
 		Multiaddrs:     req.GetMultiaddrs(),
 	})
 	if err != nil {
@@ -76,4 +91,34 @@ func (h *RPCHandlers) RevokeJob(ctx context.Context, req *pb.RevokeJobRequest) (
 	}
 
 	return &pb.RevokeJobResponse{}, nil
+}
+
+// GetJobRuns fetches job run history for the specified job proposal
+func (h *RPCHandlers) GetJobRuns(ctx context.Context, req *pb.GetJobRunsRequest) (*pb.GetJobRunsResponse, error) {
+	remoteUUID, err := uuid.Parse(req.Id)
+	limit := req.Limit
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse request id (%s): %w", req.Id, err)
+	}
+
+	if limit == 0 || limit > MaxJobRunsLimit {
+		h.lggr.Warnw("Invalid limit provided, using default",
+			"requestedLimit", limit,
+			"defaultLimit", DefaultJobRunsLimit,
+		)
+		limit = DefaultJobRunsLimit
+	}
+
+	summaries, err := h.svc.GetJobRuns(ctx, &GetJobRunsArgs{
+		FeedsManagerID: h.feedsManagerID,
+		RemoteUUID:     remoteUUID,
+		Limit:          limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get job runs: %w", err)
+	}
+
+	return &pb.GetJobRunsResponse{
+		Runs: summaries,
+	}, nil
 }

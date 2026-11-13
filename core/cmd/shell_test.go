@@ -16,29 +16,31 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/smartcontractkit/chainlink-solana/pkg/solana"
-	solcfg "github.com/smartcontractkit/chainlink-solana/pkg/solana/config"
-	"github.com/smartcontractkit/chainlink-starknet/relayer/pkg/chainlink/config"
-	stkcfg "github.com/smartcontractkit/chainlink-starknet/relayer/pkg/chainlink/config"
+	"github.com/smartcontractkit/chainlink-common/pkg/beholder"
+	"github.com/smartcontractkit/chainlink-common/pkg/beholder/beholdertest"
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	commonevents "github.com/smartcontractkit/chainlink-protos/workflows/go/common"
 	"github.com/smartcontractkit/chainlink/v2/core/cmd"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/logger/audit"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/mocks"
 	"github.com/smartcontractkit/chainlink/v2/core/sessions"
 	"github.com/smartcontractkit/chainlink/v2/core/sessions/localauth"
+	"github.com/smartcontractkit/chainlink/v2/core/static"
 	"github.com/smartcontractkit/chainlink/v2/plugins"
 )
 
 func TestTerminalCookieAuthenticator_AuthenticateWithoutSession(t *testing.T) {
 	t.Parallel()
 
-	ctx := testutils.Context(t)
+	ctx := t.Context()
 	app := cltest.NewApplicationEVMDisabled(t)
 	u := cltest.NewUserWithSession(t, app.AuthenticationProvider())
 
@@ -57,10 +59,10 @@ func TestTerminalCookieAuthenticator_AuthenticateWithoutSession(t *testing.T) {
 			tca := cmd.NewSessionCookieAuthenticator(cmd.ClientOpts{}, store, logger.TestLogger(t))
 			cookie, err := tca.Authenticate(ctx, sr)
 
-			assert.Error(t, err)
+			require.Error(t, err)
 			assert.Nil(t, cookie)
 			cookie, err = store.Retrieve()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Nil(t, cookie)
 		})
 	}
@@ -69,7 +71,7 @@ func TestTerminalCookieAuthenticator_AuthenticateWithoutSession(t *testing.T) {
 func TestTerminalCookieAuthenticator_AuthenticateWithSession(t *testing.T) {
 	t.Parallel()
 
-	ctx := testutils.Context(t)
+	ctx := t.Context()
 	app := cltest.NewApplicationEVMDisabled(t)
 	require.NoError(t, app.Start(ctx))
 
@@ -92,18 +94,18 @@ func TestTerminalCookieAuthenticator_AuthenticateWithSession(t *testing.T) {
 			cookie, err := tca.Authenticate(ctx, sr)
 
 			if test.wantError {
-				assert.Error(t, err)
+				require.Error(t, err)
 				assert.Nil(t, cookie)
 
 				cookie, err = store.Retrieve()
-				assert.NoError(t, err)
+				require.NoError(t, err)
 				assert.Nil(t, cookie)
 			} else {
-				assert.NoError(t, err)
+				require.NoError(t, err)
 				assert.NotNil(t, cookie)
 
 				retrievedCookie, err := store.Retrieve()
-				assert.NoError(t, err)
+				require.NoError(t, err)
 				assert.Equal(t, cookie, retrievedCookie)
 			}
 		})
@@ -124,7 +126,7 @@ func TestDiskCookieStore_Retrieve(t *testing.T) {
 	t.Run("missing cookie file", func(t *testing.T) {
 		store := cmd.DiskCookieStore{Config: cfg}
 		cookie, err := store.Retrieve()
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Nil(t, cookie)
 	})
 
@@ -132,7 +134,7 @@ func TestDiskCookieStore_Retrieve(t *testing.T) {
 		cfg.rootdir = "../internal/fixtures/badcookie"
 		store := cmd.DiskCookieStore{Config: cfg}
 		cookie, err := store.Retrieve()
-		assert.Error(t, err)
+		require.Error(t, err)
 		assert.Nil(t, cookie)
 	})
 
@@ -140,7 +142,7 @@ func TestDiskCookieStore_Retrieve(t *testing.T) {
 		cfg.rootdir = "../internal/fixtures"
 		store := cmd.DiskCookieStore{Config: cfg}
 		cookie, err := store.Retrieve()
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.NotNil(t, cookie)
 	})
 }
@@ -161,9 +163,10 @@ func TestTerminalAPIInitializer_InitializeWithoutAPIUser(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			ctx := t.Context()
 			db := pgtest.NewSqlxDB(t)
 			lggr := logger.TestLogger(t)
-			orm := localauth.NewORM(db, time.Minute, lggr, pgtest.NewQConfig(true), audit.NoopLogger)
+			orm := localauth.NewORM(db, time.Minute, lggr, audit.NoopLogger)
 
 			mock := &cltest.MockCountingPrompter{T: t, EnteredStrings: test.enteredStrings, NotTerminal: !test.isTerminal}
 			tai := cmd.NewPromptingAPIInitializer(mock)
@@ -173,15 +176,15 @@ func TestTerminalAPIInitializer_InitializeWithoutAPIUser(t *testing.T) {
 			// create/run with a new admin user
 			pgtest.MustExec(t, db, "DELETE FROM users;")
 
-			user, err := tai.Initialize(orm, lggr)
+			user, err := tai.Initialize(ctx, orm, lggr)
 			if test.isError {
 				assert.Error(t, err)
 			} else {
-				assert.NoError(t, err)
+				require.NoError(t, err)
 				assert.Equal(t, len(test.enteredStrings), mock.Count)
 
-				persistedUser, err := orm.FindUser(email)
-				assert.NoError(t, err)
+				persistedUser, err := orm.FindUser(ctx, email)
+				require.NoError(t, err)
 
 				assert.Equal(t, user.Email, persistedUser.Email)
 				assert.Equal(t, user.HashedPassword, persistedUser.HashedPassword)
@@ -191,10 +194,10 @@ func TestTerminalAPIInitializer_InitializeWithoutAPIUser(t *testing.T) {
 }
 
 func TestTerminalAPIInitializer_InitializeWithExistingAPIUser(t *testing.T) {
+	ctx := t.Context()
 	db := pgtest.NewSqlxDB(t)
-	cfg := configtest.NewGeneralConfig(t, nil)
 	lggr := logger.TestLogger(t)
-	orm := localauth.NewORM(db, time.Minute, lggr, cfg.Database(), audit.NoopLogger)
+	orm := localauth.NewORM(db, time.Minute, lggr, audit.NoopLogger)
 
 	// Clear out fixture users/users created from the other test cases
 	// This asserts that on initial run with an empty users table that the credentials file will instantiate and
@@ -203,14 +206,14 @@ func TestTerminalAPIInitializer_InitializeWithExistingAPIUser(t *testing.T) {
 	require.NoError(t, err)
 
 	initialUser := cltest.MustRandomUser(t)
-	require.NoError(t, orm.CreateUser(&initialUser))
+	require.NoError(t, orm.CreateUser(ctx, &initialUser))
 
 	mock := &cltest.MockCountingPrompter{T: t}
 	tai := cmd.NewPromptingAPIInitializer(mock)
 
 	// If there is an existing user, and we are in the Terminal prompt, no input prompts required
-	user, err := tai.Initialize(orm, lggr)
-	assert.NoError(t, err)
+	user, err := tai.Initialize(ctx, orm, lggr)
+	require.NoError(t, err)
 	assert.Equal(t, 0, mock.Count)
 
 	assert.Equal(t, initialUser.Email, user.Email)
@@ -229,9 +232,10 @@ func TestFileAPIInitializer_InitializeWithoutAPIUser(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			ctx := t.Context()
 			db := pgtest.NewSqlxDB(t)
 			lggr := logger.TestLogger(t)
-			orm := localauth.NewORM(db, time.Minute, lggr, pgtest.NewQConfig(true), audit.NoopLogger)
+			orm := localauth.NewORM(db, time.Minute, lggr, audit.NoopLogger)
 
 			// Clear out fixture users/users created from the other test cases
 			// This asserts that on initial run with an empty users table that the credentials file will instantiate and
@@ -239,14 +243,14 @@ func TestFileAPIInitializer_InitializeWithoutAPIUser(t *testing.T) {
 			pgtest.MustExec(t, db, "DELETE FROM users;")
 
 			tfi := cmd.NewFileAPIInitializer(test.file)
-			user, err := tfi.Initialize(orm, lggr)
+			user, err := tfi.Initialize(ctx, orm, lggr)
 			if test.wantError {
 				assert.Error(t, err)
 			} else {
-				assert.NoError(t, err)
+				require.NoError(t, err)
 				assert.Equal(t, cltest.APIEmailAdmin, user.Email)
-				persistedUser, err := orm.FindUser(user.Email)
-				assert.NoError(t, err)
+				persistedUser, err := orm.FindUser(ctx, user.Email)
+				require.NoError(t, err)
 				assert.Equal(t, persistedUser.Email, user.Email)
 			}
 		})
@@ -255,8 +259,7 @@ func TestFileAPIInitializer_InitializeWithoutAPIUser(t *testing.T) {
 
 func TestFileAPIInitializer_InitializeWithExistingAPIUser(t *testing.T) {
 	db := pgtest.NewSqlxDB(t)
-	cfg := configtest.NewGeneralConfig(t, nil)
-	orm := localauth.NewORM(db, time.Minute, logger.TestLogger(t), cfg.Database(), audit.NoopLogger)
+	orm := localauth.NewORM(db, time.Minute, logger.TestLogger(t), audit.NoopLogger)
 
 	tests := []struct {
 		name      string
@@ -269,13 +272,14 @@ func TestFileAPIInitializer_InitializeWithExistingAPIUser(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			ctx := t.Context()
 			lggr := logger.TestLogger(t)
 			tfi := cmd.NewFileAPIInitializer(test.file)
-			user, err := tfi.Initialize(orm, lggr)
+			user, err := tfi.Initialize(ctx, orm, lggr)
 			if test.wantError {
 				assert.Error(t, err)
 			} else {
-				assert.NoError(t, err)
+				require.NoError(t, err)
 				assert.Equal(t, cltest.APIEmailAdmin, user.Email)
 			}
 		})
@@ -332,7 +336,6 @@ func TestFileSessionRequestBuilder(t *testing.T) {
 }
 
 func TestNewUserCache(t *testing.T) {
-
 	r, err := rand.Int(rand.Reader, big.NewInt(256*1024*1024))
 	require.NoError(t, err)
 	// NewUserCache owns it's Dir.
@@ -347,46 +350,39 @@ func TestNewUserCache(t *testing.T) {
 	}()
 
 	assert.DirExists(t, c.RootDir())
-
 }
 
 func TestSetupSolanaRelayer(t *testing.T) {
 	lggr := logger.TestLogger(t)
-	reg := plugins.NewLoopRegistry(lggr, nil)
-	ks := mocks.NewSolana(t)
+	reg := plugins.NewTestLoopRegistry(lggr)
+	ks := &keystore.SolanaLooppSigner{Solana: mocks.NewSolana(t)}
+	ksCSA := &keystore.CSASigner{CSA: mocks.NewCSA(t)}
 
 	// config 3 chains but only enable 2 => should only be 2 relayer
 	nEnabledChains := 2
+
 	tConfig := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-		c.Solana = solana.TOMLConfigs{
-			&solana.TOMLConfig{
-				ChainID: ptr[string]("solana-id-1"),
-				Enabled: ptr(true),
-				Chain:   solcfg.Chain{},
-				Nodes:   []*solcfg.Node{},
+		c.Solana = chainlink.RawConfigs{
+			{
+				"ChainID": "solana-id-1",
+				"Enabled": true,
 			},
-			&solana.TOMLConfig{
-				ChainID: ptr[string]("solana-id-2"),
-				Enabled: ptr(true),
-				Chain:   solcfg.Chain{},
-				Nodes:   []*solcfg.Node{},
+			{
+				"ChainID": "solana-id-2",
+				"Enabled": true,
 			},
-			&solana.TOMLConfig{
-				ChainID: ptr[string]("disabled-solana-id-1"),
-				Enabled: ptr(false),
-				Chain:   solcfg.Chain{},
-				Nodes:   []*solcfg.Node{},
+			{
+				"ChainID": "disabled-solana-id-1",
+				"Enabled": false,
 			},
 		}
 	})
 
 	t2Config := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-		c.Solana = solana.TOMLConfigs{
-			&solana.TOMLConfig{
-				ChainID: ptr[string]("solana-id-1"),
-				Enabled: ptr(true),
-				Chain:   solcfg.Chain{},
-				Nodes:   []*solcfg.Node{},
+		c.Solana = chainlink.RawConfigs{
+			{
+				"ChainID": "solana-id-1",
+				"Enabled": true,
 			},
 		}
 	})
@@ -396,20 +392,10 @@ func TestSetupSolanaRelayer(t *testing.T) {
 		LoopRegistry: reg,
 	}
 
-	// not parallel; shared state
-	t.Run("no plugin", func(t *testing.T) {
-		relayers, err := rf.NewSolana(ks, tConfig.SolanaConfigs())
-		require.NoError(t, err)
-		require.NotNil(t, relayers)
-		require.Len(t, relayers, nEnabledChains)
-		// no using plugin, so registry should be empty
-		require.Len(t, reg.List(), 0)
-	})
-
 	t.Run("plugin", func(t *testing.T) {
 		t.Setenv("CL_SOLANA_CMD", "phony_solana_cmd")
 
-		relayers, err := rf.NewSolana(ks, tConfig.SolanaConfigs())
+		relayers, err := rf.NewSolana(ks, ksCSA, tConfig.SolanaConfigs())
 		require.NoError(t, err)
 		require.NotNil(t, relayers)
 		require.Len(t, relayers, nEnabledChains)
@@ -419,31 +405,21 @@ func TestSetupSolanaRelayer(t *testing.T) {
 
 	// test that duplicate enabled chains is an error when
 	duplicateConfig := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-		c.Solana = solana.TOMLConfigs{
-			&solana.TOMLConfig{
-				ChainID: ptr[string]("dupe"),
-				Enabled: ptr(true),
-				Chain:   solcfg.Chain{},
-				Nodes:   []*solcfg.Node{},
+		c.Solana = chainlink.RawConfigs{
+			{
+				"ChainID": "dupe",
+				"Enabled": true,
 			},
-			&solana.TOMLConfig{
-				ChainID: ptr[string]("dupe"),
-				Enabled: ptr(true),
-				Chain:   solcfg.Chain{},
-				Nodes:   []*solcfg.Node{},
+			{
+				"ChainID": "dupe",
+				"Enabled": true,
 			},
 		}
 	})
 
-	// not parallel; shared state
-	t.Run("no plugin, duplicate chains", func(t *testing.T) {
-		_, err := rf.NewSolana(ks, duplicateConfig.SolanaConfigs())
-		require.Error(t, err)
-	})
-
 	t.Run("plugin, duplicate chains", func(t *testing.T) {
 		t.Setenv("CL_SOLANA_CMD", "phony_solana_cmd")
-		_, err := rf.NewSolana(ks, duplicateConfig.SolanaConfigs())
+		_, err := rf.NewSolana(ks, ksCSA, duplicateConfig.SolanaConfigs())
 		require.Error(t, err)
 	})
 
@@ -451,56 +427,53 @@ func TestSetupSolanaRelayer(t *testing.T) {
 		t.Setenv("CL_SOLANA_CMD", "phony_solana_cmd")
 		t.Setenv("CL_SOLANA_ENV", "fake_path")
 
-		_, err := rf.NewSolana(ks, t2Config.SolanaConfigs())
+		_, err := rf.NewSolana(ks, ksCSA, t2Config.SolanaConfigs())
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "failed to parse Solana env file")
+		require.Contains(t, err.Error(), "failed to parse env file")
 	})
 
 	t.Run("plugin already registered", func(t *testing.T) {
 		t.Setenv("CL_SOLANA_CMD", "phony_solana_cmd")
 
-		_, err := rf.NewSolana(ks, tConfig.SolanaConfigs())
+		_, err := rf.NewSolana(ks, ksCSA, tConfig.SolanaConfigs())
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "failed to create Solana LOOP command")
+		require.Contains(t, err.Error(), "failed to create LOOP command")
 	})
 }
 
 func TestSetupStarkNetRelayer(t *testing.T) {
 	lggr := logger.TestLogger(t)
-	reg := plugins.NewLoopRegistry(lggr, nil)
-	ks := mocks.NewStarkNet(t)
+	reg := plugins.NewTestLoopRegistry(lggr)
+	ks := &keystore.StarknetLooppSigner{StarkNet: mocks.NewStarkNet(t)}
+	ksCSA := &keystore.CSASigner{CSA: mocks.NewCSA(t)}
 	// config 3 chains but only enable 2 => should only be 2 relayer
 	nEnabledChains := 2
 	tConfig := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-		c.Starknet = stkcfg.TOMLConfigs{
-			&stkcfg.TOMLConfig{
-				ChainID: ptr[string]("starknet-id-1"),
-				Enabled: ptr(true),
-				Chain:   stkcfg.Chain{},
-				Nodes:   []*config.Node{},
+		c.Starknet = chainlink.RawConfigs{
+			{
+				"ChainID":   "starknet-id-1",
+				"Enabled":   true,
+				"FeederURL": commonconfig.MustParseURL("https://feeder.url"),
 			},
-			&stkcfg.TOMLConfig{
-				ChainID: ptr[string]("starknet-id-2"),
-				Enabled: ptr(true),
-				Chain:   stkcfg.Chain{},
-				Nodes:   []*config.Node{},
+			{
+				"ChainID":   "starknet-id-2",
+				"Enabled":   true,
+				"FeederURL": commonconfig.MustParseURL("https://feeder.url"),
 			},
-			&stkcfg.TOMLConfig{
-				ChainID: ptr[string]("disabled-starknet-id-1"),
-				Enabled: ptr(false),
-				Chain:   stkcfg.Chain{},
-				Nodes:   []*config.Node{},
+			{
+				"ChainID":   "disabled-starknet-id-1",
+				"Enabled":   new(false),
+				"FeederURL": commonconfig.MustParseURL("https://feeder.url"),
 			},
 		}
 	})
 
 	t2Config := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-		c.Starknet = stkcfg.TOMLConfigs{
-			&stkcfg.TOMLConfig{
-				ChainID: ptr[string]("starknet-id-3"),
-				Enabled: ptr(true),
-				Chain:   stkcfg.Chain{},
-				Nodes:   []*config.Node{},
+		c.Starknet = chainlink.RawConfigs{
+			{
+				"ChainID":   "starknet-id-3",
+				"Enabled":   true,
+				"FeederURL": commonconfig.MustParseURL("https://feeder.url"),
 			},
 		}
 	})
@@ -509,20 +482,10 @@ func TestSetupStarkNetRelayer(t *testing.T) {
 		LoopRegistry: reg,
 	}
 
-	// not parallel; shared state
-	t.Run("no plugin", func(t *testing.T) {
-		relayers, err := rf.NewStarkNet(ks, tConfig.StarknetConfigs())
-		require.NoError(t, err)
-		require.NotNil(t, relayers)
-		require.Len(t, relayers, nEnabledChains)
-		// no using plugin, so registry should be empty
-		require.Len(t, reg.List(), 0)
-	})
-
-	t.Run("plugin", func(t *testing.T) {
+	t.Run("plugin-cmd", func(t *testing.T) {
 		t.Setenv("CL_STARKNET_CMD", "phony_starknet_cmd")
 
-		relayers, err := rf.NewStarkNet(ks, tConfig.StarknetConfigs())
+		relayers, err := rf.NewStarkNet(ks, ksCSA, tConfig.StarknetConfigs())
 		require.NoError(t, err)
 		require.NotNil(t, relayers)
 		require.Len(t, relayers, nEnabledChains)
@@ -532,31 +495,29 @@ func TestSetupStarkNetRelayer(t *testing.T) {
 
 	// test that duplicate enabled chains is an error when
 	duplicateConfig := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-		c.Starknet = stkcfg.TOMLConfigs{
-			&stkcfg.TOMLConfig{
-				ChainID: ptr[string]("dupe"),
-				Enabled: ptr(true),
-				Chain:   stkcfg.Chain{},
-				Nodes:   []*config.Node{},
+		c.Starknet = chainlink.RawConfigs{
+			{
+				"ChainID":   "dupe",
+				"Enabled":   true,
+				"FeederURL": commonconfig.MustParseURL("https://feeder.url"),
 			},
-			&stkcfg.TOMLConfig{
-				ChainID: ptr[string]("dupe"),
-				Enabled: ptr(true),
-				Chain:   stkcfg.Chain{},
-				Nodes:   []*config.Node{},
+			{
+				"ChainID":   "dupe",
+				"Enabled":   true,
+				"FeederURL": commonconfig.MustParseURL("https://feeder.url"),
 			},
 		}
 	})
 
 	// not parallel; shared state
 	t.Run("no plugin, duplicate chains", func(t *testing.T) {
-		_, err := rf.NewStarkNet(ks, duplicateConfig.StarknetConfigs())
+		_, err := rf.NewStarkNet(ks, ksCSA, duplicateConfig.StarknetConfigs())
 		require.Error(t, err)
 	})
 
 	t.Run("plugin, duplicate chains", func(t *testing.T) {
 		t.Setenv("CL_STARKNET_CMD", "phony_starknet_cmd")
-		_, err := rf.NewStarkNet(ks, duplicateConfig.StarknetConfigs())
+		_, err := rf.NewStarkNet(ks, ksCSA, duplicateConfig.StarknetConfigs())
 		require.Error(t, err)
 	})
 
@@ -564,23 +525,23 @@ func TestSetupStarkNetRelayer(t *testing.T) {
 		t.Setenv("CL_STARKNET_CMD", "phony_starknet_cmd")
 		t.Setenv("CL_STARKNET_ENV", "fake_path")
 
-		_, err := rf.NewStarkNet(ks, t2Config.StarknetConfigs())
+		_, err := rf.NewStarkNet(ks, ksCSA, t2Config.StarknetConfigs())
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "failed to parse Starknet env file")
+		require.ErrorContains(t, err, "failed to parse env file")
 	})
 
 	t.Run("plugin already registered", func(t *testing.T) {
 		t.Setenv("CL_STARKNET_CMD", "phony_starknet_cmd")
 
-		_, err := rf.NewStarkNet(ks, tConfig.StarknetConfigs())
+		_, err := rf.NewStarkNet(ks, ksCSA, tConfig.StarknetConfigs())
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "failed to create StarkNet LOOP command")
+		require.ErrorContains(t, err, "failed to create LOOP command")
 	})
 }
 
 // flagSetApplyFromAction applies the flags from action to the flagSet.
 // `parentCommand` will filter the app commands and only applies the flags if the command/subcommand has a parent with that name, if left empty no filtering is done
-func flagSetApplyFromAction(action interface{}, flagSet *flag.FlagSet, parentCommand string) {
+func flagSetApplyFromAction(action any, flagSet *flag.FlagSet, parentCommand string) {
 	cliApp := cmd.Shell{}
 	app := cmd.NewApp(&cliApp)
 
@@ -594,11 +555,9 @@ func flagSetApplyFromAction(action interface{}, flagSet *flag.FlagSet, parentCom
 			flag.Apply(flagSet)
 		}
 	}
-
 }
 
 func recursiveFindFlagsWithName(actionFuncName string, command cli.Command, parent string, foundName bool) []cli.Flag {
-
 	if command.Action != nil {
 		if actionFuncName == getFuncName(command.Action) && foundName {
 			return command.Flags
@@ -618,6 +577,49 @@ func recursiveFindFlagsWithName(actionFuncName string, command cli.Command, pare
 	return nil
 }
 
-func getFuncName(i interface{}) string {
+func getFuncName(i any) string {
 	return runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name()
+}
+
+func TestShell_emitNodeConfig(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	lggr := logger.TestLogger(t)
+
+	gcfg := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
+		// use defaults
+	})
+
+	rec := beholdertest.NewRecorder()
+	shell := &cmd.Shell{
+		Config:         gcfg,
+		Logger:         lggr,
+		BeholderClient: &beholder.Client{Emitter: rec},
+	}
+
+	shell.EmitNodeConfig(ctx)
+
+	// Verify that a BaseMessage was emitted
+	msgs := rec.Messages(t, "beholder_entity", "BaseMessage")
+	require.Len(t, msgs, 1, "Expected exactly one BaseMessage to be emitted")
+
+	// Verify the message content
+	msg := msgs[0]
+	require.Equal(t, "BaseMessage", msg.Attrs["beholder_entity"])
+
+	// Unmarshal the BaseMessage
+	var baseMsg commonevents.BaseMessage
+	require.NoError(t, proto.Unmarshal(msg.Body, &baseMsg))
+
+	// Verify the message contains TOML configuration
+	require.NotEmpty(t, baseMsg.Msg, "BaseMessage should contain configuration")
+	require.Contains(t, baseMsg.Msg, "[Log]", "Configuration should contain Log section")
+	require.Contains(t, baseMsg.Msg, "[Database]", "Configuration should contain Database section")
+	require.Contains(t, baseMsg.Msg, "[WebServer]", "Configuration should contain WebServer section")
+
+	// Verify labels are set correctly
+	require.Equal(t, "Application", baseMsg.Labels["system"])
+	require.Equal(t, static.Version, baseMsg.Labels["version"])
+	require.Equal(t, static.Sha, baseMsg.Labels["commit"])
 }

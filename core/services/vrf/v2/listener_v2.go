@@ -13,34 +13,27 @@ import (
 	"github.com/pkg/errors"
 	"github.com/theodesp/go-heaps/pairing"
 
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink-common/pkg/services"
-
-	txmgrcommon "github.com/smartcontractkit/chainlink/v2/common/txmgr"
-	txmgrtypes "github.com/smartcontractkit/chainlink/v2/common/txmgr/types"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/logpoller"
-	evmtypes "github.com/smartcontractkit/chainlink/v2/core/chains/evm/types"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/aggregator_v3_interface"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/batch_vrf_coordinator_v2"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/batch_vrf_coordinator_v2plus"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/vrf_coordinator_v2"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/vrf_coordinator_v2plus_interface"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/vrf_owner"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/generated/batch_vrf_coordinator_v2plus"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/generated/vrf_coordinator_v2plus_interface"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/shared/generated/initial/aggregator_v3_interface"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
+	"github.com/smartcontractkit/chainlink-evm/pkg/logpoller"
+	evmtypes "github.com/smartcontractkit/chainlink-evm/pkg/types"
+	txmgrcommon "github.com/smartcontractkit/chainlink-framework/chains/txmgr"
+	txmgrtypes "github.com/smartcontractkit/chainlink-framework/chains/txmgr/types"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
-	"github.com/smartcontractkit/chainlink/v2/core/services/pg"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 	"github.com/smartcontractkit/chainlink/v2/core/services/vrf/vrfcommon"
 )
 
 var (
 	_                         job.ServiceCtx = &listenerV2{}
-	coordinatorV2ABI                         = evmtypes.MustGetABI(vrf_coordinator_v2.VRFCoordinatorV2ABI)
 	coordinatorV2PlusABI                     = evmtypes.MustGetABI(vrf_coordinator_v2plus_interface.IVRFCoordinatorV2PlusInternalABI)
-	batchCoordinatorV2ABI                    = evmtypes.MustGetABI(batch_vrf_coordinator_v2.BatchVRFCoordinatorV2ABI)
 	batchCoordinatorV2PlusABI                = evmtypes.MustGetABI(batch_vrf_coordinator_v2plus.BatchVRFCoordinatorV2PlusABI)
-	vrfOwnerABI                              = evmtypes.MustGetABI(vrf_owner.VRFOwnerMetaData.ABI)
 	// These are the transaction states used when summing up already reserved subscription funds that are about to be used in in-flight transactions
 	reserveEthLinkQueryStates = []txmgrtypes.TxState{txmgrcommon.TxUnconfirmed, txmgrcommon.TxUnstarted, txmgrcommon.TxInProgress}
 )
@@ -60,8 +53,7 @@ const (
 	// backoffFactor is the factor by which to increase the delay each time a request fails.
 	backoffFactor = 1.3
 
-	txMetaFieldSubId  = "SubId"
-	txMetaGlobalSubId = "GlobalSubId"
+	txMetaGlobalSubID = "GlobalSubId"
 )
 
 func New(
@@ -70,10 +62,9 @@ func New(
 	l logger.Logger,
 	chain legacyevm.Chain,
 	chainID *big.Int,
-	q pg.Q,
+	ds sqlutil.DataSource,
 	coordinator CoordinatorV2_X,
-	batchCoordinator batch_vrf_coordinator_v2.BatchVRFCoordinatorV2Interface,
-	vrfOwner vrf_owner.VRFOwnerInterface,
+	batchCoordinator batch_vrf_coordinator_v2plus.BatchVRFCoordinatorV2PlusInterface,
 	aggregator *aggregator_v3_interface.AggregatorV3Interface,
 	pipelineRunner pipeline.Runner,
 	gethks keystore.Eth,
@@ -90,10 +81,9 @@ func New(
 		chainID:               chainID,
 		coordinator:           coordinator,
 		batchCoordinator:      batchCoordinator,
-		vrfOwner:              vrfOwner,
 		pipelineRunner:        pipelineRunner,
 		job:                   job,
-		q:                     q,
+		ds:                    ds,
 		gethks:                gethks,
 		chStop:                make(chan struct{}),
 		reqAdded:              reqAdded,
@@ -103,6 +93,7 @@ func New(
 		aggregator:            aggregator,
 		inflightCache:         inflightCache,
 		fulfillmentLogDeduper: fulfillmentDeduper,
+		retries:               make(map[string]retryState),
 	}
 }
 
@@ -115,12 +106,11 @@ type listenerV2 struct {
 	chainID *big.Int
 
 	coordinator      CoordinatorV2_X
-	batchCoordinator batch_vrf_coordinator_v2.BatchVRFCoordinatorV2Interface
-	vrfOwner         vrf_owner.VRFOwnerInterface
+	batchCoordinator batch_vrf_coordinator_v2plus.BatchVRFCoordinatorV2PlusInterface
 
 	pipelineRunner pipeline.Runner
 	job            job.Job
-	q              pg.Q
+	ds             sqlutil.DataSource
 	gethks         keystore.Eth
 	chStop         services.StopChan
 
@@ -152,6 +142,13 @@ type listenerV2 struct {
 	// inflightCache is a cache of in-flight requests, used to prevent
 	// re-processing of requests that are in-flight or already fulfilled.
 	inflightCache vrfcommon.InflightCache
+
+	// retries holds backoff state (attempts, lastTry) by request ID for requests that were
+	// attempted but not processed. Pending requests are rebuilt from the log poller on every
+	// tick, so without this the backoff in ready() would never see a retry.
+	// Only accessed from the runLogListener goroutine, so it is not guarded by a mutex.
+	// Entries are pruned in updateRetryState, so it never outgrows the pending request set.
+	retries map[string]retryState
 }
 
 func (lsn *listenerV2) HealthReport() map[string]error {
@@ -170,11 +167,11 @@ func (lsn *listenerV2) Start(ctx context.Context) error {
 		gasLimit := lsn.feeCfg.LimitDefault()
 		vrfLimit := lsn.feeCfg.LimitJobType().VRF()
 		if vrfLimit != nil {
-			gasLimit = *vrfLimit
+			gasLimit = uint64(*vrfLimit)
 		}
 		if err != nil {
 			lsn.l.Criticalw("Error getting coordinator config for gas limit check, starting anyway.", "err", err)
-		} else if conf.MaxGasLimit()+(GasProofVerification*2) > gasLimit {
+		} else if uint64(conf.MaxGasLimit()+(GasProofVerification*2)) > gasLimit {
 			lsn.l.Criticalw("Node gas limit setting may not be high enough to fulfill all requests; it should be increased. Starting anyway.",
 				"currentGasLimit", gasLimit,
 				"neededGasLimit", conf.MaxGasLimit()+(GasProofVerification*2),
@@ -192,11 +189,9 @@ func (lsn *listenerV2) Start(ctx context.Context) error {
 		lsn.respCount = respCount
 
 		// Log listener gathers request logs and processes them
-		lsn.wg.Add(1)
-		go func() {
-			defer lsn.wg.Done()
+		lsn.wg.Go(func() {
 			lsn.runLogListener(spec.PollPeriod, spec.MinIncomingConfirmations)
-		}()
+		})
 
 		return nil
 	})
@@ -237,14 +232,21 @@ func (lsn *listenerV2) GetStartingResponseCountsV2(ctx context.Context) (respCou
 			continue
 		}
 		bi := new(big.Int).SetBytes(b)
+		if c.Count < 0 {
+			lsn.l.Errorw("unexpected negative fulfillment count from tx metadata", "count", c.Count, "reqID", c.RequestID)
+			continue
+		}
 		respCounts[bi.String()] = uint64(c.Count)
 	}
 	return respCounts, nil
 }
 
-func (lsn *listenerV2) setLatestHead(head logpoller.LogPollerBlock) {
+func (lsn *listenerV2) setLatestHead(head logpoller.Block) {
 	lsn.latestHeadMu.Lock()
 	defer lsn.latestHeadMu.Unlock()
+	if head.BlockNumber < 0 {
+		return
+	}
 	num := uint64(head.BlockNumber)
 	if num > lsn.latestHeadNumber {
 		lsn.latestHeadNumber = num

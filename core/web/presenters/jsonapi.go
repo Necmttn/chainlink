@@ -1,17 +1,23 @@
 package presenters
 
 import (
+	"fmt"
 	"strconv"
 )
 
 // JAID represents a JSON API ID.
-// It implements the api2go MarshalIdentifier and UnmarshalIdentitier interface.
+// It implements the api2go MarshalIdentifier and UnmarshalIdentifier interface.
 type JAID struct {
 	ID string `json:"-"`
 }
 
 func NewJAID(id string) JAID {
 	return JAID{id}
+}
+
+// NewPrefixedJAID prefixes JAID with chain id in %s/%s format.
+func NewPrefixedJAID(id, prefix string) JAID {
+	return JAID{ID: fmt.Sprintf("%s/%s", prefix, id)}
 }
 
 // NewJAIDInt32 converts an int32 into a JAID
@@ -29,7 +35,7 @@ func (jaid JAID) GetID() string {
 	return jaid.ID
 }
 
-// SetID implements the api2go UnmarshalIdentitier interface.
+// SetID implements the api2go UnmarshalIdentifier interface.
 func (jaid *JAID) SetID(value string) error {
 	jaid.ID = value
 

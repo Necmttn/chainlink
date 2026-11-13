@@ -1,19 +1,19 @@
 package utils
 
 import (
+	stderrors "errors"
 	"fmt"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/pkg/errors"
-	"go.uber.org/multierr"
 )
 
 // FileExists returns true if a file at the passed string exists.
 func FileExists(name string) (bool, error) {
+	//nolint:gosec // path is caller-provided, not untrusted user input
 	if _, err := os.Stat(name); err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
@@ -28,15 +28,6 @@ func TooPermissive(fileMode, maxAllowedPerms os.FileMode) bool {
 	return fileMode&^maxAllowedPerms != 0
 }
 
-// IsFileOwnedByChainlink attempts to read fileInfo to verify file owner
-func IsFileOwnedByChainlink(fileInfo os.FileInfo) (bool, error) {
-	stat, ok := fileInfo.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false, errors.Errorf("Unable to determine file owner of %s", fileInfo.Name())
-	}
-	return int(stat.Uid) == os.Getuid(), nil
-}
-
 // EnsureDirAndMaxPerms ensures that the given path exists, that it's a directory,
 // and that it has permissions that are no more permissive than the given ones.
 //
@@ -45,16 +36,17 @@ func IsFileOwnedByChainlink(fileInfo os.FileInfo) (bool, error) {
 // - If the path exists, and is a directory, but has the wrong perms, it is chmod'ed
 func EnsureDirAndMaxPerms(path string, perms os.FileMode) error {
 	stat, err := os.Stat(path)
-	if err != nil && !os.IsNotExist(err) {
+	switch {
+	case err != nil && !os.IsNotExist(err):
 		// Regular error
 		return err
-	} else if os.IsNotExist(err) {
+	case os.IsNotExist(err):
 		// Dir doesn't exist, create it with desired perms
 		return os.MkdirAll(path, perms)
-	} else if !stat.IsDir() {
+	case !stat.IsDir():
 		// Path exists, but it's a file, so don't clobber
 		return errors.Errorf("%v already exists and is not a directory", path)
-	} else if stat.Mode() != perms {
+	case stat.Mode() != perms:
 		// Dir exists, but wrong perms, so chmod
 		return os.Chmod(path, stat.Mode()&perms)
 	}
@@ -68,7 +60,7 @@ func WriteFileWithMaxPerms(path string, data []byte, perms os.FileMode) (err err
 	if err != nil {
 		return err
 	}
-	defer func() { err = multierr.Combine(err, f.Close()) }()
+	defer func() { err = stderrors.Join(err, f.Close()) }()
 	err = EnsureFileMaxPerms(f, perms)
 	if err != nil {
 		return
@@ -97,14 +89,13 @@ func EnsureFilepathMaxPerms(filepath string, perms os.FileMode) (err error) {
 	if err != nil {
 		return err
 	}
-	defer func() { err = multierr.Combine(err, dst.Close()) }()
+	defer func() { err = stderrors.Join(err, dst.Close()) }()
 	return EnsureFileMaxPerms(dst, perms)
 }
 
-// FileSize repesents a file size in bytes.
+// FileSize represents a file size in bytes.
 type FileSize uint64
 
-// nolint
 const (
 	KB = 1000
 	MB = 1000 * KB
@@ -127,16 +118,17 @@ var (
 
 // MarshalText encodes s as a human readable string.
 func (s FileSize) MarshalText() ([]byte, error) {
-	if s >= TB {
-		return []byte(fmt.Sprintf("%.2ftb", float64(s)/TB)), nil
-	} else if s >= GB {
-		return []byte(fmt.Sprintf("%.2fgb", float64(s)/GB)), nil
-	} else if s >= MB {
-		return []byte(fmt.Sprintf("%.2fmb", float64(s)/MB)), nil
-	} else if s >= KB {
-		return []byte(fmt.Sprintf("%.2fkb", float64(s)/KB)), nil
+	switch {
+	case s >= TB:
+		return fmt.Appendf(nil, "%.2ftb", float64(s)/TB), nil
+	case s >= GB:
+		return fmt.Appendf(nil, "%.2fgb", float64(s)/GB), nil
+	case s >= MB:
+		return fmt.Appendf(nil, "%.2fmb", float64(s)/MB), nil
+	case s >= KB:
+		return fmt.Appendf(nil, "%.2fkb", float64(s)/KB), nil
 	}
-	return []byte(fmt.Sprintf("%db", s)), nil
+	return fmt.Appendf(nil, "%db", s), nil
 }
 
 // UnmarshalText parses a file size from bs in to s.

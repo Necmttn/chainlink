@@ -2,15 +2,13 @@ package loader
 
 import (
 	"context"
+	stderrors "errors"
 
 	"github.com/graph-gophers/dataloader"
 	"github.com/pkg/errors"
-	"go.uber.org/multierr"
 
-	commontypes "github.com/smartcontractkit/chainlink-common/pkg/types"
-
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/txmgr"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/types"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr"
+	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
 	"github.com/smartcontractkit/chainlink/v2/core/services/feeds"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
@@ -20,17 +18,17 @@ import (
 // ErrInvalidType indicates that results loaded is not the type expected
 var ErrInvalidType = errors.New("invalid type")
 
-// GetChainByID fetches the chain by it's id.
-func GetChainByID(ctx context.Context, id string) (*commontypes.ChainStatus, error) {
+// GetChainByRelayID fetches the chain by it's relayId.
+func GetChainByRelayID(ctx context.Context, id string) (*chainlink.NetworkChainStatus, error) {
 	ldr := For(ctx)
 
-	thunk := ldr.ChainsByIDLoader.Load(ctx, dataloader.StringKey(id))
+	thunk := ldr.ChainsByRelayIDLoader.Load(ctx, dataloader.StringKey(id))
 	result, err := thunk()
 	if err != nil {
 		return nil, err
 	}
 
-	chain, ok := result.(commontypes.ChainStatus)
+	chain, ok := result.(chainlink.NetworkChainStatus)
 	if !ok {
 		return nil, ErrInvalidType
 	}
@@ -38,26 +36,8 @@ func GetChainByID(ctx context.Context, id string) (*commontypes.ChainStatus, err
 	return &chain, nil
 }
 
-// GetNodesByChainID fetches the nodes for a chain.
-func GetNodesByChainID(ctx context.Context, id string) ([]types.Node, error) {
-	ldr := For(ctx)
-
-	thunk := ldr.NodesByChainIDLoader.Load(ctx, dataloader.StringKey(id))
-	result, err := thunk()
-	if err != nil {
-		return nil, err
-	}
-
-	nodes, ok := result.([]types.Node)
-	if !ok {
-		return nil, ErrInvalidType
-	}
-
-	return nodes, nil
-}
-
 // GetFeedsManagerByID fetches the feed manager by ID.
-func GetFeedsManagerByID(ctx context.Context, id string) (*feeds.FeedsManager, error) {
+func GetFeedsManagerByID(ctx context.Context, id string) (*feeds.Manager, error) {
 	ldr := For(ctx)
 
 	thunk := ldr.FeedsManagersByIDLoader.Load(ctx, dataloader.StringKey(id))
@@ -66,7 +46,7 @@ func GetFeedsManagerByID(ctx context.Context, id string) (*feeds.FeedsManager, e
 		return nil, err
 	}
 
-	mgr, ok := result.(feeds.FeedsManager)
+	mgr, ok := result.(feeds.Manager)
 	if !ok {
 		return nil, ErrInvalidType
 	}
@@ -86,7 +66,7 @@ func GetJobRunsByIDs(ctx context.Context, ids []int64) ([]pipeline.Run, error) {
 	thunk := ldr.JobRunsByIDLoader.LoadMany(ctx, dataloader.NewKeysFromStrings(strIDs))
 	results, errs := thunk()
 	if errs != nil {
-		merr := multierr.Combine(errs...)
+		merr := stderrors.Join(errs...)
 
 		return nil, errors.Wrap(merr, "errors fetching runs")
 	}
@@ -134,14 +114,14 @@ func GetLatestSpecByJobProposalID(ctx context.Context, jpID string) (*feeds.JobP
 		return nil, errors.Wrapf(ErrInvalidType, "Result : %T", result)
 	}
 
-	max := specs[0]
+	maxSpec := specs[0]
 	for _, spec := range specs {
-		if spec.Version > max.Version {
-			max = spec
+		if spec.Version > maxSpec.Version {
+			maxSpec = spec
 		}
 	}
 
-	return &max, nil
+	return &maxSpec, nil
 }
 
 // GetJobProposalsByFeedsManagerID fetches the job proposals by feeds manager ID.

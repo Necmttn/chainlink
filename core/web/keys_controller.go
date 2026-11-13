@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -8,7 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/manyminds/api2go/jsonapi"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/logger/audit"
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
 )
@@ -16,10 +17,10 @@ import (
 type Keystore[K keystore.Key] interface {
 	Get(id string) (K, error)
 	GetAll() ([]K, error)
-	Create() (K, error)
-	Delete(id string) (K, error)
-	Import(keyJSON []byte, password string) (K, error)
-	Export(id string, password string) ([]byte, error)
+	Create(context.Context) (K, error)
+	Delete(ctx context.Context, id string) (K, error)
+	Import(ctx context.Context, keyJSON []byte, password string) (K, error)
+	Export(id, password string) ([]byte, error)
 }
 
 type KeysController interface {
@@ -46,11 +47,12 @@ type keysController[K keystore.Key, R jsonapi.EntityNamer] struct {
 }
 
 func NewKeysController[K keystore.Key, R jsonapi.EntityNamer](ks Keystore[K], lggr logger.Logger, auditLogger audit.AuditLogger, resourceName string,
-	newResource func(K) *R, newResources func([]K) []R) KeysController {
+	newResource func(K) *R, newResources func([]K) []R,
+) KeysController {
 	var k K
 	typ, err := keystore.GetFieldNameForKey(k)
 	if err != nil {
-		panic(fmt.Errorf("unable to create keys controller: %v", err))
+		panic(fmt.Errorf("unable to create keys controller: %w", err))
 	}
 	return &keysController[K, R]{
 		ks:           ks,
@@ -73,13 +75,14 @@ func (kc *keysController[K, R]) Index(c *gin.Context) {
 }
 
 func (kc *keysController[K, R]) Create(c *gin.Context) {
-	key, err := kc.ks.Create()
+	ctx := c.Request.Context()
+	key, err := kc.ks.Create(ctx)
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	kc.auditLogger.Audit(audit.KeyCreated, map[string]interface{}{
+	kc.auditLogger.Audit(audit.KeyCreated, map[string]any{
 		"type": kc.typ,
 		"id":   key.ID(),
 	})
@@ -88,19 +91,20 @@ func (kc *keysController[K, R]) Create(c *gin.Context) {
 }
 
 func (kc *keysController[K, R]) Delete(c *gin.Context) {
+	ctx := c.Request.Context()
 	keyID := c.Param("keyID")
 	key, err := kc.ks.Get(keyID)
 	if err != nil {
 		jsonAPIError(c, http.StatusNotFound, err)
 		return
 	}
-	_, err = kc.ks.Delete(key.ID())
+	_, err = kc.ks.Delete(ctx, key.ID())
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	kc.auditLogger.Audit(audit.KeyDeleted, map[string]interface{}{
+	kc.auditLogger.Audit(audit.KeyDeleted, map[string]any{
 		"type": kc.typ,
 		"id":   key.ID(),
 	})
@@ -110,6 +114,7 @@ func (kc *keysController[K, R]) Delete(c *gin.Context) {
 
 func (kc *keysController[K, R]) Import(c *gin.Context) {
 	defer kc.lggr.ErrorIfFn(c.Request.Body.Close, "Error closing Import request body")
+	ctx := c.Request.Context()
 
 	bytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
@@ -117,13 +122,13 @@ func (kc *keysController[K, R]) Import(c *gin.Context) {
 		return
 	}
 	oldPassword := c.Query("oldpassword")
-	key, err := kc.ks.Import(bytes, oldPassword)
+	key, err := kc.ks.Import(ctx, bytes, oldPassword)
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	kc.auditLogger.Audit(audit.KeyImported, map[string]interface{}{
+	kc.auditLogger.Audit(audit.KeyImported, map[string]any{
 		"type": kc.typ,
 		"id":   key.ID(),
 	})
@@ -142,7 +147,7 @@ func (kc *keysController[K, R]) Export(c *gin.Context) {
 		return
 	}
 
-	kc.auditLogger.Audit(audit.KeyExported, map[string]interface{}{
+	kc.auditLogger.Audit(audit.KeyExported, map[string]any{
 		"type": kc.typ,
 		"id":   keyID,
 	})

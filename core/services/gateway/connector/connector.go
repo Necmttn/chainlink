@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -9,57 +10,63 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/jonboulle/clockwork"
+	"go.opentelemetry.io/otel/attribute"
 
+	"github.com/smartcontractkit/chainlink-common/pkg/beholder"
+	jsonrpc "github.com/smartcontractkit/chainlink-common/pkg/jsonrpc2"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink-common/pkg/services"
-	"github.com/smartcontractkit/chainlink-common/pkg/utils/hex"
-
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
-	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/api"
+	"github.com/smartcontractkit/chainlink-common/pkg/types/core"
+	commonhex "github.com/smartcontractkit/chainlink-common/pkg/utils/hex"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/network"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
 )
 
-//go:generate mockery --quiet --name GatewayConnector --output ./mocks/ --case=underscore
-//go:generate mockery --quiet --name Signer --output ./mocks/ --case=underscore
-//go:generate mockery --quiet --name GatewayConnectorHandler --output ./mocks/ --case=underscore
+var _ GatewayConnector = (*gatewayConnector)(nil)
 
 // GatewayConnector is a component run by Nodes to connect to a set of Gateways.
 type GatewayConnector interface {
-	job.ServiceCtx
+	services.Service
 	network.ConnectionInitiator
-
-	SendToGateway(ctx context.Context, gatewayId string, msg *api.Message) error
+	// core.MultiGatewayConnector is used by LOOP plugins to interact with the Gateway over gRPC.
+	core.MultiGatewayConnector
 }
 
 // Signer implementation needs to be provided by a GatewayConnector user (node)
 // in order to sign handshake messages with node's private key.
 type Signer interface {
 	// Sign keccak256 hash of data.
-	Sign(data ...[]byte) ([]byte, error)
+	Sign(ctx context.Context, data ...[]byte) ([]byte, error)
 }
 
 // GatewayConnector user (node) implements application logic in the Handler interface.
 type GatewayConnectorHandler interface {
 	job.ServiceCtx
-
-	HandleGatewayMessage(ctx context.Context, gatewayId string, msg *api.Message)
+	// core.GatewayConnectorHandler is a narrow interface that provides methods to handle messages from Gateways.
+	// This interface is used by LOOP plugins to handle messages from Gateways over gRPC
+	core.GatewayConnectorHandler
 }
 
 type gatewayConnector struct {
+	core.UnimplementedGatewayConnector
+
 	services.StateMachine
 
-	config      *ConnectorConfig
-	codec       api.Codec
-	clock       utils.Clock
+	config      *Config
+	clock       clockwork.Clock
 	nodeAddress []byte
+	csaKey      string
 	signer      Signer
-	handler     GatewayConnectorHandler
+	handlersMu  sync.RWMutex
+	handlers    map[string]core.GatewayConnectorHandler
 	gateways    map[string]*gatewayState
-	urlToId     map[string]string
+	urlToID     map[string]string
 	closeWait   sync.WaitGroup
 	shutdownCh  services.StopChan
 	lggr        logger.Logger
+	metrics     *connectorMetrics
 }
 
 func (c *gatewayConnector) HealthReport() map[string]error {
@@ -73,101 +80,232 @@ func (c *gatewayConnector) HealthReport() map[string]error {
 func (c *gatewayConnector) Name() string { return c.lggr.Name() }
 
 type gatewayState struct {
+	// signal channel is closed once the gateway is connected
+	signalCh chan struct{}
+
 	conn     network.WSConnectionWrapper
-	config   ConnectorGatewayConfig
+	config   GatewayConfig
 	url      *url.URL
 	wsClient network.WebSocketClient
 }
 
-func NewGatewayConnector(config *ConnectorConfig, signer Signer, handler GatewayConnectorHandler, clock utils.Clock, lggr logger.Logger) (GatewayConnector, error) {
-	if config == nil || signer == nil || handler == nil || clock == nil || lggr == nil {
+// A gatewayState is connected when the signal channel is closed
+func (gs *gatewayState) signal() {
+	close(gs.signalCh)
+}
+
+// awaitConn blocks until the gateway is connected or the context is done
+func (gs *gatewayState) awaitConn(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("await connection failed: %w", ctx.Err())
+	case <-gs.signalCh:
+		return nil
+	}
+}
+
+func NewGatewayConnector(config *Config, signer Signer, clock clockwork.Clock, lggr logger.Logger, csaKey string) (*gatewayConnector, error) {
+	if config == nil || signer == nil || clock == nil || lggr == nil {
 		return nil, errors.New("nil dependency")
 	}
-	if len(config.DonId) == 0 || len(config.DonId) > network.HandshakeDonIdLen {
-		return nil, errors.New("invalid DON ID")
+	if err := validateConnectorConfig(config); err != nil {
+		return nil, err
 	}
-	addressBytes, err := hex.DecodeString(config.NodeAddress)
+	addressBytes, err := commonhex.DecodeString(config.NodeAddress)
 	if err != nil {
 		return nil, err
 	}
+	metrics, err := newConnectorMetrics()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create gateway connector metrics: %w", err)
+	}
+	wsMetrics, err := network.NewWSConnectionMetrics(beholder.GetMeter())
+	if err != nil {
+		return nil, fmt.Errorf("failed to create websocket connection metrics: %w", err)
+	}
 	connector := &gatewayConnector{
 		config:      config,
-		codec:       &api.JsonRPCCodec{},
 		clock:       clock,
 		nodeAddress: addressBytes,
+		csaKey:      csaKey,
 		signer:      signer,
-		handler:     handler,
+		handlers:    make(map[string]core.GatewayConnectorHandler),
 		shutdownCh:  make(chan struct{}),
-		lggr:        lggr.Named("GatewayConnector"),
+		lggr:        logger.Named(lggr, "GatewayConnector"),
+		metrics:     metrics,
 	}
 	gateways := make(map[string]*gatewayState)
-	urlToId := make(map[string]string)
+	urlToID := make(map[string]string)
 	for _, gw := range config.Gateways {
-		gw := gw
-		if _, exists := gateways[gw.Id]; exists {
-			return nil, fmt.Errorf("duplicate Gateway ID %s", gw.Id)
+		if _, exists := gateways[gw.ID]; exists {
+			return nil, fmt.Errorf("duplicate Gateway ID %s", gw.ID)
 		}
-		if _, exists := urlToId[gw.URL]; exists {
+		if _, exists := urlToID[gw.URL]; exists {
 			return nil, fmt.Errorf("duplicate Gateway URL %s", gw.URL)
 		}
 		parsedURL, err := url.Parse(gw.URL)
 		if err != nil {
 			return nil, err
 		}
+		l := logger.With(lggr, "URL", parsedURL)
 		gateway := &gatewayState{
-			conn:     network.NewWSConnectionWrapper(lggr),
+			conn:     network.NewWSConnectionWrapperWithObserver(l, wsMetrics.Observer(attribute.String("gateway_id", gw.ID))),
 			config:   gw,
 			url:      parsedURL,
 			wsClient: network.NewWebSocketClient(config.WsClientConfig, connector, lggr),
+			signalCh: make(chan struct{}),
 		}
-		gateways[gw.Id] = gateway
-		urlToId[gw.URL] = gw.Id
+		gateways[gw.ID] = gateway
+		urlToID[gw.URL] = gw.ID
 	}
 	connector.gateways = gateways
-	connector.urlToId = urlToId
+	connector.urlToID = urlToID
 	return connector, nil
 }
 
-func (c *gatewayConnector) SendToGateway(ctx context.Context, gatewayId string, msg *api.Message) error {
-	data, err := c.codec.EncodeResponse(msg)
-	if err != nil {
-		return fmt.Errorf("error encoding response for gateway %s: %v", gatewayId, err)
+func (c *gatewayConnector) AddHandler(ctx context.Context, methods []string, handler core.GatewayConnectorHandler) error {
+	if handler == nil {
+		return errors.New("cannot add a nil handler")
 	}
-	gateway, ok := c.gateways[gatewayId]
+	c.handlersMu.Lock()
+	defer c.handlersMu.Unlock()
+	for _, method := range methods {
+		if _, exists := c.handlers[method]; exists {
+			return fmt.Errorf("handler for method %s already exists", method)
+		}
+	}
+	// add all or nothing
+	for _, method := range methods {
+		c.handlers[method] = handler
+	}
+	return nil
+}
+
+func (c *gatewayConnector) RemoveHandler(ctx context.Context, methods []string) error {
+	c.handlersMu.Lock()
+	defer c.handlersMu.Unlock()
+	for _, method := range methods {
+		_, exists := c.handlers[method]
+		if !exists {
+			return fmt.Errorf("handler for method %s does not exist", method)
+		}
+	}
+
+	// remove all or nothing
+	for _, method := range methods {
+		delete(c.handlers, method)
+	}
+	return nil
+}
+
+func (c *gatewayConnector) AwaitConnection(ctx context.Context, gatewayID string) error {
+	gateway, ok := c.gateways[gatewayID]
 	if !ok {
-		return fmt.Errorf("invalid Gateway ID %s", gatewayId)
+		return fmt.Errorf("invalid Gateway ID %s", gatewayID)
+	}
+	return gateway.awaitConn(ctx)
+}
+
+func (c *gatewayConnector) SendToGateway(ctx context.Context, gatewayID string, resp *jsonrpc.Response[json.RawMessage]) error {
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return fmt.Errorf("failed to marshal response: %w", err)
+	}
+	gateway, ok := c.gateways[gatewayID]
+	if !ok {
+		return fmt.Errorf("invalid Gateway ID %s", gatewayID)
 	}
 	if gateway.conn == nil {
-		return fmt.Errorf("connector not started")
+		return errors.New("connector not started")
 	}
 	return gateway.conn.Write(ctx, websocket.BinaryMessage, data)
 }
 
+func (c *gatewayConnector) SignMessage(ctx context.Context, msg []byte) ([]byte, error) {
+	return c.signer.Sign(ctx, msg)
+}
+
+func (c *gatewayConnector) GatewayIDs(ctx context.Context) ([]string, error) {
+	return c.gatewayIDsForDon(ctx, "")
+}
+
+func (c *gatewayConnector) gatewayIDsForDon(_ context.Context, donID string) ([]string, error) {
+	if donID == "" {
+		return c.allGatewayIDs(), nil
+	}
+
+	if !multiDonMode(c.config) {
+		return nil, nil
+	}
+
+	var gids []string
+	for _, gw := range c.config.Gateways {
+		if gw.DonID == donID {
+			gids = append(gids, gw.ID)
+		}
+	}
+	return gids, nil
+}
+
+func (c *gatewayConnector) GatewayIDsForDon(ctx context.Context, donID string) ([]string, error) {
+	return c.gatewayIDsForDon(ctx, donID)
+}
+
+func (c *gatewayConnector) DonIDForGateway(_ context.Context, gatewayID string) (string, error) {
+	gateway, ok := c.gateways[gatewayID]
+	if !ok {
+		return "", fmt.Errorf("invalid Gateway ID %s", gatewayID)
+	}
+	return gateway.config.DonID, nil
+}
+
+func (c *gatewayConnector) allGatewayIDs() []string {
+	gids := make([]string, 0, len(c.gateways))
+	for gid := range c.gateways {
+		gids = append(gids, gid)
+	}
+	return gids
+}
+
+func (c *gatewayConnector) DonID(context.Context) (string, error) {
+	return c.config.DonID, nil
+}
+
 func (c *gatewayConnector) readLoop(gatewayState *gatewayState) {
+	defer c.closeWait.Done()
 	ctx, cancel := c.shutdownCh.NewCtx()
 	defer cancel()
 
 	for {
 		select {
 		case <-c.shutdownCh:
-			c.closeWait.Done()
 			return
 		case item := <-gatewayState.conn.ReadChannel():
-			msg, err := c.codec.DecodeRequest(item.Data)
+			var req jsonrpc.Request[json.RawMessage]
+			err := json.Unmarshal(item.Data, &req)
 			if err != nil {
-				c.lggr.Errorw("parse error when reading from Gateway", "id", gatewayState.config.Id, "err", err)
+				c.lggr.Errorw("parse error when reading from Gateway", "id", gatewayState.config.ID, "err", err)
 				break
 			}
-			if err = msg.Validate(); err != nil {
-				c.lggr.Errorw("failed to validate message signature", "id", gatewayState.config.Id, "error", err)
+			c.handlersMu.RLock()
+			handler, exists := c.handlers[req.Method]
+			c.handlersMu.RUnlock()
+			if !exists {
+				c.lggr.Errorw("no handler for method", "id", gatewayState.config.ID, "method", req.Method)
 				break
 			}
-			c.handler.HandleGatewayMessage(ctx, gatewayState.config.Id, msg)
+			// do not break on error. HandleGatewayMessage handles errors
+			// by sending a response back to the Gateway.
+			err = handler.HandleGatewayMessage(ctx, gatewayState.config.ID, &req)
+			if err != nil {
+				c.lggr.Warnw("failed to handle message from Gateway", "id", gatewayState.config.ID, "method", req.Method, "err", err)
+			}
 		}
 	}
 }
 
 func (c *gatewayConnector) reconnectLoop(gatewayState *gatewayState) {
+	defer c.closeWait.Done()
 	redialBackoff := utils.NewRedialBackoff()
 	ctx, cancel := c.shutdownCh.NewCtx()
 	defer cancel()
@@ -175,18 +313,24 @@ func (c *gatewayConnector) reconnectLoop(gatewayState *gatewayState) {
 	for {
 		conn, err := gatewayState.wsClient.Connect(ctx, gatewayState.url)
 		if err != nil {
-			c.lggr.Errorw("connection error", "url", gatewayState.url, "error", err)
+			c.lggr.Errorw("connection error", "url", gatewayState.url, "err", err)
 		} else {
 			c.lggr.Infow("connected successfully", "url", gatewayState.url)
 			closeCh := gatewayState.conn.Reset(conn)
-			<-closeCh
+			gatewayState.signal()
+			if closeCh != nil { // nil means already closed
+				<-closeCh
+			}
 			c.lggr.Infow("connection closed", "url", gatewayState.url)
+
 			// reset backoff
 			redialBackoff = utils.NewRedialBackoff()
+
+			// reset signal channel
+			gatewayState.signalCh = make(chan struct{})
 		}
 		select {
 		case <-c.shutdownCh:
-			c.closeWait.Done()
 			return
 		case <-time.After(redialBackoff.Duration()):
 			c.lggr.Info("reconnecting ...")
@@ -197,11 +341,8 @@ func (c *gatewayConnector) reconnectLoop(gatewayState *gatewayState) {
 func (c *gatewayConnector) Start(ctx context.Context) error {
 	return c.StartOnce("GatewayConnector", func() error {
 		c.lggr.Info("starting gateway connector")
-		if err := c.handler.Start(ctx); err != nil {
-			return err
-		}
+		c.recordGatewaysPerDon(ctx)
 		for _, gatewayState := range c.gateways {
-			gatewayState := gatewayState
 			if err := gatewayState.conn.Start(ctx); err != nil {
 				return err
 			}
@@ -213,37 +354,59 @@ func (c *gatewayConnector) Start(ctx context.Context) error {
 	})
 }
 
+// recordGatewaysPerDon emits one gauge sample per DON ID configured on this
+// connector, labeled with the node's CSA key. In multi-DON mode each gateway's
+// DonID is used; in single-DON mode the top-level DonID is used. Recording is
+// skipped when the CSA key is empty or metrics are unavailable.
+func (c *gatewayConnector) recordGatewaysPerDon(ctx context.Context) {
+	if c.metrics == nil || c.csaKey == "" {
+		return
+	}
+	counts := make(map[string]int)
+	for _, gw := range c.config.Gateways {
+		donID := gw.DonID
+		if donID == "" {
+			donID = c.config.DonID
+		}
+		counts[donID]++
+	}
+	for donID, count := range counts {
+		c.metrics.recordGatewaysPerDon(ctx, c.csaKey, donID, count)
+	}
+}
+
 func (c *gatewayConnector) Close() error {
 	return c.StopOnce("GatewayConnector", func() (err error) {
 		c.lggr.Info("closing gateway connector")
 		close(c.shutdownCh)
+		var errs error
 		for _, gatewayState := range c.gateways {
-			gatewayState.conn.Close()
+			errs = errors.Join(errs, gatewayState.conn.Close())
 		}
 		c.closeWait.Wait()
-		return c.handler.Close()
+		return errs
 	})
 }
 
-func (c *gatewayConnector) NewAuthHeader(url *url.URL) ([]byte, error) {
-	gatewayId, found := c.urlToId[url.String()]
+func (c *gatewayConnector) NewAuthHeader(ctx context.Context, url *url.URL) ([]byte, error) {
+	gatewayID, found := c.urlToID[url.String()]
 	if !found {
 		return nil, network.ErrAuthInvalidGateway
 	}
 	authHeaderElems := &network.AuthHeaderElems{
-		Timestamp: uint32(c.clock.Now().Unix()),
-		DonId:     c.config.DonId,
-		GatewayId: gatewayId,
+		Timestamp: uint32(c.clock.Now().Unix()), //nolint:gosec // G115: uint32 timestamp is intentional per the auth handshake protocol
+		DonID:     c.config.DonID,
+		GatewayID: gatewayID,
 	}
 	packedElems := network.PackAuthHeader(authHeaderElems)
-	signature, err := c.signer.Sign(packedElems)
+	signature, err := c.signer.Sign(ctx, packedElems)
 	if err != nil {
 		return nil, err
 	}
 	return append(packedElems, signature...), nil
 }
 
-func (c *gatewayConnector) ChallengeResponse(url *url.URL, challenge []byte) ([]byte, error) {
+func (c *gatewayConnector) ChallengeResponse(ctx context.Context, url *url.URL, challenge []byte) ([]byte, error) {
 	challengeElems, err := network.UnpackChallenge(challenge)
 	if err != nil {
 		return nil, err
@@ -251,14 +414,14 @@ func (c *gatewayConnector) ChallengeResponse(url *url.URL, challenge []byte) ([]
 	if len(challengeElems.ChallengeBytes) < c.config.AuthMinChallengeLen {
 		return nil, network.ErrChallengeTooShort
 	}
-	gatewayId, found := c.urlToId[url.String()]
-	if !found || challengeElems.GatewayId != gatewayId {
+	gatewayID, found := c.urlToID[url.String()]
+	if !found || challengeElems.GatewayID != gatewayID {
 		return nil, network.ErrAuthInvalidGateway
 	}
-	nowTs := uint32(c.clock.Now().Unix())
+	nowTs := uint32(c.clock.Now().Unix()) //nolint:gosec // G115: uint32 timestamp is intentional per the auth handshake protocol
 	ts := challengeElems.Timestamp
 	if ts < nowTs-c.config.AuthTimestampToleranceSec || nowTs+c.config.AuthTimestampToleranceSec < ts {
 		return nil, network.ErrAuthInvalidTimestamp
 	}
-	return c.signer.Sign(challenge)
+	return c.signer.Sign(ctx, challenge)
 }

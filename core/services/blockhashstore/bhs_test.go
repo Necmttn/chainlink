@@ -1,46 +1,54 @@
 package blockhashstore_test
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/txmgr"
-	txmmocks "github.com/smartcontractkit/chainlink/v2/core/chains/evm/txmgr/mocks"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/blockhash_store"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/generated/blockhash_store"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
+	"github.com/smartcontractkit/chainlink-evm/pkg/client"
+	"github.com/smartcontractkit/chainlink-evm/pkg/keys"
+	"github.com/smartcontractkit/chainlink-evm/pkg/keys/keystest"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr"
+	"github.com/smartcontractkit/chainlink-evm/pkg/types"
+	txmmocks "github.com/smartcontractkit/chainlink/v2/common/txmgr/mocks"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/evmtest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/blockhashstore"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
-	evmrelay "github.com/smartcontractkit/chainlink/v2/core/services/relay/evm"
-	"github.com/smartcontractkit/chainlink/v2/core/utils"
 )
 
 func TestStoreRotatesFromAddresses(t *testing.T) {
+	ctx := t.Context()
 	db := pgtest.NewSqlxDB(t)
-	ethClient := evmtest.NewEthClientMockWithDefaultChain(t)
+	ethClient := client.NewNullClient(big.NewInt(evmtest.NullClientChainID), logger.Test(t))
 	cfg := configtest.NewTestGeneralConfig(t)
-	kst := cltest.NewKeyStore(t, db, cfg.Database())
-	require.NoError(t, kst.Unlock(cltest.Password))
-	relayExtenders := evmtest.NewChainRelayExtenders(t, evmtest.TestChainOpts{DB: db, KeyStore: kst.Eth(), GeneralConfig: cfg, Client: ethClient})
-	legacyChains := evmrelay.NewLegacyChainsFromRelayerExtenders(relayExtenders)
-	chain, err := legacyChains.Get(cltest.FixtureChainID.String())
+	kst := cltest.NewKeyStore(t, db)
+	require.NoError(t, kst.Unlock(ctx, cltest.Password))
+	legacyChains := evmtest.NewLegacyChains(t, evmtest.TestChainOpts{
+		ChainConfigs:   cfg.EVMConfigs(),
+		DatabaseConfig: cfg.Database(),
+		FeatureConfig:  cfg.Feature(),
+		ListenerConfig: cfg.Database().Listener(),
+		KeyStore:       kst.Eth(),
+		DB:             db,
+		Client:         ethClient,
+	})
+	chainService, err := legacyChains.Get(cltest.FixtureChainID.String())
 	require.NoError(t, err)
-	lggr := logger.TestLogger(t)
-	ks := keystore.New(db, utils.FastScryptParams, lggr, cfg.Database())
-	require.NoError(t, ks.Unlock("blah"))
-	k1, err := ks.Eth().Create(&cltest.FixtureChainID)
-	require.NoError(t, err)
-	k2, err := ks.Eth().Create(&cltest.FixtureChainID)
-	require.NoError(t, err)
-	fromAddresses := []ethkey.EIP55Address{k1.EIP55Address, k2.EIP55Address}
+	chain, ok := chainService.(legacyevm.Chain)
+	require.True(t, ok)
+	coreKS := keystest.NewMemoryChainStore()
+	ks := keys.NewStore(coreKS)
+	addr1 := coreKS.MustCreate(t)
+	addr2 := coreKS.MustCreate(t)
+	fromAddresses := []types.EIP55Address{types.EIP55AddressFromAddress(addr1), types.EIP55AddressFromAddress(addr2)}
 	txm := new(txmmocks.MockEvmTxManager)
 	bhsAddress := common.HexToAddress("0x31Ca8bf590360B3198749f852D5c516c642846F6")
 
@@ -48,25 +56,22 @@ func TestStoreRotatesFromAddresses(t *testing.T) {
 	require.NoError(t, err)
 	bhs, err := blockhashstore.NewBulletproofBHS(
 		chain.Config().EVM().GasEstimator(),
-		chain.Config().Database(),
+		cfg.Database(),
 		fromAddresses,
 		txm,
 		store,
 		nil,
-		&cltest.FixtureChainID,
-		ks.Eth(),
+		ks,
 	)
 	require.NoError(t, err)
 
 	txm.On("CreateTransaction", mock.Anything, mock.MatchedBy(func(tx txmgr.TxRequest) bool {
-		return tx.FromAddress.String() == k1.Address.String()
+		return tx.FromAddress.String() == addr1.String()
 	})).Once().Return(txmgr.Tx{}, nil)
 
 	txm.On("CreateTransaction", mock.Anything, mock.MatchedBy(func(tx txmgr.TxRequest) bool {
-		return tx.FromAddress.String() == k2.Address.String()
+		return tx.FromAddress.String() == addr2.String()
 	})).Once().Return(txmgr.Tx{}, nil)
-
-	ctx := testutils.Context(t)
 
 	// store 2 blocks
 	err = bhs.Store(ctx, 1)

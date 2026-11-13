@@ -15,6 +15,14 @@ cp stdout compact.json
 exec jq . compact.json
 cmp stdout out.json
 
+exec chainlink --remote-node-url $NODEURL health -failing
+cmp stdout out-unhealthy.txt
+
+exec chainlink --remote-node-url $NODEURL health -f -json
+cp stdout compact.json
+exec jq . compact.json
+cmp stdout out-unhealthy.json
+
 -- testdb.txt --
 CL_DATABASE_URL
 -- testport.txt --
@@ -30,13 +38,6 @@ fj293fbBnlQ!f9vNs
 [Webserver]
 HTTPPort = $PORT
 
-[[Cosmos]]
-ChainID = 'Foo'
-
-[[Cosmos.Nodes]]
-Name = 'primary'
-TendermintURL = 'http://tender.mint'
-
 [[EVM]]
 ChainID = '1'
 
@@ -45,63 +46,71 @@ Name = 'fake'
 WSURL = 'wss://foo.bar/ws'
 HTTPURL = 'https://foo.bar'
 
-[[Solana]]
-ChainID = 'Bar'
-
-[[Solana.Nodes]]
-Name = 'primary'
-URL = 'http://solana.web'
-
-[[Starknet]]
-ChainID = 'Baz'
-
-[[Starknet.Nodes]]
-Name = 'primary'
-URL = 'http://stark.node'
-
 -- out.txt --
--Cosmos.Foo.Chain
--Cosmos.Foo.Txm
--EVM.1
--EVM.1.BalanceMonitor
--EVM.1.HeadBroadcaster
--EVM.1.HeadTracker
-!EVM.1.HeadTracker.HeadListener
-	Listener is not connected
--EVM.1.LogBroadcaster
--EVM.1.Txm
--EVM.1.Txm.BlockHistoryEstimator
--EVM.1.Txm.Broadcaster
--EVM.1.Txm.Confirmer
--EVM.1.Txm.WrappedEvmEstimator
--JobSpawner
--Mailbox.Monitor
--Mercury.WSRPCPool
--Mercury.WSRPCPool.CacheSet
--PipelineORM
--PipelineRunner
--PromReporter
--Solana.Bar
--StarkNet.Baz
--TelemetryManager
+ok BridgeStatusReporter
+ok CRE
+ok CRE.DispatcherWrapper
+ok EVM.1
+ok EVM.1.BalanceMonitor
+ok EVM.1.HeadBroadcaster
+ok EVM.1.HeadTracker
+!  EVM.1.HeadTracker.HeadListener
+	Listener connected = false, receiving heads = false
+ok EVM.1.LogBroadcaster
+ok EVM.1.Relayer
+ok EVM.1.Txm
+ok EVM.1.Txm.BlockHistoryEstimator
+ok EVM.1.Txm.Broadcaster
+ok EVM.1.Txm.Confirmer
+ok EVM.1.Txm.Finalizer
+ok EVM.1.Txm.WrappedEvmEstimator
+ok HeadReporter
+ok Heartbeat
+ok JobSpawner
+ok JobSpecReporter
+ok LLOTransmissionReaper
+ok Mailbox.Monitor
+ok Mercury.WSRPCPool
+ok Mercury.WSRPCPool.CacheSet
+ok NodePlatformBuildInfo
+ok NodePlatformJobInfo
+ok PipelineORM
+ok PipelineRunner
+ok PipelineRunner.BridgeCache
+ok RetirementReportCache
+ok TelemetryManager
+ok WorkflowStore
+
+-- out-unhealthy.txt --
+!  EVM.1.HeadTracker.HeadListener
+	Listener connected = false, receiving heads = false
 
 -- out.json --
 {
   "data": [
     {
       "type": "checks",
-      "id": "Cosmos.Foo.Chain",
+      "id": "BridgeStatusReporter",
       "attributes": {
-        "name": "Cosmos.Foo.Chain",
+        "name": "BridgeStatusReporter",
         "status": "passing",
         "output": ""
       }
     },
     {
       "type": "checks",
-      "id": "Cosmos.Foo.Txm",
+      "id": "CRE",
       "attributes": {
-        "name": "Cosmos.Foo.Txm",
+        "name": "CRE",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "CRE.DispatcherWrapper",
+      "attributes": {
+        "name": "CRE.DispatcherWrapper",
         "status": "passing",
         "output": ""
       }
@@ -148,7 +157,7 @@ URL = 'http://stark.node'
       "attributes": {
         "name": "EVM.1.HeadTracker.HeadListener",
         "status": "failing",
-        "output": "Listener is not connected"
+        "output": "Listener connected = false, receiving heads = false"
       }
     },
     {
@@ -156,6 +165,15 @@ URL = 'http://stark.node'
       "id": "EVM.1.LogBroadcaster",
       "attributes": {
         "name": "EVM.1.LogBroadcaster",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "EVM.1.Relayer",
+      "attributes": {
+        "name": "EVM.1.Relayer",
         "status": "passing",
         "output": ""
       }
@@ -198,6 +216,15 @@ URL = 'http://stark.node'
     },
     {
       "type": "checks",
+      "id": "EVM.1.Txm.Finalizer",
+      "attributes": {
+        "name": "EVM.1.Txm.Finalizer",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
       "id": "EVM.1.Txm.WrappedEvmEstimator",
       "attributes": {
         "name": "EVM.1.Txm.WrappedEvmEstimator",
@@ -207,9 +234,45 @@ URL = 'http://stark.node'
     },
     {
       "type": "checks",
+      "id": "HeadReporter",
+      "attributes": {
+        "name": "HeadReporter",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "Heartbeat",
+      "attributes": {
+        "name": "Heartbeat",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
       "id": "JobSpawner",
       "attributes": {
         "name": "JobSpawner",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "JobSpecReporter",
+      "attributes": {
+        "name": "JobSpecReporter",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "LLOTransmissionReaper",
+      "attributes": {
+        "name": "LLOTransmissionReaper",
         "status": "passing",
         "output": ""
       }
@@ -243,6 +306,24 @@ URL = 'http://stark.node'
     },
     {
       "type": "checks",
+      "id": "NodePlatformBuildInfo",
+      "attributes": {
+        "name": "NodePlatformBuildInfo",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "NodePlatformJobInfo",
+      "attributes": {
+        "name": "NodePlatformJobInfo",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
       "id": "PipelineORM",
       "attributes": {
         "name": "PipelineORM",
@@ -261,27 +342,18 @@ URL = 'http://stark.node'
     },
     {
       "type": "checks",
-      "id": "PromReporter",
+      "id": "PipelineRunner.BridgeCache",
       "attributes": {
-        "name": "PromReporter",
+        "name": "PipelineRunner.BridgeCache",
         "status": "passing",
         "output": ""
       }
     },
     {
       "type": "checks",
-      "id": "Solana.Bar",
+      "id": "RetirementReportCache",
       "attributes": {
-        "name": "Solana.Bar",
-        "status": "passing",
-        "output": ""
-      }
-    },
-    {
-      "type": "checks",
-      "id": "StarkNet.Baz",
-      "attributes": {
-        "name": "StarkNet.Baz",
+        "name": "RetirementReportCache",
         "status": "passing",
         "output": ""
       }
@@ -293,6 +365,29 @@ URL = 'http://stark.node'
         "name": "TelemetryManager",
         "status": "passing",
         "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "WorkflowStore",
+      "attributes": {
+        "name": "WorkflowStore",
+        "status": "passing",
+        "output": ""
+      }
+    }
+  ]
+}
+-- out-unhealthy.json --
+{
+  "data": [
+    {
+      "type": "checks",
+      "id": "EVM.1.HeadTracker.HeadListener",
+      "attributes": {
+        "name": "EVM.1.HeadTracker.HeadListener",
+        "status": "failing",
+        "output": "Listener connected = false, receiving heads = false"
       }
     }
   ]

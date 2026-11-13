@@ -2,45 +2,63 @@ package v2
 
 import (
 	"encoding/json"
+	"errors"
 	"math/big"
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/vrf_coordinator_v2"
-	"github.com/smartcontractkit/chainlink/v2/core/services/job"
-	"github.com/smartcontractkit/chainlink/v2/core/services/vrf/vrfcommon"
-
+	commonkeystore "github.com/smartcontractkit/chainlink-common/keystore"
+	commonlogger "github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/services/servicetest"
 	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
 	clnull "github.com/smartcontractkit/chainlink-common/pkg/utils/null"
-
-	txmgrcommon "github.com/smartcontractkit/chainlink/v2/common/txmgr"
-	txmgrtypes "github.com/smartcontractkit/chainlink/v2/common/txmgr/types"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/gas"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/txmgr"
-	evmtypes "github.com/smartcontractkit/chainlink/v2/core/chains/evm/types"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm"
-	evmmocks "github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm/mocks"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/generated/vrf_coordinator_v2_5"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
+	"github.com/smartcontractkit/chainlink-evm/pkg/client/clienttest"
+	"github.com/smartcontractkit/chainlink-evm/pkg/gas"
+	"github.com/smartcontractkit/chainlink-evm/pkg/keys"
+	"github.com/smartcontractkit/chainlink-evm/pkg/logpoller"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr"
+	evmtypes "github.com/smartcontractkit/chainlink-evm/pkg/types"
+	txmgrcommon "github.com/smartcontractkit/chainlink-framework/chains/txmgr"
+	txmgrtypes "github.com/smartcontractkit/chainlink-framework/chains/txmgr/types"
+	evmmocks "github.com/smartcontractkit/chainlink/v2/common/chains/mocks"
+	mocks2 "github.com/smartcontractkit/chainlink/v2/common/txmgr/mocks"
+	"github.com/smartcontractkit/chainlink/v2/common/txmgr/types/mocks"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/evmtest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
+	"github.com/smartcontractkit/chainlink/v2/core/services/vrf/vrfcommon"
 	"github.com/smartcontractkit/chainlink/v2/core/testdata/testspecs"
-	"github.com/smartcontractkit/chainlink/v2/core/utils"
 )
 
 func makeTestTxm(t *testing.T, txStore txmgr.TestEvmTxStore, keyStore keystore.Master) txmgrcommon.TxManager[*big.Int, *evmtypes.Head, common.Address, common.Hash, common.Hash, evmtypes.Nonce, gas.EvmFee] {
 	_, _, evmConfig := txmgr.MakeTestConfigs(t)
-	ec := evmtest.NewEthClientMockWithDefaultChain(t)
+	ec := clienttest.NewClientWithDefaultChainID(t)
 	txmConfig := txmgr.NewEvmTxmConfig(evmConfig)
-	txm := txmgr.NewEvmTxm(ec.ConfiguredChainID(), txmConfig, evmConfig.Transactions(), keyStore.Eth(), logger.TestLogger(t), nil, nil,
-		nil, txStore, nil, nil, nil, nil, nil)
+	ks := keys.NewChainStore(keystore.NewEthSigner(keyStore.Eth(), ec.ConfiguredChainID()), ec.ConfiguredChainID())
+	builder := mocks.NewTxAttemptBuilder[*big.Int, *evmtypes.Head, common.Address, common.Hash, common.Hash, evmtypes.Nonce, gas.EvmFee](t)
+	servicetest.SetupNoOpMock(builder)
+	broadcaster := mocks2.NewBroadcaster[common.Address](t)
+	servicetest.SetupNoOpMock(broadcaster)
+	confirmer := mocks2.NewConfirmer[*evmtypes.Head, common.Address, common.Hash](t)
+	servicetest.SetupNoOpMock(confirmer)
+	tracker := mocks2.NewTracker[common.Address](t)
+	servicetest.SetupNoOpMock(tracker)
+	tracker.On("GetEnabledAddresses").Return(nil).Maybe()
+	finalizer := mocks.NewFinalizer[common.Hash, *evmtypes.Head](t)
+	servicetest.SetupNoOpMock(finalizer)
+	txm := txmgr.NewEvmTxm(ec.ConfiguredChainID(), txmConfig, evmConfig.Transactions(), ks, logger.TestLogger(t), nil, nil,
+		builder, txStore, broadcaster, confirmer, nil, tracker, finalizer, nil, false)
 
 	return txm
 }
@@ -54,11 +72,10 @@ func txMetaSubIDs(t *testing.T, vrfVersion vrfcommon.Version, subID *big.Int) (*
 		txMetaSubID       *uint64
 		txMetaGlobalSubID *string
 	)
-	if vrfVersion == vrfcommon.V2Plus {
-		txMetaGlobalSubID = ptr(subID.String())
-	} else if vrfVersion == vrfcommon.V2 {
-		txMetaSubID = ptr(subID.Uint64())
-	} else {
+	switch vrfVersion {
+	case vrfcommon.V2Plus:
+		txMetaGlobalSubID = new(subID.String())
+	default:
 		t.Errorf("unsupported vrf version: %s", vrfVersion)
 	}
 	return txMetaSubID, txMetaGlobalSubID
@@ -87,7 +104,7 @@ func addEthTx(t *testing.T, txStore txmgr.TestEvmTxStore, from common.Address, s
 		MinConfirmations:  clnull.Uint32{Uint32: 0},
 		PipelineTaskRunID: uuid.NullUUID{},
 	}
-	err = txStore.InsertTx(tx)
+	err = txStore.InsertTx(t.Context(), tx)
 	require.NoError(t, err)
 }
 
@@ -118,7 +135,7 @@ func addConfirmedEthTx(t *testing.T, txStore txmgr.TestEvmTxStore, from common.A
 		BroadcastAt:        &now,
 		InitialBroadcastAt: &now,
 	}
-	err = txStore.InsertTx(tx)
+	err = txStore.InsertTx(t.Context(), tx)
 	require.NoError(t, err)
 }
 
@@ -145,7 +162,7 @@ func addEthTxNativePayment(t *testing.T, txStore txmgr.TestEvmTxStore, from comm
 		MinConfirmations:  clnull.Uint32{Uint32: 0},
 		PipelineTaskRunID: uuid.NullUUID{},
 	}
-	err = txStore.InsertTx(tx)
+	err = txStore.InsertTx(t.Context(), tx)
 	require.NoError(t, err)
 }
 
@@ -175,18 +192,18 @@ func addConfirmedEthTxNativePayment(t *testing.T, txStore txmgr.TestEvmTxStore, 
 		BroadcastAt:        &now,
 		InitialBroadcastAt: &now,
 	}
-	err = txStore.InsertTx(tx)
+	err = txStore.InsertTx(t.Context(), tx)
 	require.NoError(t, err)
 }
 
 func testMaybeSubtractReservedLink(t *testing.T, vrfVersion vrfcommon.Version) {
+	ctx := t.Context()
 	db := pgtest.NewSqlxDB(t)
 	lggr := logger.TestLogger(t)
-	cfg := pgtest.NewQConfig(false)
-	ks := keystore.NewInMemory(db, utils.FastScryptParams, lggr, cfg)
-	require.NoError(t, ks.Unlock("blah"))
+	ks := keystore.NewInMemory(db, commonkeystore.FastScryptParams, lggr.Infof)
+	require.NoError(t, ks.Unlock(ctx, "blah"))
 	chainID := testutils.SimulatedChainID
-	k, err := ks.Eth().Create(chainID)
+	k, err := ks.Eth().Create(t.Context(), chainID)
 	require.NoError(t, err)
 
 	subID := new(big.Int).SetUint64(1)
@@ -196,7 +213,7 @@ func testMaybeSubtractReservedLink(t *testing.T, vrfVersion vrfcommon.Version) {
 		RequestedConfsDelay: 10,
 	}).Toml())
 	require.NoError(t, err)
-	txstore := txmgr.NewTxStore(db, lggr, cfg)
+	txstore := txmgr.NewTxStore(db, lggr)
 	txm := makeTestTxm(t, txstore, ks)
 	chain := evmmocks.NewChain(t)
 	chain.On("TxManager").Return(txm)
@@ -205,8 +222,6 @@ func testMaybeSubtractReservedLink(t *testing.T, vrfVersion vrfcommon.Version) {
 		job:       j,
 		chain:     chain,
 	}
-
-	ctx := testutils.Context(t)
 
 	// Insert an unstarted eth tx with link metadata
 	addEthTx(t, txstore, k.Address, txmgrcommon.TxUnstarted, "10000", subID, reqTxHash, vrfVersion)
@@ -236,7 +251,7 @@ func testMaybeSubtractReservedLink(t *testing.T, vrfVersion vrfcommon.Version) {
 	require.Equal(t, "80000", start.String())
 
 	// One key's data should not affect other keys' data in the case of different subscribers.
-	k2, err := ks.Eth().Create(testutils.SimulatedChainID)
+	k2, err := ks.Eth().Create(t.Context(), testutils.SimulatedChainID)
 	require.NoError(t, err)
 
 	anotherSubID := new(big.Int).SetUint64(3)
@@ -253,22 +268,19 @@ func testMaybeSubtractReservedLink(t *testing.T, vrfVersion vrfcommon.Version) {
 	require.Equal(t, "70000", start.String())
 }
 
-func TestMaybeSubtractReservedLinkV2(t *testing.T) {
-	testMaybeSubtractReservedLink(t, vrfcommon.V2)
-}
-
 func TestMaybeSubtractReservedLinkV2Plus(t *testing.T) {
+	t.Parallel()
 	testMaybeSubtractReservedLink(t, vrfcommon.V2Plus)
 }
 
 func testMaybeSubtractReservedNative(t *testing.T, vrfVersion vrfcommon.Version) {
+	ctx := t.Context()
 	db := pgtest.NewSqlxDB(t)
 	lggr := logger.TestLogger(t)
-	cfg := pgtest.NewQConfig(false)
-	ks := keystore.NewInMemory(db, utils.FastScryptParams, lggr, cfg)
-	require.NoError(t, ks.Unlock("blah"))
+	ks := keystore.NewInMemory(db, commonkeystore.FastScryptParams, lggr.Infof)
+	require.NoError(t, ks.Unlock(ctx, "blah"))
 	chainID := testutils.SimulatedChainID
-	k, err := ks.Eth().Create(chainID)
+	k, err := ks.Eth().Create(t.Context(), chainID)
 	require.NoError(t, err)
 
 	subID := new(big.Int).SetUint64(1)
@@ -278,7 +290,7 @@ func testMaybeSubtractReservedNative(t *testing.T, vrfVersion vrfcommon.Version)
 		RequestedConfsDelay: 10,
 	}).Toml())
 	require.NoError(t, err)
-	txstore := txmgr.NewTxStore(db, logger.TestLogger(t), cfg)
+	txstore := txmgr.NewTxStore(db, logger.TestLogger(t))
 	txm := makeTestTxm(t, txstore, ks)
 	require.NoError(t, err)
 	chain := evmmocks.NewChain(t)
@@ -288,8 +300,6 @@ func testMaybeSubtractReservedNative(t *testing.T, vrfVersion vrfcommon.Version)
 		job:       j,
 		chain:     chain,
 	}
-
-	ctx := testutils.Context(t)
 
 	// Insert an unstarted eth tx with native metadata
 	addEthTxNativePayment(t, txstore, k.Address, txmgrcommon.TxUnstarted, "10000", subID, reqTxHash, vrfVersion)
@@ -319,7 +329,7 @@ func testMaybeSubtractReservedNative(t *testing.T, vrfVersion vrfcommon.Version)
 	require.Equal(t, "80000", start.String())
 
 	// One key's data should not affect other keys' data in the case of different subscribers.
-	k2, err := ks.Eth().Create(testutils.SimulatedChainID)
+	k2, err := ks.Eth().Create(t.Context(), testutils.SimulatedChainID)
 	require.NoError(t, err)
 
 	anotherSubID := new(big.Int).SetUint64(3)
@@ -337,38 +347,12 @@ func testMaybeSubtractReservedNative(t *testing.T, vrfVersion vrfcommon.Version)
 }
 
 func TestMaybeSubtractReservedNativeV2Plus(t *testing.T) {
+	t.Parallel()
 	testMaybeSubtractReservedNative(t, vrfcommon.V2Plus)
 }
 
-func TestMaybeSubtractReservedNativeV2(t *testing.T) {
-	db := pgtest.NewSqlxDB(t)
-	lggr := logger.TestLogger(t)
-	cfg := pgtest.NewQConfig(false)
-	ks := keystore.NewInMemory(db, utils.FastScryptParams, lggr, cfg)
-	require.NoError(t, ks.Unlock("blah"))
-	chainID := testutils.SimulatedChainID
-	subID := new(big.Int).SetUint64(1)
-
-	j, err := vrfcommon.ValidatedVRFSpec(testspecs.GenerateVRFSpec(testspecs.VRFSpecParams{
-		RequestedConfsDelay: 10,
-	}).Toml())
-	require.NoError(t, err)
-	txstore := txmgr.NewTxStore(db, logger.TestLogger(t), cfg)
-	txm := makeTestTxm(t, txstore, ks)
-	chain := evmmocks.NewChain(t)
-	chain.On("TxManager").Return(txm).Maybe()
-	listener := &listenerV2{
-		respCount: map[string]uint64{},
-		job:       j,
-		chain:     chain,
-	}
-	// returns error because native payment is not supported for V2
-	start, err := listener.MaybeSubtractReservedEth(testutils.Context(t), big.NewInt(100_000), chainID, subID, vrfcommon.V2)
-	require.NoError(t, err)
-	assert.Equal(t, big.NewInt(0), start)
-}
-
 func TestListener_GetConfirmedAt(t *testing.T) {
+	t.Parallel()
 	j, err := vrfcommon.ValidatedVRFSpec(testspecs.GenerateVRFSpec(testspecs.VRFSpecParams{
 		RequestedConfsDelay: 10,
 	}).Toml())
@@ -382,7 +366,7 @@ func TestListener_GetConfirmedAt(t *testing.T) {
 	// Requester asks for 100 confirmations, we have a delay of 10,
 	// so we should wait for max(nodeMinConfs, requestedConfs + requestedConfsDelay) = 110 confirmations
 	nodeMinConfs := 10
-	confirmedAt := listener.getConfirmedAt(NewV2RandomWordsRequested(&vrf_coordinator_v2.VRFCoordinatorV2RandomWordsRequested{
+	confirmedAt := listener.getConfirmedAt(NewV2_5RandomWordsRequested(&vrf_coordinator_v2_5.VRFCoordinatorV25RandomWordsRequested{
 		RequestId:                   big.NewInt(1),
 		MinimumRequestConfirmations: 100,
 		Raw: types.Log{
@@ -398,7 +382,7 @@ func TestListener_GetConfirmedAt(t *testing.T) {
 	}).Toml())
 	require.NoError(t, err)
 	listener.job = j
-	confirmedAt = listener.getConfirmedAt(NewV2RandomWordsRequested(&vrf_coordinator_v2.VRFCoordinatorV2RandomWordsRequested{
+	confirmedAt = listener.getConfirmedAt(NewV2_5RandomWordsRequested(&vrf_coordinator_v2_5.VRFCoordinatorV25RandomWordsRequested{
 		RequestId:                   big.NewInt(1),
 		MinimumRequestConfirmations: 100,
 		Raw: types.Log{
@@ -409,6 +393,7 @@ func TestListener_GetConfirmedAt(t *testing.T) {
 }
 
 func TestListener_Backoff(t *testing.T) {
+	t.Parallel()
 	var tests = []struct {
 		name     string
 		initial  time.Duration
@@ -481,6 +466,7 @@ func TestListener_Backoff(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			lsn := &listenerV2{job: job.Job{
 				VRFSpec: &job.VRFSpec{
 					BackoffInitialDelay: test.initial,
@@ -497,4 +483,184 @@ func TestListener_Backoff(t *testing.T) {
 			require.Equal(t, test.expected, lsn.ready(req, 10))
 		})
 	}
+}
+
+func newRetryTestListener(t *testing.T, initial, maxDelay time.Duration) *listenerV2 {
+	t.Helper()
+	return &listenerV2{
+		l:             commonlogger.Sugared(commonlogger.Test(t)),
+		respCount:     map[string]uint64{},
+		inflightCache: vrfcommon.NewInflightCache(10),
+		reqAdded:      func() {},
+		retries:       make(map[string]retryState),
+		job: job.Job{
+			VRFSpec: &job.VRFSpec{
+				BackoffInitialDelay: initial,
+				BackoffMaxDelay:     maxDelay,
+			},
+		},
+	}
+}
+
+func newRetryTestRequest(id int64, confirmedAtBlock uint64) pendingRequest {
+	return newRetryTestRequestForSub(id, 1, confirmedAtBlock)
+}
+
+func newRetryTestRequestForSub(id int64, subID uint64, confirmedAtBlock uint64) pendingRequest {
+	return pendingRequest{
+		confirmedAtBlock: confirmedAtBlock,
+		req: NewV2_5RandomWordsRequested(&vrf_coordinator_v2_5.VRFCoordinatorV25RandomWordsRequested{
+			RequestId: big.NewInt(id),
+			SubId:     new(big.Int).SetUint64(subID),
+			Raw:       types.Log{BlockNumber: 1},
+		}),
+	}
+}
+
+// subErrCoordinator is a CoordinatorV2_X whose GetSubscription always fails with an RPC-style
+// error. Only the methods processPendingVRFRequests reaches before returning early are implemented;
+// calling any other method panics on the nil embedded interface.
+type subErrCoordinator struct {
+	CoordinatorV2_X
+	getSubscriptionCalls int
+}
+
+func (*subErrCoordinator) Version() vrfcommon.Version { return vrfcommon.V2Plus }
+
+func (c *subErrCoordinator) GetSubscription(*bind.CallOpts, *big.Int) (Subscription, error) {
+	c.getSubscriptionCalls++
+	return nil, errors.New("rpc unavailable")
+}
+
+func TestListener_updateRetryState(t *testing.T) {
+	t.Parallel()
+	lsn := newRetryTestListener(t, time.Minute, time.Hour)
+
+	failed := newRetryTestRequest(1, 1)
+	done := newRetryTestRequest(2, 1)
+	gated := newRetryTestRequest(3, 1)
+	gated.attempts = 4
+	gatedLastTry := time.Now().UTC().Add(-time.Second)
+	gated.lastTry = gatedLastTry
+	lsn.retries["3"] = retryState{attempts: 4, lastTry: gatedLastTry}
+	lsn.retries["2"] = retryState{attempts: 1, lastTry: time.Now().UTC()}
+	lsn.retries["99"] = retryState{attempts: 1, lastTry: time.Now().UTC()} // no longer pending
+
+	pending := []pendingRequest{failed, done, gated}
+	// gated is pending but waiting out its backoff, so it is not part of confirmed.
+	confirmed := map[string][]pendingRequest{"1": {failed, done}}
+	processed := map[string]struct{}{"2": {}}
+
+	before := time.Now().UTC()
+	lsn.updateRetryState(pending, confirmed, processed)
+
+	// failed request: attempts incremented, lastTry set
+	require.Equal(t, 1, lsn.retries["1"].attempts)
+	require.False(t, lsn.retries["1"].lastTry.Before(before))
+	// processed request: dropped
+	require.NotContains(t, lsn.retries, "2")
+	// gated request: untouched
+	require.Equal(t, retryState{attempts: 4, lastTry: gatedLastTry}, lsn.retries["3"])
+	// request no longer pending: pruned
+	require.NotContains(t, lsn.retries, "99")
+	require.Len(t, lsn.retries, 2)
+
+	// the next tick sees the restored attempt count and increments it again
+	failed.attempts = lsn.retries["1"].attempts
+	lsn.updateRetryState([]pendingRequest{failed}, map[string][]pendingRequest{"1": {failed}}, map[string]struct{}{})
+	require.Equal(t, 2, lsn.retries["1"].attempts)
+	// gated request fell out of pending, so it is pruned
+	require.NotContains(t, lsn.retries, "3")
+
+	// once nothing is pending, nothing is retained
+	lsn.updateRetryState(nil, nil, nil)
+	require.Empty(t, lsn.retries)
+}
+
+func TestListener_updateRetryState_nilMap(t *testing.T) {
+	t.Parallel()
+	lsn := newRetryTestListener(t, 0, 0)
+	lsn.retries = nil
+	req := newRetryTestRequest(1, 1)
+	lsn.updateRetryState([]pendingRequest{req}, map[string][]pendingRequest{"1": {req}}, nil)
+	require.Equal(t, 1, lsn.retries["1"].attempts)
+}
+
+// TestListener_retryStatePersistsAcrossTicks is the regression test for requests being rebuilt
+// with zeroed attempts/lastTry on every poll, which made backoff a no-op.
+func TestListener_retryStatePersistsAcrossTicks(t *testing.T) {
+	t.Parallel()
+	lsn := newRetryTestListener(t, time.Minute, time.Hour)
+
+	requested := []RandomWordsRequested{newRetryTestRequest(1, 1).req}
+	requestedLP := []logpoller.Log{{CreatedAt: time.Now()}}
+
+	// tick 1: first attempt is ready, and fails.
+	pending := lsn.handleRequested(requested, requestedLP, 1)
+	require.Len(t, pending, 1)
+	require.Zero(t, pending[0].attempts)
+	require.True(t, lsn.ready(pending[0], 100))
+	lsn.updateRetryState(pending, map[string][]pendingRequest{"1": pending}, map[string]struct{}{})
+
+	// tick 2: the poll rebuilds the request, but it must come back with its retry state
+	// and must not be ready until the backoff has elapsed.
+	pending = lsn.handleRequested(requested, requestedLP, 1)
+	require.Len(t, pending, 1)
+	require.Equal(t, 1, pending[0].attempts)
+	require.False(t, pending[0].lastTry.IsZero())
+	require.False(t, lsn.ready(pending[0], 100))
+	// being gated must not wipe its state
+	lsn.updateRetryState(pending, map[string][]pendingRequest{}, map[string]struct{}{})
+	require.Equal(t, 1, lsn.retries["1"].attempts)
+
+	// once the backoff window has passed the request is ready again.
+	lsn.retries["1"] = retryState{attempts: 1, lastTry: time.Now().UTC().Add(-2 * time.Minute)}
+	pending = lsn.handleRequested(requested, requestedLP, 1)
+	require.True(t, lsn.ready(pending[0], 100))
+
+	// the request gets fulfilled: it is no longer pending and its state is released.
+	lsn.updateRetryState(nil, nil, nil)
+	require.Empty(t, lsn.retries)
+}
+
+// TestListener_processPendingVRFRequests_earlyReturnKeepsRetryState covers the wiring between
+// processPendingVRFRequests and updateRetryState. When the subscription loop returns early,
+// requests that were never handed to request processing must not be recorded as failed attempts,
+// and the deferred update must still run (pruning entries of requests that are no longer pending).
+func TestListener_processPendingVRFRequests_earlyReturnKeepsRetryState(t *testing.T) {
+	t.Parallel()
+	coordinator := &subErrCoordinator{}
+	lsn := newRetryTestListener(t, time.Minute, time.Hour)
+	lsn.coordinator = coordinator
+	lsn.setLatestHead(logpoller.Block{BlockNumber: 100})
+
+	now := time.Now().UTC()
+	longAgo := now.Add(-time.Hour) // well past the backoff window, so the request is ready
+	justNow := now.Add(-time.Second)
+
+	// sub 1: a ready request that already failed twice, and one still waiting out its backoff.
+	retried := newRetryTestRequestForSub(1, 1, 2)
+	retried.attempts, retried.lastTry = 2, longAgo
+	gated := newRetryTestRequestForSub(3, 1, 2)
+	gated.attempts, gated.lastTry = 4, justNow
+	// sub 2: a ready request that was never attempted.
+	fresh := newRetryTestRequestForSub(2, 2, 2)
+
+	lsn.retries["1"] = retryState{attempts: 2, lastTry: longAgo}
+	lsn.retries["3"] = retryState{attempts: 4, lastTry: justNow}
+	lsn.retries["99"] = retryState{attempts: 1, lastTry: longAgo} // request is no longer pending
+
+	// GetSubscription fails for whichever subscription is processed first, so the loop returns
+	// before any request is handed to request processing, whatever the map iteration order is.
+	lsn.processPendingVRFRequests(t.Context(), []pendingRequest{retried, gated, fresh})
+
+	require.Equal(t, 1, coordinator.getSubscriptionCalls, "loop should return at the first failing subscription")
+	// never attempted: attempts must not be incremented and no entry created
+	require.Equal(t, retryState{attempts: 2, lastTry: longAgo}, lsn.retries["1"])
+	require.NotContains(t, lsn.retries, "2")
+	// still waiting out its backoff: state is kept
+	require.Equal(t, retryState{attempts: 4, lastTry: justNow}, lsn.retries["3"])
+	// the deferred update ran: the entry for a request that is no longer pending was pruned
+	require.NotContains(t, lsn.retries, "99")
+	require.Len(t, lsn.retries, 2)
 }

@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,31 +11,30 @@ import (
 )
 
 func TestDeferableWriteCloser_Close(t *testing.T) {
-
 	d := t.TempDir()
 	f, err := os.Create(filepath.Join(d, "test-file"))
 	require.NoError(t, err)
 
 	wc := NewDeferableWriteCloser(f)
 	wantStr := "wanted"
-	_, err = wc.Write([]byte(wantStr))
-	assert.NoError(t, err)
+	_, err = io.WriteString(wc, wantStr)
+	require.NoError(t, err)
 	defer func() {
 		assert.NoError(t, wc.Close())
 	}()
 
-	assert.NoError(t, wc.Close())
+	require.NoError(t, wc.Close())
 	assert.True(t, wc.closed)
 	// safe to close multiple times
-	assert.NoError(t, wc.Close())
+	require.NoError(t, wc.Close())
 
-	_, err = f.Write([]byte("after close"))
-	assert.ErrorIs(t, err, os.ErrClosed)
+	_, err = io.WriteString(f, "after close")
+	require.ErrorIs(t, err, os.ErrClosed)
 
-	_, err = wc.Write([]byte("write to wc after close"))
-	assert.ErrorIs(t, err, os.ErrClosed)
+	_, err = io.WriteString(f, "write to wc after close")
+	require.ErrorIs(t, err, os.ErrClosed)
 
 	r, err := os.ReadFile(f.Name())
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, wantStr, string(r))
 }

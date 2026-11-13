@@ -1,21 +1,22 @@
 package web
 
 import (
+	stderrors "errors"
+	"fmt"
 	"math/big"
 	"net/http"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/gin-gonic/gin"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/forwarders"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/logpoller"
-	ubig "github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
+	"github.com/smartcontractkit/chainlink-evm/pkg/forwarders"
+	"github.com/smartcontractkit/chainlink-evm/pkg/logpoller"
 	"github.com/smartcontractkit/chainlink/v2/core/logger/audit"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
-	"github.com/smartcontractkit/chainlink/v2/core/services/pg"
 	"github.com/smartcontractkit/chainlink/v2/core/utils/stringutils"
 	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
-
-	"github.com/gin-gonic/gin"
 )
 
 // EVMForwardersController manages EVM forwarders.
@@ -25,8 +26,8 @@ type EVMForwardersController struct {
 
 // Index lists EVM forwarders.
 func (cc *EVMForwardersController) Index(c *gin.Context, size, page, offset int) {
-	orm := forwarders.NewORM(cc.App.GetSqlxDB(), cc.App.GetLogger(), cc.App.GetConfig().Database())
-	fwds, count, err := orm.FindForwarders(0, size)
+	orm := forwarders.NewORM(cc.App.GetDB())
+	fwds, count, err := orm.FindForwarders(c.Request.Context(), 0, size)
 
 	if err != nil {
 		jsonAPIError(c, http.StatusBadRequest, err)
@@ -43,7 +44,7 @@ func (cc *EVMForwardersController) Index(c *gin.Context, size, page, offset int)
 
 // TrackEVMForwarderRequest is a JSONAPI request for creating an EVM forwarder.
 type TrackEVMForwarderRequest struct {
-	EVMChainID *ubig.Big      `json:"evmChainId"`
+	EVMChainID *sqlutil.Big   `json:"evmChainId"`
 	Address    common.Address `json:"address"`
 }
 
@@ -55,15 +56,15 @@ func (cc *EVMForwardersController) Track(c *gin.Context) {
 		jsonAPIError(c, http.StatusUnprocessableEntity, err)
 		return
 	}
-	orm := forwarders.NewORM(cc.App.GetSqlxDB(), cc.App.GetLogger(), cc.App.GetConfig().Database())
-	fwd, err := orm.CreateForwarder(request.Address, *request.EVMChainID)
+	orm := forwarders.NewORM(cc.App.GetDB())
+	fwd, err := orm.CreateForwarder(c.Request.Context(), request.Address, *request.EVMChainID)
 
 	if err != nil {
 		jsonAPIError(c, http.StatusBadRequest, err)
 		return
 	}
 
-	cc.App.GetAuditLogger().Audit(audit.ForwarderCreated, map[string]interface{}{
+	cc.App.GetAuditLogger().Audit(audit.ForwarderCreated, map[string]any{
 		"forwarderID":         fwd.ID,
 		"forwarderAddress":    fwd.Address,
 		"forwarderEVMChainID": fwd.EVMChainID,
@@ -79,29 +80,33 @@ func (cc *EVMForwardersController) Delete(c *gin.Context) {
 		return
 	}
 
-	filterCleanup := func(tx pg.Queryer, evmChainID int64, addr common.Address) error {
-		chain, err2 := cc.App.GetRelayers().LegacyEVMChains().Get(big.NewInt(evmChainID).String())
+	filterCleanup := func(tx sqlutil.DataSource, evmChainID int64, addr common.Address) error {
+		chainService, err2 := cc.App.GetRelayers().LegacyEVMChains().Get(big.NewInt(evmChainID).String()) //nolint:staticcheck // LegacyEVMChains is deprecated but refactoring to new relayer interface requires larger architectural changes
 		if err2 != nil {
 			// If the chain id doesn't even exist, or logpoller is disabled, then there isn't any filter to clean up.  Returning an error
 			// here could be dangerous as it would make it impossible to delete a forwarder with an invalid chain id
-			return nil
+			return nil //nolint:nilerr // intentional: a missing chain id means no forwarder filter to clean up
+		}
+		chain, ok := chainService.(legacyevm.Chain)
+		if !ok {
+			return fmt.Errorf("not available in loop mode: %w", stderrors.ErrUnsupported)
 		}
 
 		if chain.LogPoller() == logpoller.LogPollerDisabled {
 			// handle same as non-existent chain id
 			return nil
 		}
-		return chain.LogPoller().UnregisterFilter(forwarders.FilterName(addr), pg.WithQueryer(tx))
+		return chain.LogPoller().UnregisterFilter(c.Request.Context(), forwarders.FilterName(addr))
 	}
 
-	orm := forwarders.NewORM(cc.App.GetSqlxDB(), cc.App.GetLogger(), cc.App.GetConfig().Database())
-	err = orm.DeleteForwarder(id, filterCleanup)
+	orm := forwarders.NewORM(cc.App.GetDB())
+	err = orm.DeleteForwarder(c.Request.Context(), id, filterCleanup)
 
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	cc.App.GetAuditLogger().Audit(audit.ForwarderDeleted, map[string]interface{}{"id": id})
+	cc.App.GetAuditLogger().Audit(audit.ForwarderDeleted, map[string]any{"id": id})
 	jsonAPIResponseWithStatus(c, nil, "forwarder", http.StatusNoContent)
 }

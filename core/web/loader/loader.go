@@ -14,7 +14,7 @@ type loadersKey struct{}
 type Dataloader struct {
 	app chainlink.Application
 
-	ChainsByIDLoader                          *dataloader.Loader
+	ChainsByRelayIDLoader                     *dataloader.Loader
 	EthTxAttemptsByEthTxIDLoader              *dataloader.Loader
 	FeedsManagersByIDLoader                   *dataloader.Loader
 	FeedsManagerChainConfigsByManagerIDLoader *dataloader.Loader
@@ -37,15 +37,15 @@ func New(app chainlink.Application) *Dataloader {
 		jps      = &jobProposalBatcher{app: app}
 		jpSpecs  = &jobProposalSpecBatcher{app: app}
 		jbs      = &jobBatcher{app: app}
-		attmpts  = &ethTransactionAttemptBatcher{app: app}
+		attempts = &ethTransactionAttemptBatcher{app: app}
 		specErrs = &jobSpecErrorsBatcher{app: app}
 	)
 
 	return &Dataloader{
 		app: app,
 
-		ChainsByIDLoader:                          dataloader.NewBatchedLoader(chains.loadByIDs),
-		EthTxAttemptsByEthTxIDLoader:              dataloader.NewBatchedLoader(attmpts.loadByEthTransactionIDs),
+		ChainsByRelayIDLoader:                     dataloader.NewBatchedLoader(chains.loadByRelayIDs),
+		EthTxAttemptsByEthTxIDLoader:              dataloader.NewBatchedLoader(attempts.loadByEthTransactionIDs),
 		FeedsManagersByIDLoader:                   dataloader.NewBatchedLoader(mgrs.loadByIDs),
 		FeedsManagerChainConfigsByManagerIDLoader: dataloader.NewBatchedLoader(ccfgs.loadByManagerIDs),
 		JobProposalsByManagerIDLoader:             dataloader.NewBatchedLoader(jps.loadByManagersIDs),

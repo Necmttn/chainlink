@@ -1,14 +1,15 @@
 package resolver
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"testing"
 
 	gqlerrors "github.com/graph-gophers/graphql-go/errors"
 	"github.com/pkg/errors"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 	"github.com/smartcontractkit/chainlink/v2/core/utils/stringutils"
@@ -18,6 +19,7 @@ import (
 // so we test the job error resolvers by fetching a job by id.
 
 func TestResolver_JobErrors(t *testing.T) {
+	t.Parallel()
 	var (
 		id      = int32(1)
 		errorID = int64(200)
@@ -27,12 +29,12 @@ func TestResolver_JobErrors(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
-				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", id).Return(job.Job{
+				f.Mocks.jobORM.On("FindJobWithoutSpecErrors", mock.Anything, id).Return(job.Job{
 					ID: int32(1),
 				}, nil)
-				f.Mocks.jobORM.On("FindSpecErrorsByJobIDs", []int32{1}, mock.Anything).Return([]job.SpecError{
+				f.Mocks.jobORM.On("FindSpecErrorsByJobIDs", mock.Anything, []int32{1}, mock.Anything).Return([]job.SpecError{
 					{
 						ID:          errorID,
 						Description: "no contract code at given address",
@@ -95,15 +97,15 @@ func TestResolver_DismissJobError(t *testing.T) {
 					}
 				}
 		}`
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"id": "1",
 	}
-	invalidVariables := map[string]interface{}{
+	invalidVariables := map[string]any{
 		"id": "asdadada",
 	}
-	d, err := json.Marshal(map[string]interface{}{
-		"dismissJobError": map[string]interface{}{
-			"jobError": map[string]interface{}{
+	d, err := json.Marshal(map[string]any{
+		"dismissJobError": map[string]any{
+			"jobError": map[string]any{
 				"id":          "1",
 				"occurrences": 5,
 				"description": "test-description",
@@ -111,7 +113,7 @@ func TestResolver_DismissJobError(t *testing.T) {
 			},
 		},
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	expected := string(d)
 
 	gError := errors.New("error")
@@ -123,8 +125,8 @@ func TestResolver_DismissJobError(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.Mocks.jobORM.On("FindSpecError", id).Return(job.SpecError{
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.Mocks.jobORM.On("FindSpecError", mock.Anything, id).Return(job.SpecError{
 					ID:          id,
 					Occurrences: 5,
 					Description: "test-description",
@@ -140,8 +142,8 @@ func TestResolver_DismissJobError(t *testing.T) {
 		{
 			name:          "not found on FindSpecError()",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.Mocks.jobORM.On("FindSpecError", id).Return(job.SpecError{}, sql.ErrNoRows)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.Mocks.jobORM.On("FindSpecError", mock.Anything, id).Return(job.SpecError{}, sql.ErrNoRows)
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
 			},
 			query:     mutation,
@@ -158,8 +160,8 @@ func TestResolver_DismissJobError(t *testing.T) {
 		{
 			name:          "not found on DismissError()",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.Mocks.jobORM.On("FindSpecError", id).Return(job.SpecError{}, nil)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.Mocks.jobORM.On("FindSpecError", mock.Anything, id).Return(job.SpecError{}, nil)
 				f.Mocks.jobORM.On("DismissError", mock.Anything, id).Return(sql.ErrNoRows)
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
 			},
@@ -177,8 +179,8 @@ func TestResolver_DismissJobError(t *testing.T) {
 		{
 			name:          "generic error on FindSpecError()",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.Mocks.jobORM.On("FindSpecError", id).Return(job.SpecError{}, gError)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.Mocks.jobORM.On("FindSpecError", mock.Anything, id).Return(job.SpecError{}, gError)
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
 			},
 			query:     mutation,
@@ -188,7 +190,7 @@ func TestResolver_DismissJobError(t *testing.T) {
 				{
 					Extensions:    nil,
 					ResolverError: gError,
-					Path:          []interface{}{"dismissJobError"},
+					Path:          []any{"dismissJobError"},
 					Message:       gError.Error(),
 				},
 			},
@@ -196,8 +198,8 @@ func TestResolver_DismissJobError(t *testing.T) {
 		{
 			name:          "generic error on DismissError()",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.Mocks.jobORM.On("FindSpecError", id).Return(job.SpecError{}, nil)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.Mocks.jobORM.On("FindSpecError", mock.Anything, id).Return(job.SpecError{}, nil)
 				f.Mocks.jobORM.On("DismissError", mock.Anything, id).Return(gError)
 				f.App.On("JobORM").Return(f.Mocks.jobORM)
 			},
@@ -208,7 +210,7 @@ func TestResolver_DismissJobError(t *testing.T) {
 				{
 					Extensions:    nil,
 					ResolverError: gError,
-					Path:          []interface{}{"dismissJobError"},
+					Path:          []any{"dismissJobError"},
 					Message:       gError.Error(),
 				},
 			},
@@ -223,7 +225,7 @@ func TestResolver_DismissJobError(t *testing.T) {
 				{
 					Extensions:    nil,
 					ResolverError: idError,
-					Path:          []interface{}{"dismissJobError"},
+					Path:          []any{"dismissJobError"},
 					Message:       idError.Error(),
 				},
 			},

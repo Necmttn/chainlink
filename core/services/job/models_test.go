@@ -1,4 +1,4 @@
-package job
+package job_test
 
 import (
 	_ "embed"
@@ -7,65 +7,107 @@ import (
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/guregu/null.v4"
 
 	"github.com/smartcontractkit/chainlink-common/pkg/codec"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
 	"github.com/smartcontractkit/chainlink-common/pkg/types"
+	"github.com/smartcontractkit/chainlink-evm/pkg/config"
+	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 	"github.com/smartcontractkit/chainlink/v2/core/services/relay"
-	evmtypes "github.com/smartcontractkit/chainlink/v2/core/services/relay/evm/types"
-	"github.com/smartcontractkit/chainlink/v2/core/store/models"
 )
+
+func TestStandardCapabilitiesSpec_Deserialization(t *testing.T) {
+	tomlData := `
+	type = "standardcapabilities"
+	schemaVersion = 1
+	name = "consensus-capabilities"
+	externalJobID = "aea7103f-6e87-5c01-b644-a0b4aeaed3eb"
+	forwardingAllowed = false
+	command = "consensus"
+	config = """"""
+
+	[oracle_factory]
+	enabled = true
+	bootstrap_peers = ["12D3KooWBAzThfs9pD4WcsFKCi68EUz2fZgZskDBT6JcJRndPss5@cl-keystone-two-bt-0:5001"]
+	ocr_contract_address = "0x2C84cff4cd5fA5a0c17dbc710fcCb8FC6A03dEEd"
+	ocr_key_bundle_id = "5fbb7d5dc1e592142a979b7014552e07a78cb89b1a8626c6412f12f2adfcb240"
+	chain_id = "11155111"
+	transmitter_id = "0x60042fBB756f736744C334c463BeBE1A72Add04F"
+	[oracle_factory.onchainSigningStrategy]
+	strategyName = "multi-chain"
+	[oracle_factory.onchainSigningStrategy.config]
+	aptos = "7c2df2e806306383f9aa2bc7a3198cf0e1c626f873799992b2841240c6931733"
+	evm = "5fbb7d5dc1e592142a979b7014552e07a78cb89b1a8626c6412f12f2adfcb240"
+	`
+
+	var spec job.StandardCapabilitiesSpec
+	err := toml.Unmarshal([]byte(tomlData), &spec)
+	require.NoError(t, err)
+	assert.Equal(t, "consensus", spec.Command)
+	assert.Equal(t, "11155111", spec.OracleFactory.ChainID)
+	assert.Equal(t, "multi-chain", spec.OracleFactory.OnchainSigning.StrategyName)
+	assert.Equal(t, []string{"12D3KooWBAzThfs9pD4WcsFKCi68EUz2fZgZskDBT6JcJRndPss5@cl-keystone-two-bt-0:5001"}, spec.OracleFactory.BootstrapPeers)
+	assert.Equal(t, map[string]string{
+		"aptos": "7c2df2e806306383f9aa2bc7a3198cf0e1c626f873799992b2841240c6931733",
+		"evm":   "5fbb7d5dc1e592142a979b7014552e07a78cb89b1a8626c6412f12f2adfcb240",
+	}, spec.OracleFactory.OnchainSigning.Config)
+	assert.Equal(t, "0x60042fBB756f736744C334c463BeBE1A72Add04F", spec.OracleFactory.TransmitterID)
+	assert.Equal(t, "0x2C84cff4cd5fA5a0c17dbc710fcCb8FC6A03dEEd", spec.OracleFactory.OCRContractAddress)
+	assert.Equal(t, "5fbb7d5dc1e592142a979b7014552e07a78cb89b1a8626c6412f12f2adfcb240", spec.OracleFactory.OCRKeyBundleID)
+}
 
 func TestOCR2OracleSpec_RelayIdentifier(t *testing.T) {
 	type fields struct {
-		Relay       relay.Network
+		Relay       string
 		ChainID     string
-		RelayConfig JSONConfig
+		RelayConfig job.JSONConfig
 	}
 	tests := []struct {
 		name    string
 		fields  fields
-		want    relay.ID
+		want    types.RelayID
 		wantErr bool
 	}{
-		{name: "err no chain id",
+		{
+			name:    "err no chain id",
 			fields:  fields{},
-			want:    relay.ID{},
+			want:    types.RelayID{},
 			wantErr: true,
 		},
 		{
 			name: "evm explicitly configured",
 			fields: fields{
-				Relay:   relay.EVM,
+				Relay:   relay.NetworkEVM,
 				ChainID: "1",
 			},
-			want: relay.ID{Network: relay.EVM, ChainID: "1"},
+			want: types.RelayID{Network: relay.NetworkEVM, ChainID: "1"},
 		},
 		{
 			name: "evm implicitly configured",
 			fields: fields{
-				Relay:       relay.EVM,
+				Relay:       relay.NetworkEVM,
 				RelayConfig: map[string]any{"chainID": 1},
 			},
-			want: relay.ID{Network: relay.EVM, ChainID: "1"},
+			want: types.RelayID{Network: relay.NetworkEVM, ChainID: "1"},
 		},
 		{
 			name: "evm implicitly configured with bad value",
 			fields: fields{
-				Relay:       relay.EVM,
+				Relay:       relay.NetworkEVM,
 				RelayConfig: map[string]any{"chainID": float32(1)},
 			},
-			want:    relay.ID{},
+			want:    types.RelayID{},
 			wantErr: true,
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			s := &OCR2OracleSpec{
+			s := &job.OCR2OracleSpec{
 				Relay:       tt.fields.Relay,
 				ChainID:     tt.fields.ChainID,
 				RelayConfig: tt.fields.RelayConfig,
@@ -90,19 +132,19 @@ var (
 )
 
 func TestOCR2OracleSpec(t *testing.T) {
-	val := OCR2OracleSpec{
-		Relay:                             relay.EVM,
+	val := job.OCR2OracleSpec{
+		Relay:                             relay.NetworkEVM,
 		PluginType:                        types.Median,
 		ContractID:                        "foo",
 		OCRKeyBundleID:                    null.StringFrom("bar"),
 		TransmitterID:                     null.StringFrom("baz"),
 		ContractConfigConfirmations:       1,
-		ContractConfigTrackerPollInterval: *models.NewInterval(time.Second),
-		RelayConfig: map[string]interface{}{
+		ContractConfigTrackerPollInterval: *sqlutil.NewInterval(time.Second),
+		RelayConfig: map[string]any{
 			"chainID":   1337,
 			"fromBlock": 42,
-			"chainReader": evmtypes.ChainReaderConfig{
-				Contracts: map[string]evmtypes.ChainContractReader{
+			"chainReader": config.ChainReaderConfig{
+				Contracts: map[string]config.ChainContractReader{
 					"median": {
 						ContractABI: `[
   {
@@ -171,7 +213,7 @@ func TestOCR2OracleSpec(t *testing.T) {
   }
 ]
 `,
-						Configs: map[string]*evmtypes.ChainReaderDefinition{
+						Configs: map[string]*config.ChainReaderDefinition{
 							"LatestTransmissionDetails": {
 								ChainSpecificName: "latestTransmissionDetails",
 								OutputModifications: codec.ModifiersConfig{
@@ -188,14 +230,14 @@ func TestOCR2OracleSpec(t *testing.T) {
 							},
 							"LatestRoundRequested": {
 								ChainSpecificName: "RoundRequested",
-								ReadType:          evmtypes.Event,
+								ReadType:          config.Event,
 							},
 						},
 					},
 				},
 			},
-			"codec": evmtypes.CodecConfig{
-				Configs: map[string]evmtypes.ChainCodecConfig{
+			"codec": config.CodecConfig{
+				Configs: map[string]config.ChainCodecConfig{
 					"MedianReport": {
 						TypeABI: `[
   {
@@ -220,7 +262,15 @@ func TestOCR2OracleSpec(t *testing.T) {
 				},
 			},
 		},
-		PluginConfig: map[string]interface{}{"juelsPerFeeCoinSource": `  // data source 1
+		OnchainSigningStrategy: map[string]any{
+			"strategyName": "single-chain",
+			"config": map[string]any{
+				"evm":       "",
+				"publicKey": "0xdeadbeef",
+			},
+		},
+		PluginConfig: map[string]any{
+			"juelsPerFeeCoinSource": `  // data source 1
   ds1          [type=bridge name="%s"];
   ds1_parse    [type=jsonparse path="data"];
   ds1_multiply [type=multiply times=2];
@@ -246,13 +296,13 @@ func TestOCR2OracleSpec(t *testing.T) {
 	})
 
 	t.Run("round-trip", func(t *testing.T) {
-		var gotVal OCR2OracleSpec
+		var gotVal job.OCR2OracleSpec
 		require.NoError(t, toml.Unmarshal([]byte(compact), &gotVal))
 		gotB, err := toml.Marshal(gotVal)
 		require.NoError(t, err)
 		require.Equal(t, compact, string(gotB))
 		t.Run("pretty", func(t *testing.T) {
-			var gotVal OCR2OracleSpec
+			var gotVal job.OCR2OracleSpec
 			require.NoError(t, toml.Unmarshal([]byte(pretty), &gotVal))
 			gotB, err := toml.Marshal(gotVal)
 			require.NoError(t, err)

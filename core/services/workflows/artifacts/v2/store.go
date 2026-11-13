@@ -1,0 +1,290 @@
+package v2
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/jonboulle/clockwork"
+
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/workflowkey"
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	"github.com/smartcontractkit/chainlink-common/pkg/custmsg"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/cresettings"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/limits"
+	storage_service "github.com/smartcontractkit/chainlink-protos/storage-service/go"
+	ghcapabilities "github.com/smartcontractkit/chainlink/v2/core/services/gateway/handlers/capabilities"
+	"github.com/smartcontractkit/chainlink/v2/core/services/job"
+	"github.com/smartcontractkit/chainlink/v2/core/services/workflows/types"
+)
+
+func safeUint32(n uint64) uint32 {
+	if n > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(n)
+}
+
+type ArtifactLimiters struct {
+	MaxConfigSize  limits.BoundLimiter[commonconfig.Size]
+	MaxSecretsSize limits.BoundLimiter[commonconfig.Size] // TODO unused
+	MaxBinarySize  limits.BoundLimiter[commonconfig.Size]
+}
+
+// makeLimiters constructs ArtifactLimiters from cfg, or uses defaults if cfg is nil.
+func makeLimiters(lf limits.Factory) (limiters *ArtifactLimiters, err error) {
+	limiters = new(ArtifactLimiters)
+	configSizeLimit := cresettings.Default.PerWorkflow.WASMConfigSizeLimit
+	limiters.MaxConfigSize, err = limits.MakeUpperBoundLimiter(lf, configSizeLimit)
+	if err != nil {
+		return limiters, err
+	}
+
+	secretsSizeLimit := cresettings.Default.PerWorkflow.WASMSecretsSizeLimit
+	limiters.MaxSecretsSize, err = limits.MakeUpperBoundLimiter(lf, secretsSizeLimit)
+	if err != nil {
+		return limiters, err
+	}
+
+	binarySizeLimit := cresettings.Default.PerWorkflow.WASMBinarySizeLimit
+	limiters.MaxBinarySize, err = limits.MakeUpperBoundLimiter(lf, binarySizeLimit)
+	return limiters, err
+}
+
+type StoreConfig struct {
+	ArtifactStorageHost string
+}
+
+func WithConfig(cfg StoreConfig) func(*Store) {
+	return func(a *Store) {
+		a.config = &cfg
+	}
+}
+
+type SerialisedModuleStore interface {
+	StoreModule(workflowID string, module []byte, engineVersion string) error
+	GetModule(workflowID string) (path, engineVersion string, ok bool, err error)
+	DeleteModule(workflowID string) error
+}
+
+type Store struct {
+	lggr logger.Logger
+
+	limiters *ArtifactLimiters
+	config   *StoreConfig
+
+	orm WorkflowRegistryDS
+
+	// retrieveFunc is a function that retrieves a URL to download an artifact.
+	retrieveFunc types.LocationRetrieverFunc
+	// fetchFn is a function that fetches the contents of a URL with a limit on the size of the response.
+	fetchFn types.FetcherFunc
+
+	clock clockwork.Clock
+
+	encryptionKey workflowkey.Key
+
+	emitter custmsg.MessageEmitter
+}
+
+func NewStore(lggr logger.Logger, orm WorkflowRegistryDS, fetchFn types.FetcherFunc, retrieveFunc types.LocationRetrieverFunc, clock clockwork.Clock, encryptionKey workflowkey.Key,
+	emitter custmsg.MessageEmitter, limitsFactory limits.Factory, opts ...func(*Store),
+) (*Store, error) {
+	artifactsStore := &Store{
+		lggr:          lggr,
+		orm:           orm,
+		retrieveFunc:  retrieveFunc,
+		fetchFn:       fetchFn,
+		clock:         clock,
+		config:        &StoreConfig{},
+		encryptionKey: encryptionKey,
+		emitter:       emitter,
+	}
+
+	for _, o := range opts {
+		o(artifactsStore)
+	}
+
+	var err error
+	artifactsStore.limiters, err = makeLimiters(limitsFactory)
+	if err != nil {
+		return nil, err
+	}
+
+	if retrieveFunc != nil && artifactsStore.config.ArtifactStorageHost == "" {
+		return nil, errors.New("storage service URL prefix must be set in the store config")
+	}
+
+	return artifactsStore, nil
+}
+
+// FetchWorkflowArtifacts fetches the workflow binary and config from a cache or the specified URLs if the artifacts have not
+// been cached already. Before a workflow can be started this method must be called to ensure all artifacts used by the
+// workflow are available from the store.
+func (h *Store) FetchWorkflowArtifacts(ctx context.Context, workflowID, binaryURL, configURL string, existingSpec *job.WorkflowSpec) ([]byte, []byte, error) {
+	if existingSpec != nil && existingSpec.Workflow != "" {
+		// there is no update in the BinaryURL or ConfigURL, lets decode the stored artifacts
+		decodedBinary, err := hex.DecodeString(existingSpec.Workflow)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to decode stored workflow spec: %w", err)
+		}
+		return decodedBinary, []byte(existingSpec.Config), nil
+	}
+
+	// Determine which URL to retrieve workflow binary artifacts from
+	parsedBinaryURL, err := url.Parse(binaryURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid binary URL: %w", err)
+	}
+
+	// If the binary URL points to the artifact storage host, use the retrieve function to get the signed URL.
+	// NOTE: retrieveFunc may be nil if the fetcherFunc was overridden.
+	// TODO CRE-632: retrieverFunc should enforced made to always be set, once local CRE can support it.
+	if h.retrieveFunc != nil && parsedBinaryURL.Host == h.config.ArtifactStorageHost {
+		signedBinaryURL, err2 := h.retrieveFunc(ctx, &storage_service.DownloadArtifactRequest{
+			Id:   workflowID,
+			Type: storage_service.ArtifactType_ARTIFACT_TYPE_BINARY,
+		})
+		if err2 != nil {
+			return nil, nil, fmt.Errorf("failed to get binary artifact URL: %w", err2)
+		}
+		binaryURL = signedBinaryURL
+	}
+
+	// Fetch the binary files from the specified URLs.
+	var (
+		binary, decodedBinary, config []byte
+	)
+
+	maxBinarySize, err := h.limiters.MaxBinarySize.Limit(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get binary size limit: %w", err)
+	} else if maxBinarySize < 0 {
+		maxBinarySize = 0
+	}
+	req := ghcapabilities.Request{
+		URL:              binaryURL,
+		Method:           http.MethodGet,
+		MaxResponseBytes: safeUint32(uint64(maxBinarySize)),
+		WorkflowID:       workflowID,
+	}
+	binary, err = h.fetchFn(ctx, messageID(binaryURL, workflowID), req)
+	if err != nil {
+		return nil, nil, &types.ArtifactFetchError{ArtifactType: "binary", URL: binaryURL, Err: err}
+	}
+
+	if decodedBinary, err = base64.StdEncoding.DecodeString(string(binary)); err != nil {
+		return nil, nil, fmt.Errorf("failed to decode binary: %w", err)
+	}
+
+	if configURL != "" {
+		// Determine which URL to retrieve config binary artifacts from
+		parsedConfigURL, err2 := url.Parse(configURL)
+		if err2 != nil {
+			return nil, nil, fmt.Errorf("invalid config URL: %w", err2)
+		}
+
+		// If the config URL points to the artifact storage host, use the retrieve function to get the signed URL.
+		// NOTE: retrieveFunc may be nil if the fetcherFunc was overridden.
+		// TODO CRE-632: retrieverFunc should enforced made to always be set, once local CRE can support it.
+		if h.retrieveFunc != nil && parsedConfigURL.Host == h.config.ArtifactStorageHost {
+			signedConfigURL, configErr := h.retrieveFunc(ctx, &storage_service.DownloadArtifactRequest{
+				Id:   workflowID,
+				Type: storage_service.ArtifactType_ARTIFACT_TYPE_CONFIG,
+			})
+			if configErr != nil {
+				return nil, nil, fmt.Errorf("failed to get config artifact URL: %w", configErr)
+			}
+			configURL = signedConfigURL
+		}
+
+		maxResponseBytes, err := h.limiters.MaxConfigSize.Limit(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to get binary size limit: %w", err)
+		} else if maxResponseBytes < 0 {
+			maxResponseBytes = 0
+		}
+		// Fetch the config files from the specified URLs.
+		req := ghcapabilities.Request{
+			URL:              configURL,
+			Method:           http.MethodGet,
+			MaxResponseBytes: safeUint32(uint64(maxResponseBytes)),
+			WorkflowID:       workflowID,
+		}
+
+		config, err2 = h.fetchFn(ctx, messageID(configURL, workflowID), req)
+		if err2 != nil {
+			return nil, nil, &types.ArtifactFetchError{ArtifactType: "config", URL: configURL, Err: err2}
+		}
+	}
+	return decodedBinary, config, nil
+}
+
+func (h *Store) GetWorkflowSpec(ctx context.Context, workflowID string) (*job.WorkflowSpec, error) {
+	spec, err := h.orm.GetWorkflowSpec(ctx, workflowID)
+	return spec, err
+}
+
+// ListWorkflowSpecs returns the persisted workflow specs (identity columns
+// only). It backs the orphan sweep and the metering snapshot path.
+func (h *Store) ListWorkflowSpecs(ctx context.Context) ([]*job.WorkflowSpec, error) {
+	return h.orm.ListWorkflowSpecs(ctx)
+}
+
+func (h *Store) UpsertWorkflowSpec(ctx context.Context, spec *job.WorkflowSpec) (int64, error) {
+	return h.orm.UpsertWorkflowSpec(ctx, spec)
+}
+
+// SaveTriggerSubscriptions persists the marshaled trigger subscription payload
+// so future engine starts for this workflow ID can skip WASM execution.
+func (h *Store) SaveTriggerSubscriptions(ctx context.Context, workflowID string, payload []byte) error {
+	return h.orm.SaveTriggerSubscriptions(ctx, workflowID, payload)
+}
+
+// DeleteWorkflowArtifacts removes the workflow spec from the database. If not
+// found, returns (nil, nil).
+func (h *Store) DeleteWorkflowArtifacts(ctx context.Context, workflowID string) (*job.WorkflowSpec, error) {
+	return h.orm.DeleteWorkflowSpec(ctx, workflowID)
+}
+
+func (h *Store) PauseWorkflowArtifacts(ctx context.Context, workflowID string) error {
+	return h.orm.PauseWorkflowSpec(ctx, workflowID)
+}
+
+func (h *Store) DeleteWorkflowArtifactsBatch(ctx context.Context, workflowIDs []string) error {
+	return h.orm.DeleteWorkflowSpecs(ctx, workflowIDs)
+}
+
+func (h *Store) GetWasmBinary(ctx context.Context, workflowID string) ([]byte, error) {
+	spec, err := h.orm.GetWorkflowSpec(ctx, workflowID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get workflow spec by workflow ID: %w", err)
+	}
+
+	// there is no update in the BinaryURL or ConfigURL, lets decode the stored artifacts
+	decodedBinary, err := hex.DecodeString(spec.Workflow)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode stored workflow string: %w", err)
+	}
+
+	return decodedBinary, nil
+}
+
+func messageID(url string, parts ...string) string {
+	h := sha256.New()
+	h.Write([]byte(url))
+	for _, p := range parts {
+		h.Write([]byte(p))
+	}
+	hash := hex.EncodeToString(h.Sum(nil))
+	p := []string{ghcapabilities.MethodWorkflowSyncer, hash}
+	return strings.Join(p, "/")
+}

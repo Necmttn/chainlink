@@ -2,18 +2,18 @@ package web
 
 import (
 	"embed"
-	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
 	"os"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 )
 
 // Go's new embed feature doesn't allow us to embed things outside of the current module.
@@ -21,7 +21,7 @@ import (
 // inside this module. To achieve this, we direct webpack to output all of the compiled assets
 // in this module's folder under the "assets" directory.
 
-//go:generate ../../operator_ui/install.sh
+//go:generate go run ../../operator_ui/install.go  ../..
 //go:embed "assets"
 var uiEmbedFs embed.FS
 
@@ -40,7 +40,7 @@ const (
 // ServeFileSystem wraps a http.FileSystem with an additional file existence check
 type ServeFileSystem interface {
 	http.FileSystem
-	Exists(prefix string, path string) bool
+	Exists(prefix, path string) (bool, error)
 }
 
 // EmbedFileSystem implements the ServeFileSystem interface using an embed.FS
@@ -60,23 +60,19 @@ func NewEmbedFileSystem(efs embed.FS, pathPrefix string) ServeFileSystem {
 }
 
 // Exists implements the ServeFileSystem interface.
-func (e *EmbedFileSystem) Exists(prefix string, filepath string) bool {
-	found := false
+func (e *EmbedFileSystem) Exists(prefix, filepath string) (found bool, err error) {
 	if p := path.Base(strings.TrimPrefix(filepath, prefix)); len(p) < len(filepath) {
-		//nolint:errcheck
-		fs.WalkDir(e.FS, ".", func(fpath string, d fs.DirEntry, err error) error {
+		err = fs.WalkDir(e.FS, ".", func(fpath string, d fs.DirEntry, err error) error {
 			fileName := path.Base(fpath)
 			if fileName == p {
 				found = true
-				// Return an error so that we terminate the search early.
-				// Otherwise, the search will continue for the rest of the file tree.
-				return errors.New("file found")
+				return fs.SkipAll
 			}
 			return nil
 		})
 	}
 
-	return found
+	return found, err
 }
 
 // Open implements the http.FileSystem interface.
@@ -97,7 +93,7 @@ type gzipFileHandler struct {
 // which adds support for static resources precompressed with gzip, at
 // the cost of removing the support for directory browsing.
 func GzipFileServer(root ServeFileSystem, lggr logger.Logger) http.Handler {
-	return &gzipFileHandler{root, logger.Sugared(lggr.Named("GzipFilehandler"))}
+	return &gzipFileHandler{root, logger.Sugared(lggr).Named("GzipFilehandler")}
 }
 
 func (f *gzipFileHandler) openAndStat(path string) (http.File, os.FileInfo, error) {
@@ -124,8 +120,7 @@ var preferredEncodings = []string{"gzip"}
 
 // File extension to use for different encodings.
 func extensionForEncoding(encname string) string {
-	switch encname {
-	case "gzip":
+	if encname == "gzip" {
 		return ".gz"
 	}
 	return ""
@@ -147,7 +142,9 @@ func (f *gzipFileHandler) findBestFile(w http.ResponseWriter, r *http.Request, f
 		ext := extensionForEncoding(posenc)
 		fname := fpath + ext
 
-		if f.root.Exists("/", fname) {
+		if ok, err := f.root.Exists("/", fname); err != nil {
+			return nil, nil, err
+		} else if ok {
 			available = append(available, posenc)
 		}
 	}
@@ -180,7 +177,7 @@ func (f *gzipFileHandler) findBestFile(w http.ResponseWriter, r *http.Request, f
 // Determines the best encoding to use
 func negotiateContentEncoding(r *http.Request, available []string) string {
 	values := strings.Split(r.Header.Get(acceptEncodingHeader), ",")
-	aes := []string{}
+	aes := make([]string, 0, len(values))
 
 	// Clean the values
 	for _, v := range values {
@@ -188,10 +185,8 @@ func negotiateContentEncoding(r *http.Request, available []string) string {
 	}
 
 	for _, a := range available {
-		for _, acceptEnc := range aes {
-			if acceptEnc == a {
-				return a
-			}
+		if slices.Contains(aes, a) {
+			return a
 		}
 	}
 
@@ -230,7 +225,10 @@ func ServeGzippedAssets(urlPrefix string, fs ServeFileSystem, lggr logger.Logger
 		fileserver = http.StripPrefix(urlPrefix, fileserver)
 	}
 	return func(c *gin.Context) {
-		if fs.Exists(urlPrefix, c.Request.URL.Path) {
+		if ok, err := fs.Exists(urlPrefix, c.Request.URL.Path); err != nil {
+			lggr.Errorw("Failed to search for file", "err", err)
+			c.AbortWithStatus(http.StatusInternalServerError)
+		} else if ok {
 			fileserver.ServeHTTP(c.Writer, c.Request)
 			c.Abort()
 		} else {

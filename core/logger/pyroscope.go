@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"os"
 	"runtime"
 
 	"github.com/grafana/pyroscope-go"
@@ -19,6 +20,10 @@ func StartPyroscope(pyroConfig config.Pyroscope, pprofConfig PprofConfig) (*pyro
 	runtime.SetBlockProfileRate(pprofConfig.BlockProfileRate())
 	runtime.SetMutexProfileFraction(pprofConfig.MutexProfileFraction())
 
+	// Increase memory profiling sample rate for better granularity
+	// Default is 512KB (524288 bytes) per sample
+	// runtime.MemProfileRate = 512 * 1024 // 512KB per sample
+
 	sha, ver := static.Short()
 
 	return pyroscope.Start(pyroscope.Config{
@@ -26,16 +31,20 @@ func StartPyroscope(pyroConfig config.Pyroscope, pprofConfig PprofConfig) (*pyro
 		ApplicationName: "chainlink-node",
 
 		ServerAddress: pyroConfig.ServerAddress(),
-		AuthToken:     pyroConfig.AuthToken(),
+		AuthToken:     pyroConfig.AuthToken(), //nolint:staticcheck // SA1019
 
 		// We disable logging the profiling info, it will be in the Pyroscope instance anyways...
 		Logger: nil,
 
-		Tags: map[string]string{
-			"SHA":         sha,
-			"Version":     ver,
-			"Environment": pyroConfig.Environment(),
-		},
+		Tags: func() map[string]string {
+			hostname, _ := os.Hostname()
+			return map[string]string{
+				"SHA":         sha,
+				"Version":     ver,
+				"Environment": pyroConfig.Environment(),
+				"hostname":    hostname, // set hostname, so we can distinguish between nodes in the same environment
+			}
+		}(),
 
 		ProfileTypes: []pyroscope.ProfileType{
 			// these profile types are enabled by default:

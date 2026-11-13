@@ -10,7 +10,6 @@ import (
 
 	"github.com/smartcontractkit/chainlink/v2/core/bridges"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
@@ -25,11 +24,11 @@ func TestCronV2Pipeline(t *testing.T) {
 	cfg := configtest.NewTestGeneralConfig(t)
 	db := pgtest.NewSqlxDB(t)
 
-	keyStore := cltest.NewKeyStore(t, db, cfg.Database())
+	keyStore := cltest.NewKeyStore(t, db)
 	lggr := logger.TestLogger(t)
-	orm := pipeline.NewORM(db, lggr, cfg.Database(), cfg.JobPipeline().MaxSuccessfulRuns())
-	btORM := bridges.NewORM(db, lggr, cfg.Database())
-	jobORM := job.NewORM(db, orm, btORM, keyStore, lggr, cfg.Database())
+	orm := pipeline.NewORM(db, lggr, cfg.JobPipeline().MaxSuccessfulRuns())
+	btORM := bridges.NewORM(db)
+	jobORM := job.NewORM(db, orm, btORM, keyStore, lggr)
 
 	jb := &job.Job{
 		Type:          job.Cron,
@@ -40,18 +39,22 @@ func TestCronV2Pipeline(t *testing.T) {
 	}
 	delegate := cron.NewDelegate(runner, lggr)
 
-	require.NoError(t, jobORM.CreateJob(jb))
-	serviceArray, err := delegate.ServicesForSpec(*jb)
+	require.NoError(t, jobORM.CreateJob(t.Context(), jb))
+	serviceArray, err := delegate.ServicesForSpec(t.Context(), *jb)
 	require.NoError(t, err)
 	assert.Len(t, serviceArray, 1)
 	service := serviceArray[0]
 
-	err = service.Start(testutils.Context(t))
+	err = service.Start(t.Context())
 	require.NoError(t, err)
 	defer func() { assert.NoError(t, service.Close()) }()
 }
 
 func TestCronV2Schedule(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
 	t.Parallel()
 
 	spec := job.Job{
@@ -69,7 +72,7 @@ func TestCronV2Schedule(t *testing.T) {
 
 	service, err := cron.NewCronFromJobSpec(spec, runner, logger.TestLogger(t))
 	require.NoError(t, err)
-	err = service.Start(testutils.Context(t))
+	err = service.Start(t.Context())
 	require.NoError(t, err)
 	defer func() { assert.NoError(t, service.Close()) }()
 

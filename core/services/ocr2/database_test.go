@@ -2,31 +2,30 @@ package ocr2_test
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 	"time"
 
-	medianconfig "github.com/smartcontractkit/chainlink/v2/core/services/ocr2/plugins/median/config"
-
+	"github.com/jmoiron/sqlx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jmoiron/sqlx"
 	ocrtypes "github.com/smartcontractkit/libocr/offchainreporting2plus/types"
 
+	"github.com/smartcontractkit/chainlink-evm/pkg/types"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
 	"github.com/smartcontractkit/chainlink/v2/core/services/ocr2"
+	medianconfig "github.com/smartcontractkit/chainlink/v2/core/services/ocr2/plugins/median/config"
 	"github.com/smartcontractkit/chainlink/v2/core/services/ocr2/testhelpers"
 )
 
 const defaultPluginID = 0
 
-func MustInsertOCROracleSpec(t *testing.T, db *sqlx.DB, transmitterAddress ethkey.EIP55Address) job.OCR2OracleSpec {
+func MustInsertOCROracleSpec(t *testing.T, db *sqlx.DB, transmitterAddress types.EIP55Address) job.OCR2OracleSpec {
 	t.Helper()
 
 	spec := job.OCR2OracleSpec{}
@@ -35,16 +34,21 @@ func MustInsertOCROracleSpec(t *testing.T, db *sqlx.DB, transmitterAddress ethke
 	ds1_multiply [type=multiply times=1.23];
 	ds1 -> ds1_parse -> ds1_multiply -> answer1;
 	answer1      [type=median index=0];`
-	config := medianconfig.PluginConfig{JuelsPerFeeCoinPipeline: mockJuelsPerFeeCoinSource}
+	mockGasPriceSubunitsSource := `ds1          [type=bridge name=voter_turnout];
+	ds1_parse    [type=jsonparse path="one,two"];
+	ds1_multiply [type=multiply times=1.23];
+	ds1 -> ds1_parse -> ds1_multiply -> answer1;
+	answer1      [type=median index=0];`
+	config := medianconfig.PluginConfig{JuelsPerFeeCoinPipeline: mockJuelsPerFeeCoinSource, GasPriceSubunitsPipeline: mockGasPriceSubunitsSource}
 	jsonConfig, err := json.Marshal(config)
 	require.NoError(t, err)
 
 	require.NoError(t, db.Get(&spec, `INSERT INTO ocr2_oracle_specs (
-relay, relay_config, contract_id, p2pv2_bootstrappers, ocr_key_bundle_id, monitoring_endpoint, transmitter_id, 
-blockchain_timeout, contract_config_tracker_poll_interval, contract_config_confirmations, plugin_type, plugin_config, created_at, updated_at) VALUES (
+relay, relay_config, contract_id, p2pv2_bootstrappers, ocr_key_bundle_id, monitoring_endpoint, transmitter_id,
+blockchain_timeout, contract_config_tracker_poll_interval, contract_config_confirmations, plugin_type, plugin_config, onchain_signing_strategy, allow_no_bootstrappers, created_at, updated_at) VALUES (
 'ethereum', '{}', $1, '{}', $2, $3, $4,
-0, 0, 0, 'median', $5, NOW(), NOW()
-) RETURNING *`, cltest.NewEIP55Address().String(), cltest.DefaultOCR2KeyBundleID, "chain.link:1234", transmitterAddress.String(), jsonConfig))
+0, 0, 0, 'median', $5, '{}', $6, NOW(), NOW()
+) RETURNING *`, cltest.NewEIP55Address().String(), cltest.DefaultOCR2KeyBundleID, "chain.link:1234", transmitterAddress.String(), jsonConfig, true))
 	return spec
 }
 
@@ -60,78 +64,77 @@ func Test_DB_ReadWriteState(t *testing.T) {
 	sqlDB := setupDB(t)
 
 	configDigest := testhelpers.MakeConfigDigest(t)
-	cfg := configtest.NewTestGeneralConfig(t)
-	ethKeyStore := cltest.NewKeyStore(t, sqlDB, cfg.Database()).Eth()
+	ethKeyStore := cltest.NewKeyStore(t, sqlDB).Eth()
 	key, _ := cltest.MustInsertRandomKey(t, ethKeyStore)
 	spec := MustInsertOCROracleSpec(t, sqlDB, key.EIP55Address)
 	lggr := logger.TestLogger(t)
 
 	t.Run("reads and writes state", func(t *testing.T) {
-		db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr, cfg.Database())
+		db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr)
 		state := ocrtypes.PersistentState{
 			Epoch:                1,
 			HighestSentEpoch:     2,
 			HighestReceivedEpoch: []uint32{3},
 		}
 
-		err := db.WriteState(testutils.Context(t), configDigest, state)
+		err := db.WriteState(t.Context(), configDigest, state)
 		require.NoError(t, err)
 
-		readState, err := db.ReadState(testutils.Context(t), configDigest)
+		readState, err := db.ReadState(t.Context(), configDigest)
 		require.NoError(t, err)
 
 		require.Equal(t, state, *readState)
 	})
 
 	t.Run("updates state", func(t *testing.T) {
-		db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr, cfg.Database())
+		db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr)
 		newState := ocrtypes.PersistentState{
 			Epoch:                2,
 			HighestSentEpoch:     3,
 			HighestReceivedEpoch: []uint32{4, 5},
 		}
 
-		err := db.WriteState(testutils.Context(t), configDigest, newState)
+		err := db.WriteState(t.Context(), configDigest, newState)
 		require.NoError(t, err)
 
-		readState, err := db.ReadState(testutils.Context(t), configDigest)
+		readState, err := db.ReadState(t.Context(), configDigest)
 		require.NoError(t, err)
 
 		require.Equal(t, newState, *readState)
 	})
 
 	t.Run("does not return result for wrong spec", func(t *testing.T) {
-		db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr, cfg.Database())
+		db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr)
 		state := ocrtypes.PersistentState{
 			Epoch:                3,
 			HighestSentEpoch:     4,
 			HighestReceivedEpoch: []uint32{5, 6},
 		}
 
-		err := db.WriteState(testutils.Context(t), configDigest, state)
+		err := db.WriteState(t.Context(), configDigest, state)
 		require.NoError(t, err)
 
 		// odb with different spec
-		db = ocr2.NewDB(sqlDB, -1, defaultPluginID, lggr, cfg.Database())
+		db = ocr2.NewDB(sqlDB, -1, defaultPluginID, lggr)
 
-		readState, err := db.ReadState(testutils.Context(t), configDigest)
+		readState, err := db.ReadState(t.Context(), configDigest)
 		require.NoError(t, err)
 
 		require.Nil(t, readState)
 	})
 
 	t.Run("does not return result for wrong config digest", func(t *testing.T) {
-		db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr, cfg.Database())
+		db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr)
 		state := ocrtypes.PersistentState{
 			Epoch:                4,
 			HighestSentEpoch:     5,
 			HighestReceivedEpoch: []uint32{6, 7},
 		}
 
-		err := db.WriteState(testutils.Context(t), configDigest, state)
+		err := db.WriteState(t.Context(), configDigest, state)
 		require.NoError(t, err)
 
-		readState, err := db.ReadState(testutils.Context(t), testhelpers.MakeConfigDigest(t))
+		readState, err := db.ReadState(t.Context(), testhelpers.MakeConfigDigest(t))
 		require.NoError(t, err)
 
 		require.Nil(t, readState)
@@ -151,26 +154,25 @@ func Test_DB_ReadWriteConfig(t *testing.T) {
 		OffchainConfigVersion: 111,
 		OffchainConfig:        []byte{0x03, 0x04},
 	}
-	cfg := configtest.NewTestGeneralConfig(t)
-	ethKeyStore := cltest.NewKeyStore(t, sqlDB, cfg.Database()).Eth()
+	ethKeyStore := cltest.NewKeyStore(t, sqlDB).Eth()
 	key, _ := cltest.MustInsertRandomKey(t, ethKeyStore)
 	spec := MustInsertOCROracleSpec(t, sqlDB, key.EIP55Address)
 	lggr := logger.TestLogger(t)
 
 	t.Run("reads and writes config", func(t *testing.T) {
-		db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr, cfg.Database())
+		db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr)
 
-		err := db.WriteConfig(testutils.Context(t), config)
+		err := db.WriteConfig(t.Context(), config)
 		require.NoError(t, err)
 
-		readConfig, err := db.ReadConfig(testutils.Context(t))
+		readConfig, err := db.ReadConfig(t.Context())
 		require.NoError(t, err)
 
 		require.Equal(t, &config, readConfig)
 	})
 
 	t.Run("updates config", func(t *testing.T) {
-		db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr, cfg.Database())
+		db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr)
 
 		newConfig := ocrtypes.ContractConfig{
 			ConfigDigest: testhelpers.MakeConfigDigest(t),
@@ -178,24 +180,24 @@ func Test_DB_ReadWriteConfig(t *testing.T) {
 			Transmitters: []ocrtypes.Account{},
 		}
 
-		err := db.WriteConfig(testutils.Context(t), newConfig)
+		err := db.WriteConfig(t.Context(), newConfig)
 		require.NoError(t, err)
 
-		readConfig, err := db.ReadConfig(testutils.Context(t))
+		readConfig, err := db.ReadConfig(t.Context())
 		require.NoError(t, err)
 
 		require.Equal(t, &newConfig, readConfig)
 	})
 
 	t.Run("does not return result for wrong spec", func(t *testing.T) {
-		db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr, cfg.Database())
+		db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr)
 
-		err := db.WriteConfig(testutils.Context(t), config)
+		err := db.WriteConfig(t.Context(), config)
 		require.NoError(t, err)
 
-		db = ocr2.NewDB(sqlDB, -1, defaultPluginID, lggr, cfg.Database())
+		db = ocr2.NewDB(sqlDB, -1, defaultPluginID, lggr)
 
-		readConfig, err := db.ReadConfig(testutils.Context(t))
+		readConfig, err := db.ReadConfig(t.Context())
 		require.NoError(t, err)
 
 		require.Nil(t, readConfig)
@@ -203,24 +205,24 @@ func Test_DB_ReadWriteConfig(t *testing.T) {
 
 	t.Run("reads and writes config for multiple plugins", func(t *testing.T) {
 		otherPluginID := int32(2)
-		db1 := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr, cfg.Database())
-		db2 := ocr2.NewDB(sqlDB, spec.ID, otherPluginID, lggr, cfg.Database())
+		db1 := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr)
+		db2 := ocr2.NewDB(sqlDB, spec.ID, otherPluginID, lggr)
 
 		otherConfig := ocrtypes.ContractConfig{
 			ConfigDigest: testhelpers.MakeConfigDigest(t),
 			Signers:      []ocrtypes.OnchainPublicKey{},
 			Transmitters: []ocrtypes.Account{},
 		}
-		err := db1.WriteConfig(testutils.Context(t), config)
+		err := db1.WriteConfig(t.Context(), config)
 		require.NoError(t, err)
-		err = db2.WriteConfig(testutils.Context(t), otherConfig)
+		err = db2.WriteConfig(t.Context(), otherConfig)
 		require.NoError(t, err)
 
-		readConfig, err := db1.ReadConfig(testutils.Context(t))
+		readConfig, err := db1.ReadConfig(t.Context())
 		require.NoError(t, err)
 		require.Equal(t, &config, readConfig)
 
-		readConfig, err = db2.ReadConfig(testutils.Context(t))
+		readConfig, err = db2.ReadConfig(t.Context())
 		require.NoError(t, err)
 		require.Equal(t, &otherConfig, readConfig)
 	})
@@ -238,15 +240,14 @@ func assertPendingTransmissionEqual(t *testing.T, pt1, pt2 ocrtypes.PendingTrans
 func Test_DB_PendingTransmissions(t *testing.T) {
 	sqlDB := setupDB(t)
 
-	cfg := configtest.NewTestGeneralConfig(t)
-	ethKeyStore := cltest.NewKeyStore(t, sqlDB, cfg.Database()).Eth()
+	ethKeyStore := cltest.NewKeyStore(t, sqlDB).Eth()
 	key, _ := cltest.MustInsertRandomKey(t, ethKeyStore)
 
 	lggr := logger.TestLogger(t)
 	spec := MustInsertOCROracleSpec(t, sqlDB, key.EIP55Address)
 	spec2 := MustInsertOCROracleSpec(t, sqlDB, key.EIP55Address)
-	db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr, cfg.Database())
-	db2 := ocr2.NewDB(sqlDB, spec2.ID, defaultPluginID, lggr, cfg.Database())
+	db := ocr2.NewDB(sqlDB, spec.ID, defaultPluginID, lggr)
+	db2 := ocr2.NewDB(sqlDB, spec2.ID, defaultPluginID, lggr)
 	configDigest := testhelpers.MakeConfigDigest(t)
 
 	k := ocrtypes.ReportTimestamp{
@@ -271,9 +272,9 @@ func Test_DB_PendingTransmissions(t *testing.T) {
 			},
 		}
 
-		err := db.StorePendingTransmission(testutils.Context(t), k, p)
+		err := db.StorePendingTransmission(t.Context(), k, p)
 		require.NoError(t, err)
-		m, err := db.PendingTransmissionsWithConfigDigest(testutils.Context(t), configDigest)
+		m, err := db.PendingTransmissionsWithConfigDigest(t.Context(), configDigest)
 		require.NoError(t, err)
 		assertPendingTransmissionEqual(t, p, m[k])
 
@@ -286,9 +287,9 @@ func Test_DB_PendingTransmissions(t *testing.T) {
 				{Signature: cltest.MustRandomBytes(t, 7), Signer: 248},
 			},
 		}
-		err = db.StorePendingTransmission(testutils.Context(t), k, p)
+		err = db.StorePendingTransmission(t.Context(), k, p)
 		require.NoError(t, err)
-		m, err = db.PendingTransmissionsWithConfigDigest(testutils.Context(t), configDigest)
+		m, err = db.PendingTransmissionsWithConfigDigest(t.Context(), configDigest)
 		require.NoError(t, err)
 		assertPendingTransmissionEqual(t, p, m[k])
 
@@ -301,7 +302,7 @@ func Test_DB_PendingTransmissions(t *testing.T) {
 			},
 		}
 
-		err = db.StorePendingTransmission(testutils.Context(t), k2, p2)
+		err = db.StorePendingTransmission(t.Context(), k2, p2)
 		require.NoError(t, err)
 
 		kRedHerring := ocrtypes.ReportTimestamp{
@@ -318,10 +319,10 @@ func Test_DB_PendingTransmissions(t *testing.T) {
 			},
 		}
 
-		err = db.StorePendingTransmission(testutils.Context(t), kRedHerring, pRedHerring)
+		err = db.StorePendingTransmission(t.Context(), kRedHerring, pRedHerring)
 		require.NoError(t, err)
 
-		m, err = db.PendingTransmissionsWithConfigDigest(testutils.Context(t), configDigest)
+		m, err = db.PendingTransmissionsWithConfigDigest(t.Context(), configDigest)
 		require.NoError(t, err)
 
 		require.Len(t, m, 2)
@@ -341,9 +342,9 @@ func Test_DB_PendingTransmissions(t *testing.T) {
 		require.Equal(t, p2, m[k2])
 
 		// No keys for this oracleSpecID yet
-		m, err = db2.PendingTransmissionsWithConfigDigest(testutils.Context(t), configDigest)
+		m, err = db2.PendingTransmissionsWithConfigDigest(t.Context(), configDigest)
 		require.NoError(t, err)
-		require.Len(t, m, 0)
+		require.Empty(t, m)
 	})
 
 	t.Run("deletes pending transmission by key", func(t *testing.T) {
@@ -355,20 +356,20 @@ func Test_DB_PendingTransmissions(t *testing.T) {
 				{Signature: cltest.MustRandomBytes(t, 7), Signer: 248},
 			},
 		}
-		err := db.StorePendingTransmission(testutils.Context(t), k, p)
+		err := db.StorePendingTransmission(t.Context(), k, p)
 		require.NoError(t, err)
-		err = db2.StorePendingTransmission(testutils.Context(t), k, p)
-		require.NoError(t, err)
-
-		err = db.DeletePendingTransmission(testutils.Context(t), k)
+		err = db2.StorePendingTransmission(t.Context(), k, p)
 		require.NoError(t, err)
 
-		m, err := db.PendingTransmissionsWithConfigDigest(testutils.Context(t), configDigest)
+		err = db.DeletePendingTransmission(t.Context(), k)
+		require.NoError(t, err)
+
+		m, err := db.PendingTransmissionsWithConfigDigest(t.Context(), configDigest)
 		require.NoError(t, err)
 		require.Len(t, m, 1)
 
 		// Did not affect other oracleSpecID
-		m, err = db2.PendingTransmissionsWithConfigDigest(testutils.Context(t), configDigest)
+		m, err = db2.PendingTransmissionsWithConfigDigest(t.Context(), configDigest)
 		require.NoError(t, err)
 		require.Len(t, m, 1)
 	})
@@ -382,10 +383,10 @@ func Test_DB_PendingTransmissions(t *testing.T) {
 				{Signature: cltest.MustRandomBytes(t, 7), Signer: 248},
 			},
 		}
-		err := db.StorePendingTransmission(testutils.Context(t), k2, p)
+		err := db.StorePendingTransmission(t.Context(), k2, p)
 		require.NoError(t, err)
 
-		m, err := db.PendingTransmissionsWithConfigDigest(testutils.Context(t), configDigest)
+		m, err := db.PendingTransmissionsWithConfigDigest(t.Context(), configDigest)
 		require.NoError(t, err)
 		require.Len(t, m, 1)
 		// FIXME: don't understand how the median is being used as a key or what the replacement is yet
@@ -402,7 +403,7 @@ func Test_DB_PendingTransmissions(t *testing.T) {
 			},
 		}
 
-		err := db.StorePendingTransmission(testutils.Context(t), k, p)
+		err := db.StorePendingTransmission(t.Context(), k, p)
 		require.NoError(t, err)
 
 		p2 := ocrtypes.PendingTransmission{
@@ -413,7 +414,7 @@ func Test_DB_PendingTransmissions(t *testing.T) {
 				{Signature: cltest.MustRandomBytes(t, 7), Signer: 248},
 			},
 		}
-		err = db.StorePendingTransmission(testutils.Context(t), k2, p2)
+		err = db.StorePendingTransmission(t.Context(), k2, p2)
 		require.NoError(t, err)
 
 		p2 = ocrtypes.PendingTransmission{
@@ -425,19 +426,19 @@ func Test_DB_PendingTransmissions(t *testing.T) {
 			},
 		}
 
-		err = db.StorePendingTransmission(testutils.Context(t), k2, p2)
+		err = db.StorePendingTransmission(t.Context(), k2, p2)
 		require.NoError(t, err)
 
-		err = db.DeletePendingTransmissionsOlderThan(testutils.Context(t), time.Unix(900, 0))
+		err = db.DeletePendingTransmissionsOlderThan(t.Context(), time.Unix(900, 0))
 		require.NoError(t, err)
 
-		m, err := db.PendingTransmissionsWithConfigDigest(testutils.Context(t), configDigest)
+		m, err := db.PendingTransmissionsWithConfigDigest(t.Context(), configDigest)
 		require.NoError(t, err)
 		require.Len(t, m, 1)
 
 		// Didn't affect other oracleSpecIDs
-		db = ocr2.NewDB(sqlDB, spec2.ID, defaultPluginID, lggr, cfg.Database())
-		m, err = db.PendingTransmissionsWithConfigDigest(testutils.Context(t), configDigest)
+		db = ocr2.NewDB(sqlDB, spec2.ID, defaultPluginID, lggr)
+		m, err = db.PendingTransmissionsWithConfigDigest(t.Context(), configDigest)
 		require.NoError(t, err)
 		require.Len(t, m, 1)
 	})
@@ -446,13 +447,11 @@ func Test_DB_PendingTransmissions(t *testing.T) {
 func Test_DB_ReadWriteProtocolState(t *testing.T) {
 	sqlDB := setupDB(t)
 
-	cfg := configtest.NewTestGeneralConfig(t)
-
 	lggr := logger.TestLogger(t)
-	db := ocr2.NewDB(sqlDB, 0, defaultPluginID, lggr, cfg.Database())
+	db := ocr2.NewDB(sqlDB, 0, defaultPluginID, lggr)
 	cd1 := testhelpers.MakeConfigDigest(t)
 	cd2 := testhelpers.MakeConfigDigest(t)
-	ctx := testutils.Context(t)
+	ctx := t.Context()
 
 	assertCount := func(expected int64) {
 		testutils.AssertCount(t, sqlDB, "ocr_protocol_states", expected)
@@ -462,55 +461,108 @@ func Test_DB_ReadWriteProtocolState(t *testing.T) {
 		assertCount(0)
 
 		err := db.WriteProtocolState(ctx, cd1, "key1", []byte{1})
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
 		assertCount(1)
 
 		err = db.WriteProtocolState(ctx, cd2, "key1", []byte{2})
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
 		assertCount(2)
 
 		err = db.WriteProtocolState(ctx, cd2, "key2", []byte{3})
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
 		assertCount(3)
 
 		// should overwrite
 		err = db.WriteProtocolState(ctx, cd2, "key2", []byte{4})
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
 		val, err := db.ReadProtocolState(ctx, cd1, "key1")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, []byte{1}, val)
 
 		val, err = db.ReadProtocolState(ctx, cd2, "key1")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, []byte{2}, val)
 
 		val, err = db.ReadProtocolState(ctx, cd2, "key2")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, []byte{4}, val)
 
 		// should write empty value
 		err = db.WriteProtocolState(ctx, cd1, "key1", []byte{})
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
 		val, err = db.ReadProtocolState(ctx, cd1, "key1")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, []byte{}, val)
 
 		assertCount(3)
 
 		// should delete value
 		err = db.WriteProtocolState(ctx, cd1, "key1", nil)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
 		assertCount(2)
 
 		// trying to read missing value yields nil
 		val, err = db.ReadProtocolState(ctx, cd1, "key1")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Nil(t, val)
+	})
+}
+
+func Test_DB_ReadWriteBlock(t *testing.T) {
+	sqlDB := setupDB(t)
+
+	lggr := logger.TestLogger(t)
+	db := ocr2.NewDB(sqlDB, 0, defaultPluginID, lggr)
+	cd1 := testhelpers.MakeConfigDigest(t)
+	ctx := t.Context()
+
+	assertCount := func(expected int64) {
+		testutils.AssertCount(t, sqlDB, "ocr2_blocks", expected)
+	}
+
+	t.Run("stores and retrieves blocks", func(t *testing.T) {
+		assertCount(0)
+
+		block := []byte("hello world")
+		err := db.WriteBlock(ctx, cd1, 0, block)
+		require.NoError(t, err)
+
+		assertCount(1)
+
+		block = []byte("hello world 2")
+		err = db.WriteBlock(ctx, cd1, math.MaxUint64, block)
+		require.NoError(t, err)
+
+		assertCount(2)
+
+		gotBlock, err := db.ReadBlock(ctx, cd1, math.MaxUint64)
+		require.NoError(t, err)
+
+		assert.Equal(t, block, gotBlock)
+
+		// Writing nil should delete the block
+		err = db.WriteBlock(ctx, cd1, math.MaxUint64, nil)
+		require.NoError(t, err)
+
+		assertCount(1)
+
+		gotBlock, err = db.ReadBlock(ctx, cd1, math.MaxUint64)
+		require.NoError(t, err)
+		assert.Equal(t, []byte(nil), gotBlock)
+
+		// Overwrite
+		block2 := []byte("new block")
+		err = db.WriteBlock(ctx, cd1, 0, block2)
+		require.NoError(t, err)
+
+		gotBlock, err = db.ReadBlock(ctx, cd1, 0)
+		require.NoError(t, err)
+		assert.Equal(t, block2, gotBlock)
 	})
 }

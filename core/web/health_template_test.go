@@ -34,10 +34,11 @@ original error`},
 		{Name: "foo.bar.2.B", Status: passing},
 		{Name: "foo.baz", Status: passing},
 	}
-	//TODO truncated error
+	// TODO truncated error
 }
 
 func Test_checkTree_WriteHTMLTo(t *testing.T) {
+	t.Parallel()
 	ct := newCheckTree(checks())
 	var b bytes.Buffer
 	require.NoError(t, ct.WriteHTMLTo(&b))
@@ -46,6 +47,7 @@ func Test_checkTree_WriteHTMLTo(t *testing.T) {
 }
 
 func Test_writeTextTo(t *testing.T) {
+	t.Parallel()
 	var b bytes.Buffer
 	require.NoError(t, writeTextTo(&b, checks()))
 	got := b.String()

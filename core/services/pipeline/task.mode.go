@@ -3,14 +3,14 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"math/big"
 
 	"github.com/pkg/errors"
 	"github.com/shopspring/decimal"
-	"go.uber.org/multierr"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 )
 
 // Return types:
@@ -38,7 +38,7 @@ func (t *ModeTask) Run(_ context.Context, _ logger.Logger, vars Vars, inputs []R
 		allowedFaults      int
 		faults             int
 	)
-	err := multierr.Combine(
+	err := stderrors.Join(
 		errors.Wrap(ResolveParam(&maybeAllowedFaults, From(t.AllowedFaults)), "allowedFaults"),
 		errors.Wrap(ResolveParam(&valuesAndErrs, From(VarExpr(t.Values, vars), JSONWithVarExprs(t.Values, vars, true), Inputs(inputs))), "values"),
 	)
@@ -47,7 +47,7 @@ func (t *ModeTask) Run(_ context.Context, _ logger.Logger, vars Vars, inputs []R
 	}
 
 	if allowed, isSet := maybeAllowedFaults.Uint64(); isSet {
-		allowedFaults = int(allowed)
+		allowedFaults = int(allowed) //nolint:gosec // G115
 	} else {
 		allowedFaults = len(valuesAndErrs) - 1
 	}
@@ -61,52 +61,52 @@ func (t *ModeTask) Run(_ context.Context, _ logger.Logger, vars Vars, inputs []R
 
 	type entry struct {
 		count    uint64
-		original interface{}
+		original any
 	}
 
 	var (
-		m     = make(map[string]entry, len(values))
-		max   uint64
-		modes []interface{}
+		m        = make(map[string]entry, len(values))
+		maxCount uint64
+		modes    []any
 	)
 	for _, val := range values {
-		var comparable string
+		var comparableStr string
 		switch v := val.(type) {
 		case []byte:
-			comparable = string(v)
+			comparableStr = string(v)
 		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float64, float32,
 			string, bool:
-			comparable = fmt.Sprintf("%v", v)
+			comparableStr = fmt.Sprintf("%v", v)
 		case *big.Int:
-			comparable = v.String()
+			comparableStr = v.String()
 		case big.Int:
-			comparable = v.String()
+			comparableStr = v.String()
 		case *decimal.Decimal:
-			comparable = v.String()
+			comparableStr = v.String()
 		case decimal.Decimal:
-			comparable = v.String()
+			comparableStr = v.String()
 		default:
 			bs, err := json.Marshal(v)
 			if err != nil {
 				return Result{Error: errors.Wrapf(ErrBadInput, "could not json stringify value: %v", err)}, runInfo
 			}
-			comparable = string(bs)
+			comparableStr = string(bs)
 		}
 
-		m[comparable] = entry{
-			count:    m[comparable].count + 1,
+		m[comparableStr] = entry{
+			count:    m[comparableStr].count + 1,
 			original: val,
 		}
 
-		if m[comparable].count > max {
-			modes = []interface{}{val}
-			max = m[comparable].count
-		} else if m[comparable].count == max {
+		if m[comparableStr].count > maxCount {
+			modes = []any{val}
+			maxCount = m[comparableStr].count
+		} else if m[comparableStr].count == maxCount {
 			modes = append(modes, val)
 		}
 	}
-	return Result{Value: map[string]interface{}{
+	return Result{Value: map[string]any{
 		"results":     modes,
-		"occurrences": max,
+		"occurrences": maxCount,
 	}}, runInfo
 }

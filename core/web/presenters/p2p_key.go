@@ -1,7 +1,7 @@
 package presenters
 
 import (
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/p2pkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/p2pkey"
 )
 
 // P2PKeyResource represents a P2P key JSONAPI resource.
@@ -27,7 +27,7 @@ func NewP2PKeyResource(key p2pkey.KeyV2) *P2PKeyResource {
 }
 
 func NewP2PKeyResources(keys []p2pkey.KeyV2) []P2PKeyResource {
-	rs := []P2PKeyResource{}
+	rs := make([]P2PKeyResource, 0, len(keys))
 	for _, key := range keys {
 		rs = append(rs, *NewP2PKeyResource(key))
 	}

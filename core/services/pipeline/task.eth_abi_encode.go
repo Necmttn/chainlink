@@ -2,13 +2,13 @@ package pipeline
 
 import (
 	"context"
+	stderrors "errors"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/pkg/errors"
-	"go.uber.org/multierr"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 )
 
 // Return types:
@@ -36,7 +36,7 @@ func (t *ETHABIEncodeTask) Run(_ context.Context, _ logger.Logger, vars Vars, in
 		inputValues MapParam
 		theABI      BytesParam
 	)
-	err = multierr.Combine(
+	err = stderrors.Join(
 		errors.Wrap(ResolveParam(&inputValues, From(VarExpr(t.Data, vars), JSONWithVarExprs(t.Data, vars, false), nil)), "data"),
 		errors.Wrap(ResolveParam(&theABI, From(NonemptyString(t.ABI))), "abi"),
 	)
@@ -50,7 +50,7 @@ func (t *ETHABIEncodeTask) Run(_ context.Context, _ logger.Logger, vars Vars, in
 	}
 	method := abi.NewMethod(methodName, methodName, abi.Function, "", false, false, args, nil)
 
-	var vals []interface{}
+	var vals []any
 	for _, arg := range args {
 		val, exists := inputValues[arg.Name]
 		if !exists {
@@ -69,7 +69,8 @@ func (t *ETHABIEncodeTask) Run(_ context.Context, _ logger.Logger, vars Vars, in
 	}
 	var dataBytes []byte
 	if methodName != "" {
-		dataBytes = append(method.ID, argsEncoded...)
+		dataBytes = append(dataBytes, method.ID...)
+		dataBytes = append(dataBytes, argsEncoded...)
 	} else {
 		dataBytes = argsEncoded
 	}

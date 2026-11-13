@@ -3,7 +3,6 @@ package cmd_test
 import (
 	"bytes"
 	"flag"
-	"fmt"
 	"os"
 	"testing"
 
@@ -11,11 +10,12 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli"
 
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/csakey"
 	"github.com/smartcontractkit/chainlink-common/pkg/utils"
 	"github.com/smartcontractkit/chainlink/v2/core/cmd"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/csakey"
+	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
 	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 )
 
@@ -53,19 +53,20 @@ func TestCSAKeyPresenter_RenderTable(t *testing.T) {
 
 func TestShell_ListCSAKeys(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	app := startNewApplicationV2(t, nil)
-	key, err := app.GetKeyStore().CSA().Create()
+	key, err := keystore.GetDefault(ctx, app.GetKeyStore().CSA())
 	require.NoError(t, err)
 
 	requireCSAKeyCount(t, app, 1)
 
 	client, r := app.NewShellAndRenderer()
 
-	assert.Nil(t, client.ListCSAKeys(cltest.EmptyCLIContext()))
-	require.Equal(t, 1, len(r.Renders))
+	require.NoError(t, client.ListCSAKeys(cltest.EmptyCLIContext()))
+	require.Len(t, r.Renders, 1)
 	keys := *r.Renders[0].(*cmd.CSAKeyPresenters)
-	assert.Equal(t, fmt.Sprintf("csa_%s", key.PublicKeyString()), keys[0].PubKey)
+	assert.Equal(t, "csa_"+key.PublicKeyString(), keys[0].PubKey)
 }
 
 func TestShell_CreateCSAKey(t *testing.T) {
@@ -74,9 +75,9 @@ func TestShell_CreateCSAKey(t *testing.T) {
 	app := startNewApplicationV2(t, nil)
 	client, _ := app.NewShellAndRenderer()
 
-	requireCSAKeyCount(t, app, 0)
+	requireCSAKeyCount(t, app, 1)
 
-	require.NoError(t, client.CreateCSAKey(nilContext))
+	require.Error(t, client.CreateCSAKey(nilContext))
 
 	requireCSAKeyCount(t, app, 1)
 }
@@ -85,11 +86,12 @@ func TestShell_ImportExportCsaKey(t *testing.T) {
 	t.Parallel()
 
 	defer deleteKeyExportFile(t)
+	ctx := t.Context()
 
 	app := startNewApplicationV2(t, nil)
 
 	client, _ := app.NewShellAndRenderer()
-	_, err := app.GetKeyStore().CSA().Create()
+	err := app.GetKeyStore().CSA().EnsureKey(ctx)
 	require.NoError(t, err)
 
 	keys := requireCSAKeyCount(t, app, 1)
@@ -113,7 +115,7 @@ func TestShell_ImportExportCsaKey(t *testing.T) {
 	set = flag.NewFlagSet("test CSA export", 0)
 	flagSetApplyFromAction(client.ExportCSAKey, set, "")
 
-	require.NoError(t, set.Parse([]string{fmt.Sprint(key.ID())}))
+	require.NoError(t, set.Parse([]string{key.ID()}))
 	require.NoError(t, set.Set("new-password", "../internal/fixtures/incorrect_password.txt"))
 	require.NoError(t, set.Set("output", keyName))
 
@@ -122,10 +124,10 @@ func TestShell_ImportExportCsaKey(t *testing.T) {
 	require.NoError(t, client.ExportCSAKey(c))
 	require.NoError(t, utils.JustError(os.Stat(keyName)))
 
-	require.NoError(t, utils.JustError(app.GetKeyStore().CSA().Delete(key.ID())))
+	require.NoError(t, utils.JustError(app.GetKeyStore().CSA().Delete(ctx, key.ID())))
 	requireCSAKeyCount(t, app, 0)
 
-	//Import test
+	// Import test
 	set = flag.NewFlagSet("test CSA import", 0)
 	flagSetApplyFromAction(client.ImportCSAKey, set, "")
 
@@ -143,6 +145,6 @@ func requireCSAKeyCount(t *testing.T, app chainlink.Application, length int) []c
 
 	keys, err := app.GetKeyStore().CSA().GetAll()
 	require.NoError(t, err)
-	require.Equal(t, length, len(keys))
+	require.Len(t, keys, length)
 	return keys
 }

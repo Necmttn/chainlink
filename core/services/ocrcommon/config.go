@@ -5,11 +5,11 @@ import (
 
 	"github.com/smartcontractkit/libocr/commontypes"
 
-	"github.com/smartcontractkit/chainlink/v2/common/config"
+	"github.com/smartcontractkit/chainlink-evm/pkg/config/chaintype"
 )
 
 type Config interface {
-	ChainType() config.ChainType
+	ChainType() chaintype.ChainType
 }
 
 func ParseBootstrapPeers(peers []string) (bootstrapPeers []commontypes.BootstrapperLocator, err error) {
@@ -24,15 +24,21 @@ func ParseBootstrapPeers(peers []string) (bootstrapPeers []commontypes.Bootstrap
 	return
 }
 
-// GetValidatedBootstrapPeers will error unless at least one valid bootstrap peer is found
-func GetValidatedBootstrapPeers(specPeers []string, configPeers []commontypes.BootstrapperLocator) ([]commontypes.BootstrapperLocator, error) {
+// GetValidatedBootstrapPeers will error unless at least one valid bootstrap is found or
+// no bootstrappers are found and allowNoBootstrappers is true.
+func GetValidatedBootstrapPeers(specPeers []string, configPeers []commontypes.BootstrapperLocator, allowNoBootstrappers bool) ([]commontypes.BootstrapperLocator, error) {
 	bootstrapPeers, err := ParseBootstrapPeers(specPeers)
 	if err != nil {
 		return nil, err
 	}
 	if len(bootstrapPeers) == 0 {
 		if len(configPeers) == 0 {
-			return nil, errors.New("no bootstrappers found")
+			if !allowNoBootstrappers {
+				return nil, errors.New("no bootstrappers found")
+			}
+			// Bootstrappers may be empty if the node is not configured to conduct consensus (i.e. f = 0 and n = 1).
+			// This is useful for testing and development.
+			return nil, nil
 		}
 		return configPeers, nil
 	}

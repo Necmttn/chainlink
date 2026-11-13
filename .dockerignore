@@ -1,7 +1,22 @@
 .git-together
+.git
 .DS_Store
 .envrc
+.dbenv
+.npmrc
+.gitattributes
+.gitignore
+.dockerignore
+.golangci.yml
+.mockery.yaml
+.nancy-ignore
+.tarignore
+.tool-versions
+nix.conf
+nix-darwin-shell-hook.sh
+LICENSE
 *.log
+**/*_test.go
 node_modules/
 **/node_modules/
 vendor/
@@ -10,16 +25,38 @@ tmp/
 contracts/node_modules
 examples/
 
+.changeset/
+.github/
+.vscode/
+.claude/
+.cursor/
+docs/
+fuzz/
+
+*.md
+sonar-project.properties
+pnpm-lock.yaml
+flake.lock
+flake.nix
+shell.nix
+
+
+devenv/
+deployment/
 integration/
 integration-scripts/
 integration-tests/
+system-tests/
+testdata/
 
 tools/gethnet/datadir/geth
 tools/clroot/db.bolt
 tools/clroot/*.log
 tools/clroot/tempkeys
+tools/test/
 
 core/sgx/target/
+core/scripts/cre/
 
 core/*.Dockerfile
 chainlink
@@ -30,3 +67,11 @@ codeship-*.yml
 dockercfg
 credentials.env
 gcr_creds.env
+
+go.work
+go.work.sum
+
+# buildkit-cache-dance host dirs (cache-dir / scratch-dir). These hold the injected
+# Go module + build caches and must never enter the build context.
+cache-mount/
+scratch/

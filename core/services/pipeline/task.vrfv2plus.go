@@ -4,24 +4,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	stderrors "errors"
 	"fmt"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/pkg/errors"
-	"go.uber.org/multierr"
 
-	evmtypes "github.com/smartcontractkit/chainlink/v2/core/chains/evm/types"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/vrf_coordinator_v2plus_interface"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
-	"github.com/smartcontractkit/chainlink/v2/core/services/signatures/secp256k1"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/vrfkey/secp256k1"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/generated/vrf_coordinator_v2plus_interface"
+	evmtypes "github.com/smartcontractkit/chainlink-evm/pkg/types"
 	"github.com/smartcontractkit/chainlink/v2/core/services/vrf/proof"
 )
 
-var (
-	vrfCoordinatorV2PlusABI = evmtypes.MustGetABI(vrf_coordinator_v2plus_interface.IVRFCoordinatorV2PlusInternalABI)
-)
+var vrfCoordinatorV2PlusABI = evmtypes.MustGetABI(vrf_coordinator_v2plus_interface.IVRFCoordinatorV2PlusInternalABI)
 
 // VRFTaskV2Plus is identical to VRFTaskV2 except that it uses the V2Plus VRF
 // request commitment, which includes a boolean indicating whether native or
@@ -49,7 +47,7 @@ func (t *VRFTaskV2Plus) Run(_ context.Context, lggr logger.Logger, vars Vars, in
 	if inputs[0].Error != nil {
 		return Result{Error: ErrInputTaskErrored}, runInfo
 	}
-	logValues, ok := inputs[0].Value.(map[string]interface{})
+	logValues, ok := inputs[0].Value.(map[string]any)
 	if !ok {
 		return Result{Error: errors.Wrap(ErrBadInput, "expected map input")}, runInfo
 	}
@@ -59,7 +57,7 @@ func (t *VRFTaskV2Plus) Run(_ context.Context, lggr logger.Logger, vars Vars, in
 		requestBlockNumber Uint64Param
 		topics             HashSliceParam
 	)
-	err := multierr.Combine(
+	err := stderrors.Join(
 		errors.Wrap(ResolveParam(&pubKey, From(VarExpr(t.PublicKey, vars))), "publicKey"),
 		errors.Wrap(ResolveParam(&requestBlockHash, From(VarExpr(t.RequestBlockHash, vars))), "requestBlockHash"),
 		errors.Wrap(ResolveParam(&requestBlockNumber, From(VarExpr(t.RequestBlockNumber, vars))), "requestBlockNumber"),
@@ -77,7 +75,7 @@ func (t *VRFTaskV2Plus) Run(_ context.Context, lggr logger.Logger, vars Vars, in
 	if !ok {
 		return Result{Error: errors.Wrapf(ErrBadInput, "invalid preSeed")}, runInfo
 	}
-	requestId, ok := logValues["requestId"].(*big.Int)
+	requestID, ok := logValues["requestId"].(*big.Int)
 	if !ok {
 		return Result{Error: errors.Wrapf(ErrBadInput, "invalid requestId")}, runInfo
 	}
@@ -103,7 +101,7 @@ func (t *VRFTaskV2Plus) Run(_ context.Context, lggr logger.Logger, vars Vars, in
 	}
 	pk, err := secp256k1.NewPublicKeyFromBytes(pubKey)
 	if err != nil {
-		return Result{Error: fmt.Errorf("failed to create PublicKey from bytes %v", err)}, runInfo
+		return Result{Error: fmt.Errorf("failed to create PublicKey from bytes %w", err)}, runInfo
 	}
 	pkh := pk.MustHash()
 	// Validate the key against the spec
@@ -121,7 +119,7 @@ func (t *VRFTaskV2Plus) Run(_ context.Context, lggr logger.Logger, vars Vars, in
 		PreSeed:          preSeed,
 		BlockHash:        common.BytesToHash(requestBlockHash),
 		BlockNum:         uint64(requestBlockNumber),
-		SubId:            subID,
+		SubID:            subID,
 		CallbackGasLimit: callbackGasLimit,
 		NumWords:         numWords,
 		Sender:           sender,
@@ -137,21 +135,23 @@ func (t *VRFTaskV2Plus) Run(_ context.Context, lggr logger.Logger, vars Vars, in
 	if err != nil {
 		return Result{Error: err}, retryableRunInfo()
 	}
-	b, err := vrfCoordinatorV2PlusABI.Pack("fulfillRandomWords", onChainProof, rc)
+	// onlyPremium is false because this task assumes that chainlink node fulfills the VRF request
+	// gas cost should be billed to the requesting subscription
+	b, err := vrfCoordinatorV2PlusABI.Pack("fulfillRandomWords", onChainProof, rc, false /* onlyPremium */)
 	if err != nil {
 		return Result{Error: err}, runInfo
 	}
-	results := make(map[string]interface{})
+	results := make(map[string]any)
 	output := hexutil.Encode(b)
 	results["output"] = output
 	// RequestID needs to be a [32]byte for EvmTxMeta.
-	results["requestID"] = hexutil.Encode(requestId.Bytes())
+	results["requestID"] = hexutil.Encode(requestID.Bytes())
 
 	// store vrf proof and request commitment separately so they can be used in a batch fashion
 	results["proof"] = onChainProof
 	results["requestCommitment"] = rc
 
-	lggr.Debugw("Completed VRF V2 task run", "reqID", requestId.String(), "output", output)
+	lggr.Debugw("Completed VRF V2 task run", "reqID", requestID.String(), "output", output)
 
 	return Result{Value: results}, runInfo
 }

@@ -1,13 +1,16 @@
 package cmd
 
 import (
+	"cmp"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 
-	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/urfave/cli"
 
 	"github.com/smartcontractkit/chainlink/v2/core/build"
@@ -43,7 +46,7 @@ func NewApp(s *Shell) *cli.App {
 		},
 		cli.StringFlag{
 			Name:  "admin-credentials-file",
-			Usage: fmt.Sprintf("optional, applies only in client mode when making remote API calls. If provided, `FILE` containing admin credentials will be used for logging in, allowing to avoid an additional login step. If `FILE` is missing, it will be ignored. Defaults to %s", filepath.Join("<RootDir>", "apicredentials")),
+			Usage: "optional, applies only in client mode when making remote API calls. If provided, `FILE` containing admin credentials will be used for logging in, allowing to avoid an additional login step. If `FILE` is missing, it will be ignored. Defaults to " + filepath.Join("<RootDir>", "apicredentials"),
 		},
 		cli.StringFlag{
 			Name:  "remote-node-url",
@@ -73,18 +76,24 @@ func NewApp(s *Shell) *cli.App {
 		s.secretsFileIsSet = c.IsSet("secrets")
 
 		// Default to using a stdout logger only.
-		// This is overidden for server commands which may start a rotating
+		// This is overridden for server commands which may start a rotating
 		// logger instead.
 		lggr, closeFn := logger.NewLogger()
 
-		cfg, err := opts.New()
-		if err != nil {
-			return err
-		}
-
 		s.Logger = lggr
+		s.Registerer = prometheus.DefaultRegisterer // use the global DefaultRegisterer, should be safe since we only ever run one instance of the app per shell
 		s.CloseLogger = closeFn
-		s.Config = cfg
+
+		// Preserve a pre-set s.Config. Overwriting it here would clobber
+		// test configs that use a txdb-wrapped driver and cause real pgx
+		// connections to leak into the shared test database.
+		if s.Config == nil {
+			cfg, err := opts.New()
+			if err != nil {
+				return err
+			}
+			s.Config = cfg
+		}
 
 		if c.Bool("json") {
 			s.Renderer = RendererJSON{Writer: os.Stdout}
@@ -98,7 +107,7 @@ func NewApp(s *Shell) *cli.App {
 		urlStr := c.String("remote-node-url")
 		remoteNodeURL, err := url.Parse(urlStr)
 		if err != nil {
-			return errors.Wrapf(err, "%s is not a valid URL", urlStr)
+			return fmt.Errorf("%s is not a valid URL: %w", urlStr, err)
 		}
 
 		insecureSkipVerify := c.Bool("insecure-skip-verify")
@@ -108,8 +117,8 @@ func NewApp(s *Shell) *cli.App {
 
 		credentialsFile := c.String("admin-credentials-file")
 		sr, err := sessionRequestBuilder.Build(credentialsFile)
-		if err != nil && !errors.Is(errors.Cause(err), ErrNoCredentialFile) && !os.IsNotExist(err) {
-			return errors.Wrapf(err, "failed to load API credentials from file %s", credentialsFile)
+		if err != nil && !errors.Is(err, ErrNoCredentialFile) && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to load API credentials from file %s: %w", credentialsFile, err)
 		}
 
 		s.HTTP = NewAuthenticatedHTTPClient(s.Logger, clientOpts, cookieAuth, sr)
@@ -118,15 +127,14 @@ func NewApp(s *Shell) *cli.App {
 
 		// Allow for initServerConfig to be called if the flag is provided.
 		if c.Bool("applyInitServerConfig") {
-			cfg, err = initServerConfig(&opts, s.configFiles, s.secretsFiles)
+			serverCfg, err := initServerConfig(&opts, s.configFiles, s.secretsFiles)
 			if err != nil {
 				return err
 			}
-			s.Config = cfg
+			s.Config = serverCfg
 		}
 
 		return nil
-
 	}
 	app.After = func(c *cli.Context) error {
 		if s.CloseLogger != nil {
@@ -168,6 +176,10 @@ func NewApp(s *Shell) *cli.App {
 			Action: s.Health,
 			Flags: []cli.Flag{
 				cli.BoolFlag{
+					Name:  "failing, f",
+					Usage: "filter for failing services",
+				},
+				cli.BoolFlag{
 					Name:  "json, j",
 					Usage: "json output",
 				},
@@ -190,11 +202,13 @@ func NewApp(s *Shell) *cli.App {
 				initOCRKeysSubCmd(s),
 				initOCR2KeysSubCmd(s),
 
-				keysCommand("Cosmos", NewCosmosKeysClient(s)),
 				keysCommand("Solana", NewSolanaKeysClient(s)),
 				keysCommand("StarkNet", NewStarkNetKeysClient(s)),
-				keysCommand("DKGSign", NewDKGSignKeysClient(s)),
-				keysCommand("DKGEncrypt", NewDKGEncryptKeysClient(s)),
+				keysCommand("Aptos", NewAptosKeysClient(s)),
+				keysCommand("Stellar", NewStellarKeysClient(s)),
+				keysCommand("Tron", NewTronKeysClient(s)),
+				keysCommand("TON", NewTONKeysClient(s)),
+				keysCommand("Sui", NewSuiKeysClient(s)),
 
 				initVRFKeysSubCmd(s),
 			},
@@ -216,7 +230,7 @@ func NewApp(s *Shell) *cli.App {
 				},
 			},
 			Before: func(c *cli.Context) error {
-				errNoDuplicateFlags := fmt.Errorf("multiple commands with --config or --secrets flags. only one command may specify these flags. when secrets are used, they must be specific together in the same command")
+				errNoDuplicateFlags := errors.New("multiple commands with --config or --secrets flags. only one command may specify these flags. when secrets are used, they must be specific together in the same command")
 				if c.IsSet("config") {
 					if s.configFilesIsSet || s.secretsFileIsSet {
 						return errNoDuplicateFlags
@@ -240,31 +254,43 @@ func NewApp(s *Shell) *cli.App {
 
 				logFileMaxSizeMB := s.Config.Log().File().MaxSize() / utils.MB
 				if logFileMaxSizeMB > 0 {
-					err = utils.EnsureDirAndMaxPerms(s.Config.Log().File().Dir(), os.FileMode(0700))
+					err = utils.EnsureDirAndMaxPerms(s.Config.Log().File().Dir(), os.FileMode(0o700))
 					if err != nil {
 						return err
 					}
 				}
 
-				// Swap out the logger, replacing the old one.
+				// Update the logger, replacing the old one.
 				err = s.CloseLogger()
 				if err != nil {
 					return err
 				}
 
+				// Configure a new logger with OTel updatable core support
 				lggrCfg := logger.Config{
-					LogLevel:       s.Config.Log().Level(),
-					Dir:            s.Config.Log().File().Dir(),
-					JsonConsole:    s.Config.Log().JSONConsole(),
-					UnixTS:         s.Config.Log().UnixTimestamps(),
+					LogLevel:    s.Config.Log().Level(),
+					Dir:         s.Config.Log().File().Dir(),
+					JSONConsole: s.Config.Log().JSONConsole(),
+					UnixTS:      s.Config.Log().UnixTimestamps(),
+					//nolint:gosec // filemaxsizesmb won't exceed max int
 					FileMaxSizeMB:  int(logFileMaxSizeMB),
 					FileMaxAgeDays: int(s.Config.Log().File().MaxAgeDays()),
 					FileMaxBackups: int(s.Config.Log().File().MaxBackups()),
+					SentryEnabled:  s.Config.Sentry().DSN() != "",
 				}
-				l, closeFn := lggrCfg.New()
+
+				// Noop zap Core that can be swapped out later for OTel support
+				updatableCore := logger.NewUpdatableCore()
+
+				l, closeFn := lggrCfg.NewWithCores(updatableCore.Root())
 
 				s.Logger = l
-				s.CloseLogger = closeFn
+				s.CloseLogger = func() error {
+					updatableCore.Close()
+					return closeFn()
+				}
+				// s.SetOtelCore is a hook that can be used to set the OTel core
+				s.SetOtelCore = updatableCore.Update
 
 				return nil
 			},
@@ -279,35 +305,31 @@ func NewApp(s *Shell) *cli.App {
 			Usage: "Commands for handling transactions",
 			Subcommands: []cli.Command{
 				initEVMTxSubCmd(s),
-				initCosmosTxSubCmd(s),
 				initSolanaTxSubCmd(s),
 			},
 		},
 		{
-			Name:  "chains",
-			Usage: "Commands for handling chain configuration",
-			Subcommands: cli.Commands{
-				chainCommand("EVM", EVMChainClient(s), cli.Int64Flag{Name: "id", Usage: "chain ID"}),
-				chainCommand("Cosmos", CosmosChainClient(s), cli.StringFlag{Name: "id", Usage: "chain ID"}),
-				chainCommand("Solana", SolanaChainClient(s),
-					cli.StringFlag{Name: "id", Usage: "chain ID, options: [mainnet, testnet, devnet, localnet]"}),
-				chainCommand("StarkNet", StarkNetChainClient(s), cli.StringFlag{Name: "id", Usage: "chain ID"}),
-			},
+			Name:        "chains",
+			Usage:       "Commands for handling chain configuration",
+			Subcommands: initChainSubCmds(s),
 		},
 		{
-			Name:  "nodes",
-			Usage: "Commands for handling node configuration",
-			Subcommands: cli.Commands{
-				initEVMNodeSubCmd(s),
-				initCosmosNodeSubCmd(s),
-				initSolanaNodeSubCmd(s),
-				initStarkNetNodeSubCmd(s),
-			},
+			Name:        "nodes",
+			Usage:       "Commands for handling node configuration",
+			Subcommands: initNodeSubCmds(s),
 		},
 		{
 			Name:        "forwarders",
 			Usage:       "Commands for managing forwarder addresses.",
 			Subcommands: initFowardersSubCmds(s),
+		},
+		{
+			Name:  "help-all",
+			Usage: "Shows a list of all commands and sub-commands",
+			Action: func(c *cli.Context) error {
+				printCommands("", c.App.Commands)
+				return nil
+			},
 		},
 	}...)
 	return app
@@ -320,10 +342,25 @@ func format(s string) string {
 	return string(whitespace.ReplaceAll([]byte(s), []byte(" ")))
 }
 
-func initServerConfig(opts *chainlink.GeneralConfigOpts, configFiles []string, secretsFiles []string) (chainlink.GeneralConfig, error) {
+func initServerConfig(opts *chainlink.GeneralConfigOpts, configFiles, secretsFiles []string) (chainlink.GeneralConfig, error) {
 	err := opts.Setup(configFiles, secretsFiles)
 	if err != nil {
 		return nil, err
 	}
 	return opts.New()
+}
+
+func printCommands(parent string, cs cli.Commands) {
+	slices.SortFunc(cs, func(a, b cli.Command) int {
+		return cmp.Compare(a.Name, b.Name)
+	})
+	for i := range cs {
+		c := cs[i]
+		name := c.Name
+		if parent != "" {
+			name = parent + " " + name
+		}
+		fmt.Printf("%s # %s\n", name, c.Usage)
+		printCommands(name, c.Subcommands)
+	}
 }

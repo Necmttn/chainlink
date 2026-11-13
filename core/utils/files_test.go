@@ -64,13 +64,11 @@ func TestFileSize_MarshalText_String(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
-
 		t.Run(test.expected, func(t *testing.T) {
 			t.Parallel()
 
 			bstr, err := test.input.MarshalText()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, test.expected, string(bstr))
 			assert.Equal(t, test.expected, test.input.String())
 		})
@@ -113,15 +111,13 @@ func TestFileSize_UnmarshalText(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
-
 		t.Run(test.input, func(t *testing.T) {
 			t.Parallel()
 
 			var fs FileSize
 			err := fs.UnmarshalText([]byte(test.input))
 			if test.valid {
-				assert.NoError(t, err)
+				require.NoError(t, err)
 				assert.Equal(t, test.expected, fs)
 			} else {
 				assert.Error(t, err)

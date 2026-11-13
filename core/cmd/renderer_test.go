@@ -5,14 +5,13 @@ import (
 	"io"
 	"testing"
 
-	"github.com/smartcontractkit/chainlink/v2/core/cmd"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
-	"github.com/smartcontractkit/chainlink/v2/core/web"
-	webpresenters "github.com/smartcontractkit/chainlink/v2/core/web/presenters"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink/v2/core/cmd"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/v2/core/web"
+	webpresenters "github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 )
 
 func TestRendererJSON_RenderVRFKeys(t *testing.T) {
@@ -36,14 +35,14 @@ func TestRendererTable_RenderConfigurationV2(t *testing.T) {
 
 	app := cltest.NewApplicationEVMDisabled(t)
 	wantUser, wantEffective := app.Config.ConfigTOML()
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 	client := app.NewHTTPClient(nil)
 
 	t.Run("effective", func(t *testing.T) {
 		resp, cleanup := client.Get("/v2/config/v2")
 		t.Cleanup(cleanup)
 		var effective web.ConfigV2Resource
-		require.NoError(t, cltest.ParseJSONAPIResponse(t, resp, &effective))
+		cltest.ParseJSONAPIResponse(t, resp, &effective)
 
 		assert.Equal(t, wantEffective, effective.Config)
 	})
@@ -52,7 +51,7 @@ func TestRendererTable_RenderConfigurationV2(t *testing.T) {
 		resp, cleanup := client.Get("/v2/config/v2?userOnly=true")
 		t.Cleanup(cleanup)
 		var user web.ConfigV2Resource
-		require.NoError(t, cltest.ParseJSONAPIResponse(t, resp, &user))
+		cltest.ParseJSONAPIResponse(t, resp, &user)
 
 		assert.Equal(t, wantUser, user.Config)
 	})
@@ -98,7 +97,7 @@ func TestRendererTable_RenderExternalInitiatorAuthentication(t *testing.T) {
 			tw := &testWriter{test.content, t, false}
 			r := cmd.RendererTable{Writer: tw}
 
-			assert.NoError(t, r.Render(&eia))
+			require.NoError(t, r.Render(&eia))
 			assert.True(t, tw.found)
 		})
 	}

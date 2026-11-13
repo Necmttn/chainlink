@@ -31,23 +31,97 @@ fj293fbBnlQ!f9vNs
 HTTPPort = $PORT
 
 -- out.txt --
--JobSpawner
--Mailbox.Monitor
--Mercury.WSRPCPool
--Mercury.WSRPCPool.CacheSet
--PipelineORM
--PipelineRunner
--PromReporter
--TelemetryManager
+ok BridgeStatusReporter
+ok CRE
+ok CRE.DispatcherWrapper
+ok HeadReporter
+ok Heartbeat
+ok JobSpawner
+ok JobSpecReporter
+ok LLOTransmissionReaper
+ok Mailbox.Monitor
+ok Mercury.WSRPCPool
+ok Mercury.WSRPCPool.CacheSet
+ok NodePlatformBuildInfo
+ok NodePlatformJobInfo
+ok PipelineORM
+ok PipelineRunner
+ok PipelineRunner.BridgeCache
+ok RetirementReportCache
+ok TelemetryManager
+ok WorkflowStore
 
 -- out.json --
 {
   "data": [
     {
       "type": "checks",
+      "id": "BridgeStatusReporter",
+      "attributes": {
+        "name": "BridgeStatusReporter",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "CRE",
+      "attributes": {
+        "name": "CRE",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "CRE.DispatcherWrapper",
+      "attributes": {
+        "name": "CRE.DispatcherWrapper",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "HeadReporter",
+      "attributes": {
+        "name": "HeadReporter",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "Heartbeat",
+      "attributes": {
+        "name": "Heartbeat",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
       "id": "JobSpawner",
       "attributes": {
         "name": "JobSpawner",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "JobSpecReporter",
+      "attributes": {
+        "name": "JobSpecReporter",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "LLOTransmissionReaper",
+      "attributes": {
+        "name": "LLOTransmissionReaper",
         "status": "passing",
         "output": ""
       }
@@ -81,6 +155,24 @@ HTTPPort = $PORT
     },
     {
       "type": "checks",
+      "id": "NodePlatformBuildInfo",
+      "attributes": {
+        "name": "NodePlatformBuildInfo",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "NodePlatformJobInfo",
+      "attributes": {
+        "name": "NodePlatformJobInfo",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
       "id": "PipelineORM",
       "attributes": {
         "name": "PipelineORM",
@@ -99,9 +191,18 @@ HTTPPort = $PORT
     },
     {
       "type": "checks",
-      "id": "PromReporter",
+      "id": "PipelineRunner.BridgeCache",
       "attributes": {
-        "name": "PromReporter",
+        "name": "PipelineRunner.BridgeCache",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "RetirementReportCache",
+      "attributes": {
+        "name": "RetirementReportCache",
         "status": "passing",
         "output": ""
       }
@@ -111,6 +212,15 @@ HTTPPort = $PORT
       "id": "TelemetryManager",
       "attributes": {
         "name": "TelemetryManager",
+        "status": "passing",
+        "output": ""
+      }
+    },
+    {
+      "type": "checks",
+      "id": "WorkflowStore",
+      "attributes": {
+        "name": "WorkflowStore",
         "status": "passing",
         "output": ""
       }

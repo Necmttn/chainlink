@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	stderrors "errors"
 	"io"
 	"math/big"
 	"net/http"
@@ -9,23 +10,21 @@ import (
 	"strconv"
 	"strings"
 
-	commonassets "github.com/smartcontractkit/chainlink-common/pkg/assets"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/assets"
-	ubig "github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm"
-	"github.com/smartcontractkit/chainlink/v2/core/config/toml"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
-	"github.com/smartcontractkit/chainlink/v2/core/logger/audit"
-	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
-	evmrelay "github.com/smartcontractkit/chainlink/v2/core/services/relay/evm"
-	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
-	"go.uber.org/multierr"
+
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ethkey"
+	commonassets "github.com/smartcontractkit/chainlink-common/pkg/assets"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
+	"github.com/smartcontractkit/chainlink/v2/core/config/toml"
+	"github.com/smartcontractkit/chainlink/v2/core/logger/audit"
+	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
+	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 )
 
 // ETHKeysController manages account keys
@@ -85,13 +84,13 @@ func (ekc *ETHKeysController) Index(c *gin.Context) {
 	ethKeyStore := ekc.app.GetKeyStore().Eth()
 	var keys []ethkey.KeyV2
 	var err error
-	keys, err = ethKeyStore.GetAll()
+	keys, err = ethKeyStore.GetAll(c.Request.Context())
 	if err != nil {
 		err = errors.Errorf("error getting unlocked keys: %v", err)
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
-	states, err := ethKeyStore.GetStatesForKeys(keys)
+	states, err := ethKeyStore.GetStatesForKeys(c.Request.Context(), keys)
 	if err != nil {
 		err = errors.Errorf("error getting key states: %v", err)
 		jsonAPIError(c, http.StatusInternalServerError, err)
@@ -99,7 +98,7 @@ func (ekc *ETHKeysController) Index(c *gin.Context) {
 	}
 	var resources []presenters.ETHKeyResource
 	for _, state := range states {
-		key, err := ethKeyStore.Get(state.Address.Hex())
+		key, err := ethKeyStore.Get(c.Request.Context(), state.Address.Hex())
 		if err != nil {
 			jsonAPIError(c, http.StatusInternalServerError, err)
 			return
@@ -115,7 +114,6 @@ func (ekc *ETHKeysController) Index(c *gin.Context) {
 	})
 
 	jsonAPIResponseWithStatus(c, resources, "keys", http.StatusOK)
-
 }
 
 // Create adds a new account
@@ -136,13 +134,13 @@ func (ekc *ETHKeysController) Create(c *gin.Context) {
 		return
 	}
 
-	key, err := ethKeyStore.Create(chain.ID())
+	key, err := ethKeyStore.Create(c.Request.Context(), chain.ID())
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	state, err := ethKeyStore.GetState(key.ID(), chain.ID())
+	state, err := ethKeyStore.GetState(c.Request.Context(), key.ID(), chain.ID())
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
@@ -151,7 +149,7 @@ func (ekc *ETHKeysController) Create(c *gin.Context) {
 	c.Set("key", key)
 	c.Set("state", state)
 
-	ekc.app.GetAuditLogger().Audit(audit.KeyCreated, map[string]interface{}{
+	ekc.app.GetAuditLogger().Audit(audit.KeyCreated, map[string]any{
 		"type": "ethereum",
 		"id":   key.ID(),
 	})
@@ -169,7 +167,7 @@ func (ekc *ETHKeysController) Delete(c *gin.Context) {
 		return
 	}
 
-	key, err := ethKeyStore.Get(keyID)
+	key, err := ethKeyStore.Get(c.Request.Context(), keyID)
 	if err != nil {
 		if errors.Is(err, keystore.ErrKeyNotFound) {
 			jsonAPIError(c, http.StatusNotFound, err)
@@ -179,13 +177,13 @@ func (ekc *ETHKeysController) Delete(c *gin.Context) {
 		return
 	}
 
-	state, err := ethKeyStore.GetStateForKey(key)
+	state, err := ethKeyStore.GetStateForKey(c.Request.Context(), key)
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	_, err = ethKeyStore.Delete(keyID)
+	_, err = ethKeyStore.Delete(c.Request.Context(), keyID)
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
@@ -194,7 +192,7 @@ func (ekc *ETHKeysController) Delete(c *gin.Context) {
 	c.Set("key", key)
 	c.Set("state", state)
 
-	ekc.app.GetAuditLogger().Audit(audit.KeyDeleted, map[string]interface{}{
+	ekc.app.GetAuditLogger().Audit(audit.KeyDeleted, map[string]any{
 		"type": "ethereum",
 		"id":   keyID,
 	})
@@ -217,13 +215,13 @@ func (ekc *ETHKeysController) Import(c *gin.Context) {
 		return
 	}
 
-	key, err := ethKeyStore.Import(bytes, oldPassword, chain.ID())
+	key, err := ethKeyStore.Import(c.Request.Context(), bytes, oldPassword, chain.ID())
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	state, err := ethKeyStore.GetState(key.ID(), chain.ID())
+	state, err := ethKeyStore.GetState(c.Request.Context(), key.ID(), chain.ID())
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
@@ -233,7 +231,7 @@ func (ekc *ETHKeysController) Import(c *gin.Context) {
 	c.Set("state", state)
 	c.Status(http.StatusCreated)
 
-	ekc.app.GetAuditLogger().Audit(audit.KeyImported, map[string]interface{}{
+	ekc.app.GetAuditLogger().Audit(audit.KeyImported, map[string]any{
 		"type": "ethereum",
 		"id":   key.ID(),
 	})
@@ -245,13 +243,13 @@ func (ekc *ETHKeysController) Export(c *gin.Context) {
 	id := c.Param("address")
 	newPassword := c.Query("newpassword")
 
-	bytes, err := ekc.app.GetKeyStore().Eth().Export(id, newPassword)
+	bytes, err := ekc.app.GetKeyStore().Eth().Export(c.Request.Context(), id, newPassword)
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	ekc.app.GetAuditLogger().Audit(audit.KeyExported, map[string]interface{}{
+	ekc.app.GetAuditLogger().Audit(audit.KeyExported, map[string]any{
 		"type": "ethereum",
 		"id":   id,
 	})
@@ -270,7 +268,7 @@ func (ekc *ETHKeysController) Chain(c *gin.Context) {
 		jsonAPIError(c, http.StatusBadRequest, errors.Errorf("invalid address: %s, must be hex address", keyID))
 		return
 	}
-	address := common.HexToAddress((keyID))
+	address := common.HexToAddress(keyID)
 
 	cid := c.Query("evmChainID")
 	chain, ok := ekc.getChain(c, cid)
@@ -291,7 +289,7 @@ func (ekc *ETHKeysController) Chain(c *gin.Context) {
 	if abandon {
 		var resetErr error
 		err = chain.TxManager().Reset(address, abandon)
-		err = multierr.Combine(err, resetErr)
+		err = stderrors.Join(err, resetErr)
 		if err != nil {
 			if strings.Contains(err.Error(), "key state not found with address") {
 				jsonAPIError(c, http.StatusNotFound, err)
@@ -312,9 +310,9 @@ func (ekc *ETHKeysController) Chain(c *gin.Context) {
 		}
 
 		if enabled {
-			err = kst.Enable(address, chain.ID())
+			err = kst.Enable(c.Request.Context(), address, chain.ID())
 		} else {
-			err = kst.Disable(address, chain.ID())
+			err = kst.Disable(c.Request.Context(), address, chain.ID())
 		}
 		if err != nil {
 			jsonAPIError(c, http.StatusInternalServerError, err)
@@ -322,13 +320,13 @@ func (ekc *ETHKeysController) Chain(c *gin.Context) {
 		}
 	}
 
-	key, err := kst.Get(keyID)
+	key, err := kst.Get(c.Request.Context(), keyID)
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	state, err := kst.GetState(key.ID(), chain.ID())
+	state, err := kst.GetState(c.Request.Context(), key.ID(), chain.ID())
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
@@ -346,11 +344,14 @@ func (ekc *ETHKeysController) setEthBalance(bal *big.Int) presenters.NewETHKeyOp
 // queries the EthClient for the ETH balance at the address associated with state
 func (ekc *ETHKeysController) getEthBalance(ctx context.Context, state ethkey.State) *big.Int {
 	chainID := state.EVMChainID.ToInt()
-	chain, err := ekc.app.GetRelayers().LegacyEVMChains().Get(chainID.String())
+	chainService, err := ekc.app.GetRelayers().LegacyEVMChains().Get(chainID.String()) //nolint:staticcheck // LegacyEVMChains is deprecated but refactoring to new relayer interface requires larger architectural changes
 	if err != nil {
-		if !errors.Is(errors.Cause(err), evmrelay.ErrNoChains) {
-			ekc.lggr.Errorw("Failed to get EVM Chain", "chainID", chainID, "address", state.Address, "err", err)
-		}
+		ekc.lggr.Errorw("Failed to get EVM Chain", "chainID", chainID, "address", state.Address, "err", err)
+		return nil
+	}
+	chain, ok := chainService.(legacyevm.Chain)
+	if !ok {
+		ekc.lggr.Errorw("EVM Chain in LOOPP mode", "chainID", chainID, "err", err)
 		return nil
 	}
 
@@ -362,7 +363,6 @@ func (ekc *ETHKeysController) getEthBalance(ctx context.Context, state ethkey.St
 	}
 
 	return bal
-
 }
 
 func (ekc *ETHKeysController) setLinkBalance(bal *commonassets.Link) presenters.NewETHKeyOption {
@@ -371,20 +371,23 @@ func (ekc *ETHKeysController) setLinkBalance(bal *commonassets.Link) presenters.
 
 // queries the EthClient for the LINK balance at the address associated with state
 func (ekc *ETHKeysController) getLinkBalance(ctx context.Context, state ethkey.State) *commonassets.Link {
-	var bal *commonassets.Link
 	chainID := state.EVMChainID.ToInt()
-	chain, err := ekc.app.GetRelayers().LegacyEVMChains().Get(chainID.String())
+	chainService, err := ekc.app.GetRelayers().LegacyEVMChains().Get(chainID.String()) //nolint:staticcheck // LegacyEVMChains is deprecated but refactoring to new relayer interface requires larger architectural changes
 	if err != nil {
-		if !errors.Is(errors.Cause(err), evmrelay.ErrNoChains) {
-			ekc.lggr.Errorw("Failed to get EVM Chain", "chainID", chainID, "err", err)
-		}
-	} else {
-		ethClient := chain.Client()
-		addr := common.HexToAddress(chain.Config().EVM().LinkContractAddress())
-		bal, err = ethClient.LINKBalance(ctx, state.Address.Address(), addr)
-		if err != nil {
-			ekc.lggr.Errorw("Failed to get LINK balance", "chainID", chainID, "address", state.Address, "err", err)
-		}
+		ekc.lggr.Errorw("Failed to get EVM Chain", "chainID", chainID, "err", err)
+		return nil
+	}
+	chain, ok := chainService.(legacyevm.Chain)
+	if !ok {
+		ekc.lggr.Errorw("EVM Chain in LOOPP mode", "chainID", chainID, "err", err)
+		return nil
+	}
+	ethClient := chain.Client()
+	addr := common.HexToAddress(chain.Config().EVM().LinkContractAddress())
+	bal, err := ethClient.LINKBalance(ctx, state.Address.Address(), addr)
+	if err != nil {
+		ekc.lggr.Errorw("Failed to get LINK balance", "chainID", chainID, "address", state.Address, "err", err)
+		return nil
 	}
 	return bal
 }
@@ -393,27 +396,28 @@ func (ekc *ETHKeysController) getLinkBalance(ctx context.Context, state ethkey.S
 // gets the key specific max gas price from the chain config and sets it on the
 // resource.
 func (ekc *ETHKeysController) setKeyMaxGasPriceWei(price *assets.Wei) presenters.NewETHKeyOption {
-	return presenters.SetETHKeyMaxGasPriceWei(ubig.New(price.ToInt()))
+	return presenters.SetETHKeyMaxGasPriceWei(sqlutil.New(price.ToInt()))
 }
 
 func (ekc *ETHKeysController) getKeyMaxGasPriceWei(state ethkey.State, keyAddress common.Address) *assets.Wei {
-	var price *assets.Wei
 	chainID := state.EVMChainID.ToInt()
-	chain, err := ekc.app.GetRelayers().LegacyEVMChains().Get(chainID.String())
+	chainService, err := ekc.app.GetRelayers().LegacyEVMChains().Get(chainID.String()) //nolint:staticcheck // LegacyEVMChains is deprecated but refactoring to new relayer interface requires larger architectural changes
 	if err != nil {
-		if !errors.Is(errors.Cause(err), evmrelay.ErrNoChains) {
-			ekc.lggr.Errorw("Failed to get EVM Chain", "chainID", chainID, "err", err)
-		}
-	} else {
-		price = chain.Config().EVM().GasEstimator().PriceMaxKey(keyAddress)
+		ekc.lggr.Errorw("Failed to get EVM Chain", "chainID", chainID, "err", err)
+		return nil
 	}
-	return price
+	chain, ok := chainService.(legacyevm.Chain)
+	if !ok {
+		ekc.lggr.Errorw("EVM Chain in LOOPP mode", "chainID", chainID, "err", err)
+		return nil
+	}
+	return chain.Config().EVM().GasEstimator().PriceMaxKey(keyAddress)
 }
 
 // getChain is a convenience wrapper to retrieve a chain for a given request
 // and call the corresponding API response error function for 400, 404 and 500 results
 func (ekc *ETHKeysController) getChain(c *gin.Context, chainIDstr string) (chain legacyevm.Chain, ok bool) {
-	chain, err := getChain(ekc.app.GetRelayers().LegacyEVMChains(), chainIDstr)
+	chain, err := getChain(ekc.app.GetRelayers().LegacyEVMChains(), chainIDstr) //nolint:staticcheck // LegacyEVMChains is deprecated but refactoring to new relayer interface requires larger architectural changes
 	if err != nil {
 		if errors.Is(err, ErrInvalidChainID) || errors.Is(err, ErrMultipleChains) {
 			jsonAPIError(c, http.StatusBadRequest, err)

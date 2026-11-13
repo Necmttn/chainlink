@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,11 +10,9 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
-	"go.uber.org/multierr"
 
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys"
 	cutils "github.com/smartcontractkit/chainlink-common/pkg/utils"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/chaintype"
-	"github.com/smartcontractkit/chainlink/v2/core/store/models"
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
 	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 )
@@ -111,7 +110,7 @@ type OCR2KeyBundlePresenters []OCR2KeyBundlePresenter
 // RenderTable implements TableRenderer
 func (ps OCR2KeyBundlePresenters) RenderTable(rt RendererTable) error {
 	headers := []string{"ID", "Type", "On-chain pubkey", "Off-chain pubkey", "Config pubkey"}
-	rows := [][]string{}
+	rows := make([][]string, 0, len(ps))
 
 	for _, p := range ps {
 		rows = append(rows, p.ToRow())
@@ -133,7 +132,7 @@ func (s *Shell) ListOCR2KeyBundles(_ *cli.Context) error {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -145,17 +144,17 @@ func (s *Shell) ListOCR2KeyBundles(_ *cli.Context) error {
 func (s *Shell) CreateOCR2KeyBundle(c *cli.Context) error {
 	if !c.Args().Present() {
 		return s.errorOut(
-			errors.Errorf(`must pass the type to create, options are: %s`, chaintype.SupportedChainTypes.String()),
+			errors.Errorf(`must pass the type to create, options are: %s`, corekeys.SupportedChainTypes.String()),
 		)
 	}
 	chainType := c.Args().Get(0)
-	resp, err := s.HTTP.Post(s.ctx(), fmt.Sprintf("/v2/keys/ocr2/%s", chainType), nil)
+	resp, err := s.HTTP.Post(s.ctx(), "/v2/keys/ocr2/"+chainType, nil)
 	if err != nil {
 		return s.errorOut(err)
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -168,7 +167,7 @@ func (s *Shell) DeleteOCR2KeyBundle(c *cli.Context) error {
 	if !c.Args().Present() {
 		return s.errorOut(errors.New("Must pass the key ID to be deleted"))
 	}
-	id, err := models.Sha256HashFromHex(c.Args().Get(0))
+	id, err := corekeys.Sha256HashFromHex(c.Args().Get(0))
 	if err != nil {
 		return s.errorOut(err)
 	}
@@ -188,7 +187,7 @@ func (s *Shell) DeleteOCR2KeyBundle(c *cli.Context) error {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -224,7 +223,7 @@ func (s *Shell) ImportOCR2Key(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -261,7 +260,7 @@ func (s *Shell) ExportOCR2Key(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -279,7 +278,7 @@ func (s *Shell) ExportOCR2Key(c *cli.Context) (err error) {
 		return s.errorOut(errors.Wrapf(err, "Could not write %v", filepath))
 	}
 
-	_, err = os.Stderr.WriteString(fmt.Sprintf("Exported OCR key bundle %s to %s", ID, filepath))
+	_, err = fmt.Fprintf(os.Stderr, "Exported OCR key bundle %s to %s", ID, filepath)
 	if err != nil {
 		return s.errorOut(err)
 	}

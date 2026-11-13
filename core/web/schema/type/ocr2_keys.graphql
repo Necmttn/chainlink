@@ -1,8 +1,12 @@
 enum OCR2ChainType {
     EVM
-    COSMOS
     SOLANA
     STARKNET
+    APTOS
+    TRON
+    TON
+    SUI
+    STELLAR
 }
 
 type OCR2KeyBundle {

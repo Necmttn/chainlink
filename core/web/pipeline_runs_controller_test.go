@@ -1,9 +1,10 @@
 package web_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -12,140 +13,96 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/hashicorp/consul/sdk/freeport"
 	"github.com/pelletier/go-toml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
+	"github.com/smartcontractkit/freeport"
+
 	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	"github.com/smartcontractkit/chainlink-common/pkg/utils/jsonserializable"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
-	"github.com/smartcontractkit/chainlink/v2/core/services/webhook"
 	"github.com/smartcontractkit/chainlink/v2/core/testdata/testspecs"
 	"github.com/smartcontractkit/chainlink/v2/core/web"
 	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 )
 
-func TestPipelineRunsController_CreateWithBody_HappyPath(t *testing.T) {
+func TestPipelineRunsController_CreateWebhookJobRejected(t *testing.T) {
 	t.Parallel()
 
-	ethClient := cltest.NewEthMocksWithStartupAssertions(t)
-	cfg := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-		c.JobPipeline.HTTPRequest.DefaultTimeout = commonconfig.MustNewDuration(2 * time.Second)
-		c.Database.Listener.FallbackPollInterval = commonconfig.MustNewDuration(10 * time.Millisecond)
-	})
+	app := cltest.NewApplicationEVMDisabled(t)
+	require.NoError(t, app.Start(t.Context()))
 
-	app := cltest.NewApplicationWithConfig(t, cfg, ethClient)
-	require.NoError(t, app.Start(testutils.Context(t)))
-
-	// Setup the bridge
-	mockServer := cltest.NewHTTPMockServerWithRequest(t, 200, `{}`, func(r *http.Request) {
-		defer r.Body.Close()
-		bs, err := io.ReadAll(r.Body)
-		require.NoError(t, err)
-		require.Equal(t, `{"result":"12345"}`, string(bs))
-	})
-
-	_, bridge := cltest.MustCreateBridge(t, app.GetSqlxDB(), cltest.BridgeOpts{URL: mockServer.URL}, app.GetConfig().Database())
-
-	// Add the job
-	uuid := uuid.New()
-	{
-		tomlStr := fmt.Sprintf(testspecs.WebhookSpecWithBodyTemplate, uuid, bridge.Name.String())
-		jb, err := webhook.ValidatedWebhookSpec(tomlStr, app.GetExternalInitiatorManager())
-		require.NoError(t, err)
-
-		err = app.AddJobV2(testutils.Context(t), &jb)
-		require.NoError(t, err)
-	}
-
-	// Give the job.Spawner ample time to discover the job and start its service
-	// (because Postgres events don't seem to work here)
-	time.Sleep(3 * time.Second)
-
-	// Make the request
-	{
-		client := app.NewHTTPClient(nil)
-		body := strings.NewReader(`{"data":{"result":"123.45"}}`)
-		response, cleanup := client.Post("/v2/jobs/"+uuid.String()+"/runs", body)
-		defer cleanup()
-		cltest.AssertServerResponse(t, response, http.StatusOK)
-
-		var parsedResponse presenters.PipelineRunResource
-		err := web.ParseJSONAPIResponse(cltest.ParseResponseBody(t, response), &parsedResponse)
-		assert.NoError(t, err)
-		assert.NotNil(t, parsedResponse.ID)
-		assert.NotNil(t, parsedResponse.CreatedAt)
-		assert.NotNil(t, parsedResponse.FinishedAt)
-		require.Len(t, parsedResponse.TaskRuns, 3)
-	}
+	client := app.NewHTTPClient(nil)
+	// Bridge names are arbitrary; webhook creation is rejected before bridge validation.
+	tomlStr := testspecs.GetWebhookSpecNoBody(uuid.New(), uuid.NewString(), uuid.NewString())
+	body, err := json.Marshal(web.CreateJobRequest{TOML: tomlStr})
+	require.NoError(t, err)
+	response, cleanup := client.Post("/v2/jobs", bytes.NewReader(body))
+	defer cleanup()
+	cltest.AssertServerResponse(t, response, http.StatusUnprocessableEntity)
+	require.Contains(t, string(cltest.ParseResponseBody(t, response)), "job type webhook has been removed")
 }
 
-func TestPipelineRunsController_CreateNoBody_HappyPath(t *testing.T) {
+func TestPipelineRunsController_RunExistingWebhookJobRejected(t *testing.T) {
 	t.Parallel()
 
 	ethClient := cltest.NewEthMocksWithStartupAssertions(t)
+	ethClient.On("BalanceAt", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(big.NewInt(0), nil)
 	cfg := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
 		c.JobPipeline.HTTPRequest.DefaultTimeout = commonconfig.MustNewDuration(2 * time.Second)
-		c.Database.Listener.FallbackPollInterval = commonconfig.MustNewDuration(10 * time.Millisecond)
 	})
 
 	app := cltest.NewApplicationWithConfig(t, cfg, ethClient)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
-	// Setup the bridges
-	mockServer := cltest.NewHTTPMockServer(t, 200, "POST", `{"data":{"result":"123.45"}}`)
+	jobUUID := uuid.New()
+	cltest.MustInsertWebhookSpec(t, app.GetDB(), jobUUID)
 
-	_, bridge := cltest.MustCreateBridge(t, app.GetSqlxDB(), cltest.BridgeOpts{URL: mockServer.URL}, app.GetConfig().Database())
+	client := app.NewHTTPClient(nil)
+	body := strings.NewReader(`{"data":{"result":"123.45"}}`)
+	response, cleanup := client.Post("/v2/jobs/"+jobUUID.String()+"/runs", body)
+	defer cleanup()
+	cltest.AssertServerResponse(t, response, http.StatusUnprocessableEntity)
+	require.Contains(t, string(cltest.ParseResponseBody(t, response)), "webhook")
+}
 
-	mockServer = cltest.NewHTTPMockServerWithRequest(t, 200, `{}`, func(r *http.Request) {
-		defer r.Body.Close()
-		bs, err := io.ReadAll(r.Body)
-		require.NoError(t, err)
-		require.Equal(t, `{"result":"12345"}`, string(bs))
-	})
+// assertPipelineRunResult asserts the outputs/errors/inputs of a pipeline run created by
+// setupPipelineRunsControllerTests, comparing parsed fields directly instead of matching
+// raw JSON substrings.
+func assertPipelineRunResult(t *testing.T, got presenters.PipelineRunResource) {
+	t.Helper()
 
-	_, submitBridge := cltest.MustCreateBridge(t, app.GetSqlxDB(), cltest.BridgeOpts{URL: mockServer.URL}, app.GetConfig().Database())
-
-	// Add the job
-	uuid := uuid.New()
-	{
-		tomlStr := testspecs.GetWebhookSpecNoBody(uuid, bridge.Name.String(), submitBridge.Name.String())
-		jb, err := webhook.ValidatedWebhookSpec(tomlStr, app.GetExternalInitiatorManager())
-		require.NoError(t, err)
-
-		err = app.AddJobV2(testutils.Context(t), &jb)
-		require.NoError(t, err)
-	}
-
-	// Give the job.Spawner ample time to discover the job and start its service
-	// (because Postgres events don't seem to work here)
-	time.Sleep(3 * time.Second)
-
-	// Make the request (authorized as user)
-	{
-		client := app.NewHTTPClient(nil)
-		response, cleanup := client.Post("/v2/jobs/"+uuid.String()+"/runs", nil)
-		defer cleanup()
-		cltest.AssertServerResponse(t, response, http.StatusOK)
-
-		var parsedResponse presenters.PipelineRunResource
-		err := web.ParseJSONAPIResponse(cltest.ParseResponseBody(t, response), &parsedResponse)
-		bs, _ := json.MarshalIndent(parsedResponse, "", "    ")
-		t.Log(string(bs))
-		assert.NoError(t, err)
-		assert.NotNil(t, parsedResponse.ID)
-		assert.NotNil(t, parsedResponse.CreatedAt)
-		assert.NotNil(t, parsedResponse.FinishedAt)
-		require.Len(t, parsedResponse.TaskRuns, 4)
-	}
+	three := "3"
+	uhOh := "uh oh"
+	assert.Equal(t, []*string{&three}, got.Outputs)
+	assert.Equal(t, []*string{nil}, got.Errors) //nolint:staticcheck // Errors is deprecated but still populated for backwards compatibility
+	assert.Equal(t, []*string{&uhOh}, got.AllErrors)
+	assert.Equal(t, []*string{nil}, got.FatalErrors)
+	assert.Equal(t, jsonserializable.JSONSerializable{
+		Valid: true,
+		Val: map[string]any{
+			"answer":       "3",
+			"ds1":          `{"USD": 1}`,
+			"ds1_multiply": "3",
+			"ds1_parse":    int64(1),
+			"ds2":          `{"USD": 1}`,
+			"ds2_multiply": "3",
+			"ds2_parse":    int64(1),
+			"ds3":          map[string]any{},
+			"jobRun":       map[string]any{"meta": nil},
+		},
+	}, got.Inputs)
 }
 
 func TestPipelineRunsController_Index_GlobalHappyPath(t *testing.T) {
+	t.Parallel()
+
 	client, jobID, runIDs := setupPipelineRunsControllerTests(t)
 
 	url := url.URL{Path: "/v2/pipeline/runs"}
@@ -159,10 +116,9 @@ func TestPipelineRunsController_Index_GlobalHappyPath(t *testing.T) {
 
 	var parsedResponse []presenters.PipelineRunResource
 	responseBytes := cltest.ParseResponseBody(t, response)
-	assert.Contains(t, string(responseBytes), `"outputs":["3"],"errors":[null],"allErrors":["uh oh"],"fatalErrors":[null],"inputs":{"answer":"3","ds1":"{\"USD\": 1}","ds1_multiply":"3","ds1_parse":1,"ds2":"{\"USD\": 1}","ds2_multiply":"3","ds2_parse":1,"ds3":{},"jobRun":{"meta":null}`)
 
 	err := web.ParseJSONAPIResponse(responseBytes, &parsedResponse)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	require.Len(t, parsedResponse, 2)
 	// Job Run ID is returned in descending order by run ID (most recent run first)
@@ -171,21 +127,23 @@ func TestPipelineRunsController_Index_GlobalHappyPath(t *testing.T) {
 	assert.NotNil(t, parsedResponse[1].FinishedAt)
 	assert.Equal(t, jobID, parsedResponse[1].PipelineSpec.JobID)
 	require.Len(t, parsedResponse[1].TaskRuns, 8)
+	assertPipelineRunResult(t, parsedResponse[1])
 }
 
 func TestPipelineRunsController_Index_HappyPath(t *testing.T) {
+	t.Parallel()
+
 	client, jobID, runIDs := setupPipelineRunsControllerTests(t)
 
-	response, cleanup := client.Get("/v2/jobs/" + fmt.Sprintf("%v", jobID) + "/runs")
+	response, cleanup := client.Get("/v2/jobs/" + strconv.Itoa(int(jobID)) + "/runs")
 	defer cleanup()
 	cltest.AssertServerResponse(t, response, http.StatusOK)
 
 	var parsedResponse []presenters.PipelineRunResource
 	responseBytes := cltest.ParseResponseBody(t, response)
-	assert.Contains(t, string(responseBytes), `"outputs":["3"],"errors":[null],"allErrors":["uh oh"],"fatalErrors":[null],"inputs":{"answer":"3","ds1":"{\"USD\": 1}","ds1_multiply":"3","ds1_parse":1,"ds2":"{\"USD\": 1}","ds2_multiply":"3","ds2_parse":1,"ds3":{},"jobRun":{"meta":null}`)
 
 	err := web.ParseJSONAPIResponse(responseBytes, &parsedResponse)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	require.Len(t, parsedResponse, 2)
 	// Job Run ID is returned in descending order by run ID (most recent run first)
@@ -194,40 +152,44 @@ func TestPipelineRunsController_Index_HappyPath(t *testing.T) {
 	assert.NotNil(t, parsedResponse[1].FinishedAt)
 	assert.Equal(t, jobID, parsedResponse[1].PipelineSpec.JobID)
 	require.Len(t, parsedResponse[1].TaskRuns, 8)
+	assertPipelineRunResult(t, parsedResponse[1])
 }
 
 func TestPipelineRunsController_Index_Pagination(t *testing.T) {
+	t.Parallel()
+
 	client, jobID, runIDs := setupPipelineRunsControllerTests(t)
 
-	response, cleanup := client.Get("/v2/jobs/" + fmt.Sprintf("%v", jobID) + "/runs?page=1&size=1")
+	response, cleanup := client.Get("/v2/jobs/" + strconv.Itoa(int(jobID)) + "/runs?page=1&size=1")
 	defer cleanup()
 	cltest.AssertServerResponse(t, response, http.StatusOK)
 
 	var parsedResponse []presenters.PipelineRunResource
 	responseBytes := cltest.ParseResponseBody(t, response)
-	assert.Contains(t, string(responseBytes), `"outputs":["3"],"errors":[null],"allErrors":["uh oh"],"fatalErrors":[null],"inputs":{"answer":"3","ds1":"{\"USD\": 1}","ds1_multiply":"3","ds1_parse":1,"ds2":"{\"USD\": 1}","ds2_multiply":"3","ds2_parse":1,"ds3":{},"jobRun":{"meta":null}`)
 	assert.Contains(t, string(responseBytes), `"meta":{"count":2}`)
 
 	err := web.ParseJSONAPIResponse(responseBytes, &parsedResponse)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	require.Len(t, parsedResponse, 1)
 	assert.Equal(t, parsedResponse[0].ID, strconv.Itoa(int(runIDs[1])))
 	assert.NotNil(t, parsedResponse[0].CreatedAt)
 	assert.NotNil(t, parsedResponse[0].FinishedAt)
 	require.Len(t, parsedResponse[0].TaskRuns, 8)
+	assertPipelineRunResult(t, parsedResponse[0])
 }
 
 func TestPipelineRunsController_Show_HappyPath(t *testing.T) {
+	t.Parallel()
+
 	client, jobID, runIDs := setupPipelineRunsControllerTests(t)
 
-	response, cleanup := client.Get("/v2/jobs/" + fmt.Sprintf("%v", jobID) + "/runs/" + fmt.Sprintf("%v", runIDs[0]))
+	response, cleanup := client.Get("/v2/jobs/" + strconv.Itoa(int(jobID)) + "/runs/" + strconv.FormatInt(runIDs[0], 10))
 	defer cleanup()
 	cltest.AssertServerResponse(t, response, http.StatusOK)
 
 	var parsedResponse presenters.PipelineRunResource
 	responseBytes := cltest.ParseResponseBody(t, response)
-	assert.Contains(t, string(responseBytes), `"outputs":["3"],"errors":[null],"allErrors":["uh oh"],"fatalErrors":[null],"inputs":{"answer":"3","ds1":"{\"USD\": 1}","ds1_multiply":"3","ds1_parse":1,"ds2":"{\"USD\": 1}","ds2_multiply":"3","ds2_parse":1,"ds3":{},"jobRun":{"meta":null}`)
 	err := web.ParseJSONAPIResponse(responseBytes, &parsedResponse)
 	require.NoError(t, err)
 
@@ -235,12 +197,13 @@ func TestPipelineRunsController_Show_HappyPath(t *testing.T) {
 	assert.NotNil(t, parsedResponse.CreatedAt)
 	assert.NotNil(t, parsedResponse.FinishedAt)
 	require.Len(t, parsedResponse.TaskRuns, 8)
+	assertPipelineRunResult(t, parsedResponse)
 }
 
 func TestPipelineRunsController_ShowRun_InvalidID(t *testing.T) {
 	t.Parallel()
 	app := cltest.NewApplicationEVMDisabled(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 	client := app.NewHTTPClient(nil)
 
 	response, cleanup := client.Get("/v2/jobs/1/runs/invalid-run-ID")
@@ -249,20 +212,21 @@ func TestPipelineRunsController_ShowRun_InvalidID(t *testing.T) {
 }
 
 func setupPipelineRunsControllerTests(t *testing.T) (cltest.HTTPClientCleaner, int32, []int64) {
-	t.Parallel()
+	t.Helper()
+	ctx := t.Context()
 	ethClient := cltest.NewEthMocksWithStartupAssertions(t)
-	ethClient.On("PendingNonceAt", mock.Anything, mock.Anything).Return(uint64(0), nil)
+	ethClient.On("CallContract", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(nil, nil)
 	cfg := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-		c.OCR.Enabled = ptr(true)
-		c.P2P.V2.Enabled = ptr(true)
+		c.OCR.Enabled = new(true)
+		c.P2P.V2.Enabled = new(true)
 		c.P2P.V2.ListenAddresses = &[]string{fmt.Sprintf("127.0.0.1:%d", freeport.GetOne(t))}
 		c.P2P.PeerID = &cltest.DefaultP2PPeerID
-		c.EVM[0].NonceAutoSync = ptr(false)
-		c.EVM[0].BalanceMonitor.Enabled = ptr(false)
+		c.EVM[0].NonceAutoSync = new(false)
+		c.EVM[0].BalanceMonitor.Enabled = new(false)
 	})
 	app := cltest.NewApplicationWithConfigAndKey(t, cfg, ethClient, cltest.DefaultP2PKey)
-	require.NoError(t, app.Start(testutils.Context(t)))
-	require.NoError(t, app.KeyStore.OCR().Add(cltest.DefaultOCRKey))
+	require.NoError(t, app.Start(ctx))
+	require.NoError(t, app.KeyStore.OCR().Add(ctx, cltest.DefaultOCRKey))
 	client := app.NewHTTPClient(nil)
 
 	key, _ := cltest.MustInsertRandomKey(t, app.KeyStore.Eth())
@@ -274,7 +238,7 @@ func setupPipelineRunsControllerTests(t *testing.T) (cltest.HTTPClientCleaner, i
 	externalJobID       = "%s"
 	name               = "%s"
 	contractAddress    = "%s"
-	evmChainID		   = "0"
+	evmChainID		   = "%s"
 	p2pv2Bootstrappers = ["12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq@127.0.0.1:5001"]
 	keyBundleID        = "%s"
 	transmitterAddress = "%s"
@@ -296,7 +260,7 @@ func setupPipelineRunsControllerTests(t *testing.T) (cltest.HTTPClientCleaner, i
 
 		answer [type=median index=0];
 	"""
-	`, nameAndExternalJobID, nameAndExternalJobID, testutils.NewAddress().Hex(), cltest.DefaultOCRKeyBundleID, key.Address.Hex())
+	`, nameAndExternalJobID, nameAndExternalJobID, testutils.NewAddress().Hex(), cltest.FixtureChainID.String(), cltest.DefaultOCRKeyBundleID, key.Address.Hex())
 	var jb job.Job
 	err := toml.Unmarshal([]byte(sp), &jb)
 	require.NoError(t, err)
@@ -305,12 +269,12 @@ func setupPipelineRunsControllerTests(t *testing.T) (cltest.HTTPClientCleaner, i
 	require.NoError(t, err)
 	jb.OCROracleSpec = &os
 
-	err = app.AddJobV2(testutils.Context(t), &jb)
+	err = app.AddJobV2(t.Context(), &jb)
 	require.NoError(t, err)
 
-	firstRunID, err := app.RunJobV2(testutils.Context(t), jb.ID, nil)
+	firstRunID, err := app.RunJobV2(t.Context(), jb.ID, nil)
 	require.NoError(t, err)
-	secondRunID, err := app.RunJobV2(testutils.Context(t), jb.ID, nil)
+	secondRunID, err := app.RunJobV2(t.Context(), jb.ID, nil)
 	require.NoError(t, err)
 
 	return client, jb.ID, []int64{firstRunID, secondRunID}

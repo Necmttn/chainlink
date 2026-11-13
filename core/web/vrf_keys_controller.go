@@ -32,13 +32,14 @@ func (vrfkc *VRFKeysController) Index(c *gin.Context) {
 // Example:
 // "POST <application>/keys/vrf"
 func (vrfkc *VRFKeysController) Create(c *gin.Context) {
-	pk, err := vrfkc.App.GetKeyStore().VRF().Create()
+	ctx := c.Request.Context()
+	pk, err := vrfkc.App.GetKeyStore().VRF().Create(ctx)
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	vrfkc.App.GetAuditLogger().Audit(audit.KeyCreated, map[string]interface{}{
+	vrfkc.App.GetAuditLogger().Audit(audit.KeyCreated, map[string]any{
 		"type":                "vrf",
 		"id":                  pk.ID(),
 		"vrfPublicKey":        pk.PublicKey,
@@ -53,19 +54,20 @@ func (vrfkc *VRFKeysController) Create(c *gin.Context) {
 // "DELETE <application>/keys/vrf/:keyID"
 // "DELETE <application>/keys/vrf/:keyID?hard=true"
 func (vrfkc *VRFKeysController) Delete(c *gin.Context) {
+	ctx := c.Request.Context()
 	keyID := c.Param("keyID")
 	key, err := vrfkc.App.GetKeyStore().VRF().Get(keyID)
 	if err != nil {
 		jsonAPIError(c, http.StatusNotFound, err)
 		return
 	}
-	_, err = vrfkc.App.GetKeyStore().VRF().Delete(keyID)
+	_, err = vrfkc.App.GetKeyStore().VRF().Delete(ctx, keyID)
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	vrfkc.App.GetAuditLogger().Audit(audit.KeyDeleted, map[string]interface{}{
+	vrfkc.App.GetAuditLogger().Audit(audit.KeyDeleted, map[string]any{
 		"type": "vrf",
 		"id":   keyID,
 	})
@@ -78,6 +80,7 @@ func (vrfkc *VRFKeysController) Delete(c *gin.Context) {
 // "Post <application>/keys/vrf/import"
 func (vrfkc *VRFKeysController) Import(c *gin.Context) {
 	defer vrfkc.App.GetLogger().ErrorIfFn(c.Request.Body.Close, "Error closing Import request body")
+	ctx := c.Request.Context()
 
 	bytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
@@ -85,13 +88,13 @@ func (vrfkc *VRFKeysController) Import(c *gin.Context) {
 		return
 	}
 	oldPassword := c.Query("oldpassword")
-	key, err := vrfkc.App.GetKeyStore().VRF().Import(bytes, oldPassword)
+	key, err := vrfkc.App.GetKeyStore().VRF().Import(ctx, bytes, oldPassword)
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	vrfkc.App.GetAuditLogger().Audit(audit.KeyImported, map[string]interface{}{
+	vrfkc.App.GetAuditLogger().Audit(audit.KeyImported, map[string]any{
 		"type":                "vrf",
 		"id":                  key.ID(),
 		"vrfPublicKey":        key.PublicKey,
@@ -116,7 +119,7 @@ func (vrfkc *VRFKeysController) Export(c *gin.Context) {
 		return
 	}
 
-	vrfkc.App.GetAuditLogger().Audit(audit.KeyExported, map[string]interface{}{
+	vrfkc.App.GetAuditLogger().Audit(audit.KeyExported, map[string]any{
 		"type": "vrf",
 		"id":   keyID,
 	})

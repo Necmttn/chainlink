@@ -1,11 +1,9 @@
 // Package schema is used to read schema files
-// go:generate go-bindata -ignore=\.go -pkg=schema -o=bindata.go ./...
 package schema
 
 import (
 	"bytes"
 	"embed"
-	"fmt"
 )
 
 //go:embed *.graphql type/*.graphql
@@ -27,7 +25,7 @@ func GetRootSchema() (string, error) {
 	}
 
 	for _, t := range types {
-		b, err = fs.ReadFile(fmt.Sprintf("type/%s", t.Name()))
+		b, err = fs.ReadFile("type/" + t.Name())
 		if err != nil {
 			return "", err
 		}

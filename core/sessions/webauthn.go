@@ -1,7 +1,9 @@
 package sessions
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -10,7 +12,6 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 	sqlxTypes "github.com/jmoiron/sqlx/types"
-	"github.com/pkg/errors"
 )
 
 // WebAuthn holds the credentials for API user.
@@ -31,13 +32,24 @@ type WebAuthnConfiguration struct {
 	RPOrigin string
 }
 
+// rpOrigins converts a single configured origin into the []string form the
+// go-webauthn library now requires (RPOrigin is deprecated), preserving the
+// library's own validation: an empty origin still results in a construction-
+// time error from webauthn.New rather than silently accepting an empty
+// string as a valid origin entry.
+func rpOrigins(origin string) []string {
+	if origin == "" {
+		return nil
+	}
+	return []string{origin}
+}
+
 func (store *WebAuthnSessionStore) BeginWebAuthnRegistration(user User, uwas []WebAuthn, config WebAuthnConfiguration) (*protocol.CredentialCreation, error) {
 	webAuthn, err := webauthn.New(&webauthn.Config{
-		RPDisplayName: "Chainlink Operator", // Display Name
-		RPID:          config.RPID,          // Generally the domain name
-		RPOrigin:      config.RPOrigin,      // The origin URL for WebAuthn requests
+		RPDisplayName: "Chainlink Operator",       // Display Name
+		RPID:          config.RPID,                // Generally the domain name
+		RPOrigins:     rpOrigins(config.RPOrigin), // The origin URLs for WebAuthn requests
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -56,12 +68,11 @@ func (store *WebAuthnSessionStore) BeginWebAuthnRegistration(user User, uwas []W
 		waUser,
 		registerOptions,
 	)
-
 	if err != nil {
 		return nil, err
 	}
 
-	userRegistrationIndexKey := fmt.Sprintf("%s-registration", user.Email)
+	userRegistrationIndexKey := user.Email + "-registration"
 	err = store.SaveWebauthnSession(userRegistrationIndexKey, sessionData)
 	if err != nil {
 		return nil, err
@@ -72,15 +83,15 @@ func (store *WebAuthnSessionStore) BeginWebAuthnRegistration(user User, uwas []W
 
 func (store *WebAuthnSessionStore) FinishWebAuthnRegistration(user User, uwas []WebAuthn, response *http.Request, config WebAuthnConfiguration) (*webauthn.Credential, error) {
 	webAuthn, err := webauthn.New(&webauthn.Config{
-		RPDisplayName: "Chainlink Operator", // Display Name
-		RPID:          config.RPID,          // Generally the domain name
-		RPOrigin:      config.RPOrigin,      // The origin URL for WebAuthn requests
+		RPDisplayName: "Chainlink Operator",       // Display Name
+		RPID:          config.RPID,                // Generally the domain name
+		RPOrigins:     rpOrigins(config.RPOrigin), // The origin URLs for WebAuthn requests
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	userRegistrationIndexKey := fmt.Sprintf("%s-registration", user.Email)
+	userRegistrationIndexKey := user.Email + "-registration"
 	sessionData, err := store.GetWebauthnSession(userRegistrationIndexKey)
 	if err != nil {
 		return nil, err
@@ -93,7 +104,7 @@ func (store *WebAuthnSessionStore) FinishWebAuthnRegistration(user User, uwas []
 
 	credential, err := webAuthn.FinishRegistration(waUser, sessionData, response)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to FinishRegistration")
+		return nil, fmt.Errorf("failed to FinishRegistration: %w", err)
 	}
 
 	return credential, nil
@@ -101,11 +112,10 @@ func (store *WebAuthnSessionStore) FinishWebAuthnRegistration(user User, uwas []
 
 func BeginWebAuthnLogin(user User, uwas []WebAuthn, sr SessionRequest) (*protocol.CredentialAssertion, error) {
 	webAuthn, err := webauthn.New(&webauthn.Config{
-		RPDisplayName: "Chainlink Operator",       // Display Name
-		RPID:          sr.WebAuthnConfig.RPID,     // Generally the domain name
-		RPOrigin:      sr.WebAuthnConfig.RPOrigin, // The origin URL for WebAuthn requests
+		RPDisplayName: "Chainlink Operator",                  // Display Name
+		RPID:          sr.WebAuthnConfig.RPID,                // Generally the domain name
+		RPOrigins:     rpOrigins(sr.WebAuthnConfig.RPOrigin), // The origin URLs for WebAuthn requests
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +130,7 @@ func BeginWebAuthnLogin(user User, uwas []WebAuthn, sr SessionRequest) (*protoco
 		return nil, err
 	}
 
-	userLoginIndexKey := fmt.Sprintf("%s-authentication", user.Email)
+	userLoginIndexKey := user.Email + "-authentication"
 	err = sr.SessionStore.SaveWebauthnSession(userLoginIndexKey, sessionData)
 	if err != nil {
 		return nil, err
@@ -131,13 +141,12 @@ func BeginWebAuthnLogin(user User, uwas []WebAuthn, sr SessionRequest) (*protoco
 
 func FinishWebAuthnLogin(user User, uwas []WebAuthn, sr SessionRequest) error {
 	webAuthn, err := webauthn.New(&webauthn.Config{
-		RPDisplayName: "Chainlink Operator",       // Display Name
-		RPID:          sr.WebAuthnConfig.RPID,     // Generally the domain name
-		RPOrigin:      sr.WebAuthnConfig.RPOrigin, // The origin URL for WebAuthn requests
+		RPDisplayName: "Chainlink Operator",                  // Display Name
+		RPID:          sr.WebAuthnConfig.RPID,                // Generally the domain name
+		RPOrigins:     rpOrigins(sr.WebAuthnConfig.RPOrigin), // The origin URLs for WebAuthn requests
 	})
-
 	if err != nil {
-		return errors.Wrapf(err, "failed to create webAuthn structure with RPID: %s and RPOrigin: %s", sr.WebAuthnConfig.RPID, sr.WebAuthnConfig.RPOrigin)
+		return fmt.Errorf("failed to create webAuthn structure with RPID: %s and RPOrigin: %s: %w", sr.WebAuthnConfig.RPID, sr.WebAuthnConfig.RPOrigin, err)
 	}
 
 	credential, err := protocol.ParseCredentialRequestResponseBody(strings.NewReader(sr.WebAuthnData))
@@ -145,7 +154,7 @@ func FinishWebAuthnLogin(user User, uwas []WebAuthn, sr SessionRequest) error {
 		return err
 	}
 
-	userLoginIndexKey := fmt.Sprintf("%s-authentication", user.Email)
+	userLoginIndexKey := user.Email + "-authentication"
 	sessionData, err := sr.SessionStore.GetWebauthnSession(userLoginIndexKey)
 	if err != nil {
 		return err
@@ -161,37 +170,37 @@ func FinishWebAuthnLogin(user User, uwas []WebAuthn, sr SessionRequest) error {
 }
 
 // WebAuthnID returns the user's ID
-func (u WebAuthnUser) WebAuthnID() []byte {
+func (u *WebAuthnUser) WebAuthnID() []byte {
 	return []byte(u.Email)
 }
 
 // WebAuthnName returns the user's email
-func (u WebAuthnUser) WebAuthnName() string {
+func (u *WebAuthnUser) WebAuthnName() string {
 	return u.Email
 }
 
 // WebAuthnDisplayName returns the user's display name.
 // In this case we just return the email
-func (u WebAuthnUser) WebAuthnDisplayName() string {
+func (u *WebAuthnUser) WebAuthnDisplayName() string {
 	return u.Email
 }
 
 // WebAuthnIcon should be the logo in some form. How it should
 // be is currently unclear to me.
-func (u WebAuthnUser) WebAuthnIcon() string {
+func (u *WebAuthnUser) WebAuthnIcon() string {
 	return ""
 }
 
 // WebAuthnCredentials returns credentials owned by the user
-func (u WebAuthnUser) WebAuthnCredentials() []webauthn.Credential {
+func (u *WebAuthnUser) WebAuthnCredentials() []webauthn.Credential {
 	return u.WACredentials
 }
 
 // CredentialExcludeList returns a CredentialDescriptor array filled
 // with all the user's credentials to prevent them from re-registering
 // keys
-func (u WebAuthnUser) CredentialExcludeList() []protocol.CredentialDescriptor {
-	credentialExcludeList := []protocol.CredentialDescriptor{}
+func (u *WebAuthnUser) CredentialExcludeList() []protocol.CredentialDescriptor {
+	credentialExcludeList := make([]protocol.CredentialDescriptor, 0, len(u.WACredentials))
 
 	for _, cred := range u.WACredentials {
 		descriptor := protocol.CredentialDescriptor{
@@ -209,20 +218,20 @@ func (u *WebAuthnUser) LoadWebAuthnCredentials(uwas []WebAuthn) error {
 		var credential webauthn.Credential
 		err := v.PublicKeyData.Unmarshal(&credential)
 		if err != nil {
-			return fmt.Errorf("error unmarshalling provided PublicKeyData: %s", err)
+			return fmt.Errorf("error unmarshalling provided PublicKeyData: %w", err)
 		}
 		u.WACredentials = append(u.WACredentials, credential)
 	}
 	return nil
 }
 
-func duoWebAuthUserFromUser(user User, uwas []WebAuthn) (WebAuthnUser, error) {
+func duoWebAuthUserFromUser(user User, uwas []WebAuthn) (*WebAuthnUser, error) {
 	waUser := WebAuthnUser{
 		Email: user.Email,
 	}
 	err := waUser.LoadWebAuthnCredentials(uwas)
 
-	return waUser, err
+	return &waUser, err
 }
 
 // WebAuthnSessionStore is a wrapper around an in memory key value store which provides some helper
@@ -264,7 +273,7 @@ func (store *WebAuthnSessionStore) take(key string) (val string, ok bool) {
 	if ok {
 		delete(store.inProgressRegistrations, key)
 	}
-	return
+	return val, ok
 }
 
 // GetWebauthnSession unmarshals and returns the webauthn session information
@@ -273,13 +282,13 @@ func (store *WebAuthnSessionStore) GetWebauthnSession(key string) (data webauthn
 	assertion, ok := store.take(key)
 	if !ok {
 		err = errors.New("assertion not in challenge store")
-		return
+		return data, err
 	}
 	err = json.Unmarshal([]byte(assertion), &data)
-	return
+	return data, err
 }
 
-func AddCredentialToUser(ap AuthenticationProvider, email string, credential *webauthn.Credential) error {
+func AddCredentialToUser(ctx context.Context, ap AuthenticationProvider, email string, credential *webauthn.Credential) error {
 	credj, err := json.Marshal(credential)
 	if err != nil {
 		return err
@@ -289,5 +298,5 @@ func AddCredentialToUser(ap AuthenticationProvider, email string, credential *we
 		Email:         email,
 		PublicKeyData: sqlxTypes.JSONText(credj),
 	}
-	return ap.SaveWebAuthn(&token)
+	return ap.SaveWebAuthn(ctx, &token)
 }

@@ -3,7 +3,7 @@ package resolver
 import (
 	"github.com/graph-gophers/graphql-go"
 
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/solkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/solkey"
 )
 
 type SolanaKeyResolver struct {
@@ -15,7 +15,7 @@ func NewSolanaKey(key solkey.Key) *SolanaKeyResolver {
 }
 
 func NewSolanaKeys(keys []solkey.Key) []*SolanaKeyResolver {
-	var resolvers []*SolanaKeyResolver
+	resolvers := make([]*SolanaKeyResolver, 0, len(keys))
 
 	for _, k := range keys {
 		resolvers = append(resolvers, NewSolanaKey(k))

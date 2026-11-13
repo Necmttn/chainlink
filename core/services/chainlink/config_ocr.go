@@ -5,9 +5,9 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/smartcontractkit/chainlink-evm/pkg/types"
 	"github.com/smartcontractkit/chainlink/v2/core/config"
 	"github.com/smartcontractkit/chainlink/v2/core/config/toml"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
 )
 
 var _ config.OCR = (*ocrConfig)(nil)
@@ -48,7 +48,7 @@ func (o *ocrConfig) SimulateTransactions() bool {
 	return *o.c.SimulateTransactions
 }
 
-func (o *ocrConfig) TransmitterAddress() (ethkey.EIP55Address, error) {
+func (o *ocrConfig) TransmitterAddress() (types.EIP55Address, error) {
 	a := *o.c.TransmitterAddress
 	if a.IsZero() {
 		return a, errors.Wrap(config.ErrEnvUnset, "OCR.TransmitterAddress is not set")
@@ -66,4 +66,8 @@ func (o *ocrConfig) DefaultTransactionQueueDepth() uint32 {
 
 func (o *ocrConfig) CaptureEATelemetry() bool {
 	return *o.c.CaptureEATelemetry
+}
+
+func (o *ocrConfig) ConfigLogValidation() bool {
+	return *o.c.ConfigLogValidation
 }

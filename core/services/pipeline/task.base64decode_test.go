@@ -1,13 +1,11 @@
 package pipeline_test
 
 import (
-	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 )
@@ -45,10 +43,10 @@ func TestBase64DecodeTask(t *testing.T) {
 			t.Run("without vars through job DAG", func(t *testing.T) {
 				vars := pipeline.NewVarsFrom(nil)
 				task := pipeline.Base64DecodeTask{BaseTask: pipeline.NewBaseTask(0, "task", nil, nil, 0)}
-				assertOK(task.Run(testutils.Context(t), logger.TestLogger(t), vars, []pipeline.Result{{Value: test.input}}))
+				assertOK(task.Run(t.Context(), logger.TestLogger(t), vars, []pipeline.Result{{Value: test.input}}))
 			})
 			t.Run("without vars through input param", func(t *testing.T) {
-				inputStr := fmt.Sprintf("%v", test.input)
+				inputStr := test.input
 				if inputStr == "" {
 					// empty input parameter is indistinguishable from not providing it at all
 					// in that case the task will use an input defined by the job DAG
@@ -59,17 +57,17 @@ func TestBase64DecodeTask(t *testing.T) {
 					BaseTask: pipeline.NewBaseTask(0, "task", nil, nil, 0),
 					Input:    inputStr,
 				}
-				assertOK(task.Run(testutils.Context(t), logger.TestLogger(t), vars, []pipeline.Result{}))
+				assertOK(task.Run(t.Context(), logger.TestLogger(t), vars, []pipeline.Result{}))
 			})
 			t.Run("with vars", func(t *testing.T) {
-				vars := pipeline.NewVarsFrom(map[string]interface{}{
-					"foo": map[string]interface{}{"bar": test.input},
+				vars := pipeline.NewVarsFrom(map[string]any{
+					"foo": map[string]any{"bar": test.input},
 				})
 				task := pipeline.Base64DecodeTask{
 					BaseTask: pipeline.NewBaseTask(0, "task", nil, nil, 0),
 					Input:    "$(foo.bar)",
 				}
-				assertOK(task.Run(testutils.Context(t), logger.TestLogger(t), vars, []pipeline.Result{}))
+				assertOK(task.Run(t.Context(), logger.TestLogger(t), vars, []pipeline.Result{}))
 			})
 		})
 	}

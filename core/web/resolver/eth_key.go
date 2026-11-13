@@ -6,14 +6,17 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/graph-gophers/graphql-go"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ethkey"
+	commonTypes "github.com/smartcontractkit/chainlink-common/pkg/types"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
+	"github.com/smartcontractkit/chainlink-evm/pkg/types"
+	"github.com/smartcontractkit/chainlink/v2/core/services/relay"
 	"github.com/smartcontractkit/chainlink/v2/core/web/loader"
 )
 
 type ETHKey struct {
 	state ethkey.State
-	addr  ethkey.EIP55Address
+	addr  types.EIP55Address
 	chain legacyevm.Chain
 }
 
@@ -26,7 +29,7 @@ func NewETHKey(key ETHKey) *ETHKeyResolver {
 }
 
 func NewETHKeys(keys []ETHKey) []*ETHKeyResolver {
-	var resolvers []*ETHKeyResolver
+	resolvers := make([]*ETHKeyResolver, 0, len(keys))
 
 	for _, k := range keys {
 		resolvers = append(resolvers, NewETHKey(k))
@@ -36,7 +39,8 @@ func NewETHKeys(keys []ETHKey) []*ETHKeyResolver {
 }
 
 func (r *ETHKeyResolver) Chain(ctx context.Context) (*ChainResolver, error) {
-	chain, err := loader.GetChainByID(ctx, r.key.state.EVMChainID.String())
+	relayID := commonTypes.NewRelayID(relay.NetworkEVM, r.key.state.EVMChainID.String())
+	chain, err := loader.GetChainByRelayID(ctx, relayID.Name())
 	if err != nil {
 		return nil, err
 	}

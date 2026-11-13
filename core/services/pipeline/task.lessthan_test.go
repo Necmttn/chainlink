@@ -4,11 +4,9 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 )
@@ -18,7 +16,7 @@ func TestLessThanTask_Happy(t *testing.T) {
 
 	tests := []struct {
 		name  string
-		left  interface{}
+		left  any
 		right string
 		want  bool
 	}{
@@ -76,7 +74,7 @@ func TestLessThanTask_Happy(t *testing.T) {
 			t.Run("without vars through job DAG", func(t *testing.T) {
 				vars := pipeline.NewVarsFrom(nil)
 				task := pipeline.LessThanTask{BaseTask: pipeline.NewBaseTask(0, "task", nil, nil, 0), Right: test.right}
-				assertOK(task.Run(testutils.Context(t), logger.TestLogger(t), vars, []pipeline.Result{{Value: test.left}}))
+				assertOK(task.Run(t.Context(), logger.TestLogger(t), vars, []pipeline.Result{{Value: test.left}}))
 			})
 			t.Run("without vars through input param", func(t *testing.T) {
 				vars := pipeline.NewVarsFrom(nil)
@@ -85,19 +83,19 @@ func TestLessThanTask_Happy(t *testing.T) {
 					Left:     fmt.Sprintf("%v", test.left),
 					Right:    test.right,
 				}
-				assertOK(task.Run(testutils.Context(t), logger.TestLogger(t), vars, []pipeline.Result{}))
+				assertOK(task.Run(t.Context(), logger.TestLogger(t), vars, []pipeline.Result{}))
 			})
 			t.Run("with vars", func(t *testing.T) {
-				vars := pipeline.NewVarsFrom(map[string]interface{}{
-					"foo":   map[string]interface{}{"bar": test.left},
-					"chain": map[string]interface{}{"link": test.right},
+				vars := pipeline.NewVarsFrom(map[string]any{
+					"foo":   map[string]any{"bar": test.left},
+					"chain": map[string]any{"link": test.right},
 				})
 				task := pipeline.LessThanTask{
 					BaseTask: pipeline.NewBaseTask(0, "task", nil, nil, 0),
 					Left:     "$(foo.bar)",
 					Right:    "$(chain.link)",
 				}
-				assertOK(task.Run(testutils.Context(t), logger.TestLogger(t), vars, []pipeline.Result{}))
+				assertOK(task.Run(t.Context(), logger.TestLogger(t), vars, []pipeline.Result{}))
 			})
 		})
 	}
@@ -115,10 +113,10 @@ func TestLessThanTask_Unhappy(t *testing.T) {
 		wantErrorCause    error
 		wantErrorContains string
 	}{
-		{"map as input from inputs", "", "100", []pipeline.Result{{Value: map[string]interface{}{"chain": "link"}}}, pipeline.NewVarsFrom(nil), pipeline.ErrBadInput, "left"},
-		{"map as input from var", "$(foo)", "100", nil, pipeline.NewVarsFrom(map[string]interface{}{"foo": map[string]interface{}{"chain": "link"}}), pipeline.ErrBadInput, "left"},
-		{"slice as input from inputs", "", "100", []pipeline.Result{{Value: []interface{}{"chain", "link"}}}, pipeline.NewVarsFrom(nil), pipeline.ErrBadInput, "left"},
-		{"slice as input from var", "$(foo)", "100", nil, pipeline.NewVarsFrom(map[string]interface{}{"foo": []interface{}{"chain", "link"}}), pipeline.ErrBadInput, "left"},
+		{"map as input from inputs", "", "100", []pipeline.Result{{Value: map[string]any{"chain": "link"}}}, pipeline.NewVarsFrom(nil), pipeline.ErrBadInput, "left"},
+		{"map as input from var", "$(foo)", "100", nil, pipeline.NewVarsFrom(map[string]any{"foo": map[string]any{"chain": "link"}}), pipeline.ErrBadInput, "left"},
+		{"slice as input from inputs", "", "100", []pipeline.Result{{Value: []any{"chain", "link"}}}, pipeline.NewVarsFrom(nil), pipeline.ErrBadInput, "left"},
+		{"slice as input from var", "$(foo)", "100", nil, pipeline.NewVarsFrom(map[string]any{"foo": []any{"chain", "link"}}), pipeline.ErrBadInput, "left"},
 		{"input as missing var", "$(foo)", "100", nil, pipeline.NewVarsFrom(nil), pipeline.ErrKeypathNotFound, "left"},
 		{"limit as missing var", "", "$(foo)", []pipeline.Result{{Value: "123"}}, pipeline.NewVarsFrom(nil), pipeline.ErrKeypathNotFound, "right"},
 	}
@@ -130,12 +128,12 @@ func TestLessThanTask_Unhappy(t *testing.T) {
 				Left:     test.left,
 				Right:    test.right,
 			}
-			result, runInfo := task.Run(testutils.Context(t), logger.TestLogger(t), test.vars, test.inputs)
+			result, runInfo := task.Run(t.Context(), logger.TestLogger(t), test.vars, test.inputs)
 			assert.False(t, runInfo.IsPending)
 			assert.False(t, runInfo.IsRetryable)
-			require.Equal(t, test.wantErrorCause, errors.Cause(result.Error))
+			require.ErrorIs(t, result.Error, test.wantErrorCause)
 			if test.wantErrorContains != "" {
-				require.Contains(t, result.Error.Error(), test.wantErrorContains)
+				require.ErrorContains(t, result.Error, test.wantErrorContains)
 			}
 		})
 	}

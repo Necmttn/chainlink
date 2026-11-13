@@ -3,13 +3,13 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"strconv"
 
 	solanaGo "github.com/gagliardetto/solana-go"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
-	"go.uber.org/multierr"
 
 	"github.com/smartcontractkit/chainlink/v2/core/store/models/solana"
 	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
@@ -47,15 +47,16 @@ type SolanaMsgPresenter struct {
 // RenderTable implements TableRenderer
 func (p *SolanaMsgPresenter) RenderTable(rt RendererTable) error {
 	table := rt.newTable([]string{"Chain ID", "From", "To", "Amount"})
-	table.Append([]string{
+	if err := table.Append([]string{
 		p.ChainID,
 		p.From,
 		p.To,
 		strconv.FormatUint(p.Amount, 10),
-	})
+	}); err != nil {
+		return err
+	}
 
-	render(fmt.Sprintf("Solana Message %v", p.ID), table)
-	return nil
+	return render(fmt.Sprintf("Solana Message %v", p.ID), table)
 }
 
 // SolanaSendSol transfers sol from the node's account to a specified address.
@@ -72,17 +73,19 @@ func (s *Shell) SolanaSendSol(c *cli.Context) (err error) {
 	unparsedFromAddress := c.Args().Get(1)
 	fromAddress, err := solanaGo.PublicKeyFromBase58(unparsedFromAddress)
 	if err != nil {
-		return s.errorOut(multierr.Combine(
+		return s.errorOut(stderrors.Join(
 			errors.Errorf("while parsing withdrawal source address %v",
-				unparsedFromAddress), err))
+				unparsedFromAddress), err,
+		))
 	}
 
 	unparsedDestinationAddress := c.Args().Get(2)
 	destinationAddress, err := solanaGo.PublicKeyFromBase58(unparsedDestinationAddress)
 	if err != nil {
-		return s.errorOut(multierr.Combine(
+		return s.errorOut(stderrors.Join(
 			errors.Errorf("while parsing withdrawal destination address %v",
-				unparsedDestinationAddress), err))
+				unparsedDestinationAddress), err,
+		))
 	}
 
 	chainID := c.String("id")
@@ -111,7 +114,7 @@ func (s *Shell) SolanaSendSol(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 

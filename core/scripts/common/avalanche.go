@@ -39,7 +39,7 @@ func (b *AvaBloom) Add(d []byte) {
 }
 
 // add is internal version of Add, which takes a scratch buffer for reuse (needs to be at least 6 bytes)
-func (b *AvaBloom) add(d []byte, buf []byte) {
+func (b *AvaBloom) add(d, buf []byte) {
 	i1, v1, i2, v2, i3, v3 := bloomValues(d, buf)
 	b[i1] |= v1
 	b[i2] |= v2
@@ -49,17 +49,17 @@ func (b *AvaBloom) add(d []byte, buf []byte) {
 // Big converts b to a big integer.
 // Note: Converting a bloom filter to a big.Int and then calling GetBytes
 // does not return the same bytes, since big.Int will trim leading zeroes
-func (b AvaBloom) Big() *big.Int {
+func (b *AvaBloom) Big() *big.Int {
 	return new(big.Int).SetBytes(b[:])
 }
 
 // Bytes returns the backing byte slice of the bloom
-func (b AvaBloom) Bytes() []byte {
+func (b *AvaBloom) Bytes() []byte {
 	return b[:]
 }
 
 // Test checks if the given topic is present in the bloom filter
-func (b AvaBloom) Test(topic []byte) bool {
+func (b *AvaBloom) Test(topic []byte) bool {
 	i1, v1, i2, v2, i3, v3 := bloomValues(topic, make([]byte, 6))
 	return v1 == v1&b[i1] &&
 		v2 == v2&b[i2] &&
@@ -67,7 +67,7 @@ func (b AvaBloom) Test(topic []byte) bool {
 }
 
 // MarshalText encodes b as a hex string with 0x prefix.
-func (b AvaBloom) MarshalText() ([]byte, error) {
+func (b *AvaBloom) MarshalText() ([]byte, error) {
 	return hexutil.Bytes(b[:]).MarshalText()
 }
 
@@ -77,10 +77,10 @@ func (b *AvaBloom) UnmarshalText(input []byte) error {
 }
 
 // bloomValues returns the bytes (index-value pairs) to set for the given data
-func bloomValues(data []byte, hashbuf []byte) (uint, byte, uint, byte, uint, byte) {
+func bloomValues(data, hashbuf []byte) (uint, byte, uint, byte, uint, byte) {
 	sha := crypto.NewKeccakState()
-	sha.Write(data)   //nolint:errcheck
-	sha.Read(hashbuf) //nolint:errcheck
+	sha.Write(data)
+	sha.Read(hashbuf) //nolint:errcheck // keccak state read does not error
 	// The actual bits to flip
 	v1 := byte(1 << (hashbuf[1] & 0x7))
 	v2 := byte(1 << (hashbuf[3] & 0x7))
@@ -98,13 +98,6 @@ func bloomValues(data []byte, hashbuf []byte) (uint, byte, uint, byte, uint, byt
 // out on a block.
 type AvaBlockNonce [8]byte
 
-// EncodeNonce converts the given integer to a block nonce.
-func EncodeNonce(i uint64) AvaBlockNonce {
-	var n AvaBlockNonce
-	binary.BigEndian.PutUint64(n[:], i)
-	return n
-}
-
 // Uint64 returns the integer value of a block nonce.
 func (n AvaBlockNonce) Uint64() uint64 {
 	return binary.BigEndian.Uint64(n[:])
@@ -121,6 +114,7 @@ func (n *AvaBlockNonce) UnmarshalText(input []byte) error {
 }
 
 // AvaHeader is a copy of [github.com/ava-labs/coreth/core/types.Header] to avoid importing the whole module.
+// NOTE: latest changes: https://github.com/ava-labs/avalanchego/blob/c1648c292e1ce4de99a5224a10b5b3e79a913aaf/graft/coreth/plugin/evm/customtypes/header_ext.go
 type AvaHeader struct {
 	ParentHash  common.Hash    `json:"parentHash"       gencodec:"required"`
 	UncleHash   common.Hash    `json:"sha3Uncles"       gencodec:"required"`
@@ -152,29 +146,49 @@ type AvaHeader struct {
 	// BlockGasCost was added by Apricot Phase 4 and is ignored in legacy
 	// headers.
 	BlockGasCost *big.Int `json:"blockGasCost" rlp:"optional"`
+
+	// BlobGasUsed was added by EIP-4844 and is ignored in legacy headers.
+	BlobGasUsed *uint64 `json:"blobGasUsed" rlp:"optional"`
+
+	// ExcessBlobGas was added by EIP-4844 and is ignored in legacy headers.
+	ExcessBlobGas *uint64 `json:"excessBlobGas" rlp:"optional"`
+
+	// ParentBeaconRoot was added by EIP-4788 and is ignored in legacy headers.
+	ParentBeaconRoot *common.Hash `json:"parentBeaconBlockRoot" rlp:"optional"`
+
+	// TimeMilliseconds was added by Granite and is ignored in legacy headers.
+	TimeMilliseconds *uint64 `json:"timestampMilliseconds" rlp:"optional"`
+
+	// MinDelayExcess was added by Granite and is ignored in legacy headers.
+	MinDelayExcess *uint64 `json:"minDelayExcess" rlp:"optional"`
 }
 
 func (h *AvaHeader) UnmarshalJSON(input []byte) error {
 	type Header struct {
-		ParentHash     *common.Hash    `json:"parentHash"       gencodec:"required"`
-		UncleHash      *common.Hash    `json:"sha3Uncles"       gencodec:"required"`
-		Coinbase       *common.Address `json:"miner"            gencodec:"required"`
-		Root           *common.Hash    `json:"stateRoot"        gencodec:"required"`
-		TxHash         *common.Hash    `json:"transactionsRoot" gencodec:"required"`
-		ReceiptHash    *common.Hash    `json:"receiptsRoot"     gencodec:"required"`
-		Bloom          *AvaBloom       `json:"logsBloom"        gencodec:"required"`
-		Difficulty     *hexutil.Big    `json:"difficulty"       gencodec:"required"`
-		Number         *hexutil.Big    `json:"number"           gencodec:"required"`
-		GasLimit       *hexutil.Uint64 `json:"gasLimit"         gencodec:"required"`
-		GasUsed        *hexutil.Uint64 `json:"gasUsed"          gencodec:"required"`
-		Time           *hexutil.Uint64 `json:"timestamp"        gencodec:"required"`
-		Extra          *hexutil.Bytes  `json:"extraData"        gencodec:"required"`
-		MixDigest      *common.Hash    `json:"mixHash"`
-		Nonce          *AvaBlockNonce  `json:"nonce"`
-		ExtDataHash    *common.Hash    `json:"extDataHash"      gencodec:"required"`
-		BaseFee        *hexutil.Big    `json:"baseFeePerGas" rlp:"optional"`
-		ExtDataGasUsed *hexutil.Big    `json:"extDataGasUsed" rlp:"optional"`
-		BlockGasCost   *hexutil.Big    `json:"blockGasCost" rlp:"optional"`
+		ParentHash       *common.Hash    `json:"parentHash"       gencodec:"required"`
+		UncleHash        *common.Hash    `json:"sha3Uncles"       gencodec:"required"`
+		Coinbase         *common.Address `json:"miner"            gencodec:"required"`
+		Root             *common.Hash    `json:"stateRoot"        gencodec:"required"`
+		TxHash           *common.Hash    `json:"transactionsRoot" gencodec:"required"`
+		ReceiptHash      *common.Hash    `json:"receiptsRoot"     gencodec:"required"`
+		Bloom            *AvaBloom       `json:"logsBloom"        gencodec:"required"`
+		Difficulty       *hexutil.Big    `json:"difficulty"       gencodec:"required"`
+		Number           *hexutil.Big    `json:"number"           gencodec:"required"`
+		GasLimit         *hexutil.Uint64 `json:"gasLimit"         gencodec:"required"`
+		GasUsed          *hexutil.Uint64 `json:"gasUsed"          gencodec:"required"`
+		Time             *hexutil.Uint64 `json:"timestamp"        gencodec:"required"`
+		Extra            *hexutil.Bytes  `json:"extraData"        gencodec:"required"`
+		MixDigest        *common.Hash    `json:"mixHash"`
+		Nonce            *AvaBlockNonce  `json:"nonce"`
+		ExtDataHash      *common.Hash    `json:"extDataHash"      gencodec:"required"`
+		BaseFee          *hexutil.Big    `json:"baseFeePerGas" rlp:"optional"`
+		ExtDataGasUsed   *hexutil.Big    `json:"extDataGasUsed" rlp:"optional"`
+		BlockGasCost     *hexutil.Big    `json:"blockGasCost" rlp:"optional"`
+		BlobGasUsed      *hexutil.Uint64 `json:"blobGasUsed" rlp:"optional"`
+		ExcessBlobGas    *hexutil.Uint64 `json:"excessBlobGas" rlp:"optional"`
+		ParentBeaconRoot *common.Hash    `json:"parentBeaconBlockRoot" rlp:"optional"`
+		TimeMilliseconds *hexutil.Uint64 `json:"timestampMilliseconds" rlp:"optional"`
+		MinDelayExcess   *hexutil.Uint64 `json:"minDelayExcess" rlp:"optional"`
 	}
 	var dec Header
 	if err := json.Unmarshal(input, &dec); err != nil {
@@ -251,15 +265,34 @@ func (h *AvaHeader) UnmarshalJSON(input []byte) error {
 	if dec.BlockGasCost != nil {
 		h.BlockGasCost = (*big.Int)(dec.BlockGasCost)
 	}
+	if dec.BlobGasUsed != nil {
+		h.BlobGasUsed = (*uint64)(dec.BlobGasUsed)
+	}
+	if dec.ExcessBlobGas != nil {
+		h.ExcessBlobGas = (*uint64)(dec.ExcessBlobGas)
+	}
+	if dec.ParentBeaconRoot != nil {
+		h.ParentBeaconRoot = dec.ParentBeaconRoot
+	}
+	if dec.TimeMilliseconds != nil {
+		val := uint64(*dec.TimeMilliseconds)
+		h.TimeMilliseconds = &val
+	}
+	if dec.MinDelayExcess != nil {
+		val := uint64(*dec.MinDelayExcess)
+		h.MinDelayExcess = &val
+	}
 	return nil
 }
+
 func (h *AvaHeader) Hash() common.Hash {
 	return rlpHash(h)
 }
-func rlpHash(x interface{}) (h common.Hash) {
+
+func rlpHash(x any) (h common.Hash) {
 	sha := crypto.NewKeccakState()
 	sha.Reset()
-	rlp.Encode(sha, x) //nolint:errcheck
-	sha.Read(h[:])     //nolint:errcheck
+	rlp.Encode(sha, x) //nolint:errcheck // rlp encode to hash buffer does not fail
+	sha.Read(h[:])     //nolint:errcheck // keccak state read does not error
 	return h
 }

@@ -4,6 +4,7 @@ tmp/
 .pnp
 .pnp.js
 tools/bin/abigen
+tools/test/.bin/
 
 /chainlink
 core/chainlink
@@ -23,12 +24,20 @@ tools/clroot/db.sqlite3-wal
 .DS_Store
 .envrc
 .env*
+.dbenv
 !.github/actions/setup-postgres/.env
+/.github/.agents/skills/**/trials/
 .direnv
 .idea
 .vscode/
 *.iml
 debug.env
+operator_ui/install
+.devenv
+event_dump.ndjson
+
+# neovim
+.nvim.lua
 
 # codeship
 *.aes
@@ -43,10 +52,13 @@ cl_backup_*.tar.gz
 
 # Test artifacts
 core/cmd/TestClient_ImportExportP2PKeyBundle_test_key.json
-output.txt
 race.*
-golangci-lint-output.txt
+*output.txt
 /golangci-lint/
+.covdata
+temp-repo
+diagnose-*/
+diagnose-attempted-fixes-*.jsonl
 
 # DB state
 ./db/
@@ -63,16 +75,22 @@ tmp-manifest-*.yaml
 ztarrepo.tar.gz
 **/test-ledger/*
 __debug_bin*
-
-# goreleaser builds
-cosign.*
-dist/
-MacOSX*
+.test_summary/
+db_dumps/
+.run.id
+integration-tests/**/traces/
+integration-tests/**/integration-tests
+benchmark_report.csv
+benchmark_summary.json
+secrets.toml
+tmp_laneconfig/
+solana_contracts
 
 # Test & linter reports
 *report.xml
 *report.json
 *.out
+dot_graphs/
 
 contracts/yarn.lock
 
@@ -83,12 +101,41 @@ go.work*
 # This sometimes shows up for some reason
 tools/flakeytests/coverage.txt
 
-# Integration tests create these files
-.test_summary/
-.run.id
-
-# Fuzz tests can create these files
-**/testdata/fuzz/*
-
 # Runtime test configuration that might contain secrets
-overrides.toml
+override*.toml
+
+# Python venv
+.venv/
+__pycache__/
+
+ocr_soak_report.csv
+
+vendor/*
+
+*.wasm
+contracts/lcov.info
+contracts/out/
+/cache
+/.wasm-cache/
+
+# Used by plugins/chainlink.prebuilt.Dockerfile
+/bin/
+/lib/
+/build/bin/
+/build/lib/
+/tools/**/bin/
+/tools/**/.bin/
+
+# artifacts of CRE environment creation or CRE CLI usage
+core/scripts/cre/environment/*.yaml
+core/scripts/cre/environment/*.yml
+core/scripts/cre/environment/logs/
+core/scripts/cre/environment/cron
+core/scripts/cre/environment/binaries/*
+*.br.b64
+
+# AI Agent settings
+.claude/
+.cursor/
+.gemini/
+opencode.json

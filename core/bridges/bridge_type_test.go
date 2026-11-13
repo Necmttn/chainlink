@@ -2,6 +2,7 @@ package bridges_test
 
 import (
 	"encoding/json"
+	"math"
 	"math/big"
 	"math/rand"
 	"net/url"
@@ -9,18 +10,17 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/smartcontractkit/chainlink-common/pkg/assets"
 	"github.com/smartcontractkit/chainlink/v2/core/bridges"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/v2/core/store/models"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestBridgeTypeRequest(t *testing.T) {
+	t.Parallel()
 	u, err := url.Parse("http://example.com/test")
 	require.NoError(t, err)
 	r := bridges.BridgeTypeRequest{
@@ -32,7 +32,7 @@ func TestBridgeTypeRequest(t *testing.T) {
 	assert.Equal(t, "bridges", r.GetName())
 	assert.Equal(t, "test-bridge-name", r.GetID())
 	const validID = "abc123foo_bar-test"
-	assert.NoError(t, r.SetID(validID))
+	require.NoError(t, r.SetID(validID))
 	assert.Equal(t, validID, r.GetID())
 	assert.Error(t, r.SetID("abc123.,<>/.foobar"))
 }
@@ -69,12 +69,12 @@ func BenchmarkParseBridgeName(b *testing.B) {
 	for _, l := range []int{1, 10, 20, 50, 100, 1000, 10000} {
 		b.Run(strconv.Itoa(l), func(b *testing.B) {
 			var sb strings.Builder
-			for i := 0; i < l; i++ {
+			for range l {
 				sb.WriteByte(valid[rand.Intn(len(valid))])
 			}
 			name := sb.String()
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				_, err := bridges.ParseBridgeName(name)
 				if err != nil {
 					b.Fatalf("failed to parse %q: %v\n", name, err)
@@ -85,6 +85,7 @@ func BenchmarkParseBridgeName(b *testing.B) {
 }
 
 func TestBridgeName_UnmarshalJSON(t *testing.T) {
+	t.Parallel()
 	var b bridges.BridgeName
 	require.NoError(t, json.Unmarshal([]byte(`"asdf123test"`), &b))
 	require.Equal(t, "asdf123test", b.String())
@@ -119,6 +120,7 @@ func TestMarshalBridgeMetaData(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			got, err := bridges.MarshalBridgeMetaData(tt.latestAnswer, tt.updatedAt)
 			require.NoError(t, err)
 			assert.Equalf(t, tt.want, got, "MarshalBridgeMetaData(%v, %v)", tt.latestAnswer, tt.updatedAt)

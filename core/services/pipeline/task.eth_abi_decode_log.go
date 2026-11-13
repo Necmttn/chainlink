@@ -2,12 +2,12 @@ package pipeline
 
 import (
 	"context"
+	stderrors "errors"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/pkg/errors"
-	"go.uber.org/multierr"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 )
 
 // Return types:
@@ -37,7 +37,7 @@ func (t *ETHABIDecodeLogTask) Run(_ context.Context, _ logger.Logger, vars Vars,
 		data   BytesParam
 		topics HashSliceParam
 	)
-	err = multierr.Combine(
+	err = stderrors.Join(
 		errors.Wrap(ResolveParam(&data, From(VarExpr(t.Data, vars), nil)), "data"),
 		errors.Wrap(ResolveParam(&topics, From(VarExpr(t.Topics, vars))), "topics"),
 		errors.Wrap(ResolveParam(&theABI, From(NonemptyString(t.ABI))), "abi"),
@@ -51,7 +51,7 @@ func (t *ETHABIDecodeLogTask) Run(_ context.Context, _ logger.Logger, vars Vars,
 		return Result{Error: errors.Wrap(ErrBadInput, err.Error())}, runInfo
 	}
 
-	out := make(map[string]interface{})
+	out := make(map[string]any)
 	if len(data) > 0 {
 		if err2 := args.UnpackIntoMap(out, []byte(data)); err2 != nil {
 			return Result{Error: errors.Wrap(ErrBadInput, err2.Error())}, runInfo

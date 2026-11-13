@@ -3,15 +3,16 @@ name: Sync develop from smartcontractkit/chainlink
 on:
   schedule:
     # * is a special character in YAML so you have to quote this string
-    - cron: '*/30 * * * *'
+    - cron: "*/30 * * * *"
 
 jobs:
   sync:
     name: Sync
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/checkout@v7
         with:
+          persist-credentials: false
           ref: develop
         if: env.GITHUB_REPOSITORY != 'smartcontractkit/chainlink'
       - name: Sync
@@ -27,12 +28,3 @@ jobs:
             git push origin upstream/develop:develop
           fi
         if: env.GITHUB_REPOSITORY != 'smartcontractkit/chainlink'
-      - name: Collect Metrics
-        if: always()
-        id: collect-gha-metrics
-        uses: smartcontractkit/push-gha-metrics-action@d1618b772a97fd87e6505de97b872ee0b1f1729a # v2.0.2
-        with:
-          basic-auth: ${{ secrets.GRAFANA_CLOUD_BASIC_AUTH }}
-          hostname: ${{ secrets.GRAFANA_CLOUD_HOST }}
-          this-job-name: Sync
-        continue-on-error: true

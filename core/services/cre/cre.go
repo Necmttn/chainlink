@@ -1,0 +1,1163 @@
+package cre
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"math/big"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Masterminds/semver/v3"
+	"github.com/google/uuid"
+	"github.com/jonboulle/clockwork"
+	"go.opentelemetry.io/otel/metric"
+	"google.golang.org/grpc/credentials"
+
+	chainselectors "github.com/smartcontractkit/chain-selectors"
+	ocrtypes "github.com/smartcontractkit/libocr/offchainreporting2plus/types"
+
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/workflowkey"
+	"github.com/smartcontractkit/chainlink-common/pkg/beholder"
+	"github.com/smartcontractkit/chainlink-common/pkg/billing"
+	commoncap "github.com/smartcontractkit/chainlink-common/pkg/capabilities"
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities/registry"
+	"github.com/smartcontractkit/chainlink-common/pkg/custmsg"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/loop"
+	commonmetrics "github.com/smartcontractkit/chainlink-common/pkg/metrics"
+	nodeauthjwt "github.com/smartcontractkit/chainlink-common/pkg/nodeauth/jwt"
+	"github.com/smartcontractkit/chainlink-common/pkg/resourcemanager"
+	commonsrv "github.com/smartcontractkit/chainlink-common/pkg/services"
+	"github.com/smartcontractkit/chainlink-common/pkg/services/orgresolver"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/limits"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-common/pkg/storage"
+	"github.com/smartcontractkit/chainlink-common/pkg/teeattestation/passthrough"
+	commontypes "github.com/smartcontractkit/chainlink-common/pkg/types"
+	"github.com/smartcontractkit/chainlink-common/pkg/workflows/dontime"
+	"github.com/smartcontractkit/chainlink-evm/pkg/keys"
+	linkingclient "github.com/smartcontractkit/chainlink-protos/linking-service/go/v1"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities/confidentialrelay"
+	gatewayconnector "github.com/smartcontractkit/chainlink/v2/core/capabilities/gateway_connector"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities/globalconfig"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities/localcapmgr"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities/remote"
+	remotetypes "github.com/smartcontractkit/chainlink/v2/core/capabilities/remote/types"
+	"github.com/smartcontractkit/chainlink/v2/core/config"
+	"github.com/smartcontractkit/chainlink/v2/core/config/toml"
+	"github.com/smartcontractkit/chainlink/v2/core/services/job"
+	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ocr/capregconfig"
+	ocr "github.com/smartcontractkit/chainlink/v2/core/services/ocr2"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ocrcommon"
+	p2pmain "github.com/smartcontractkit/chainlink/v2/core/services/p2p"
+	p2ptypes "github.com/smartcontractkit/chainlink/v2/core/services/p2p/types"
+	registrysyncerV1 "github.com/smartcontractkit/chainlink/v2/core/services/registrysyncer"
+	registrysyncerV2 "github.com/smartcontractkit/chainlink/v2/core/services/registrysyncer/v2"
+	"github.com/smartcontractkit/chainlink/v2/core/services/shardorchestrator"
+	"github.com/smartcontractkit/chainlink/v2/core/services/standardcapabilities"
+	artifactsV2 "github.com/smartcontractkit/chainlink/v2/core/services/workflows/artifacts/v2"
+	"github.com/smartcontractkit/chainlink/v2/core/services/workflows/events"
+	"github.com/smartcontractkit/chainlink/v2/core/services/workflows/metering"
+	wfmonitoring "github.com/smartcontractkit/chainlink/v2/core/services/workflows/monitoring"
+	"github.com/smartcontractkit/chainlink/v2/core/services/workflows/ratelimiter"
+	"github.com/smartcontractkit/chainlink/v2/core/services/workflows/shardownership"
+	workflowstore "github.com/smartcontractkit/chainlink/v2/core/services/workflows/store"
+	syncerV2 "github.com/smartcontractkit/chainlink/v2/core/services/workflows/syncer/v2"
+	"github.com/smartcontractkit/chainlink/v2/core/services/workflows/syncerlimiter"
+	wftypes "github.com/smartcontractkit/chainlink/v2/core/services/workflows/types"
+	v2 "github.com/smartcontractkit/chainlink/v2/core/services/workflows/v2"
+	"github.com/smartcontractkit/chainlink/v2/core/services/workflows/v2/triggers"
+	"github.com/smartcontractkit/chainlink/v2/core/static"
+)
+
+// Keystore is the minimal interface needed from keystore for CRE
+type Keystore interface {
+	CSA() keystore.CSA
+	Eth() keystore.Eth
+	P2P() keystore.P2P
+	Workflow() keystore.Workflow
+}
+
+// Opts are the options for the CRE services that are exposed by the application
+type Opts struct {
+	CapabilitiesRegistry   *registry.Registry
+	ExecutionHandlers      *confidentialrelay.ExecutionHandlers
+	CapabilitiesDispatcher remotetypes.Dispatcher
+	CapabilitiesSharedPeer p2ptypes.SharedPeer
+
+	FetcherFunc wftypes.FetcherFunc
+
+	BillingClient metering.BillingClient
+	LinkingClient linkingclient.LinkingServiceClient
+	Meter         metric.Meter
+
+	// DurableEmit persists workflow events for durable delivery. Nil disables persistence.
+	DurableEmit func(ctx context.Context, body []byte, attrKVs ...any) error
+
+	StorageClient storage.WorkflowClient
+
+	DonTimeStore  *dontime.Store
+	LimitsFactory limits.Factory
+
+	UseLocalTimeProvider bool
+
+	WorkflowKey  workflowkey.Key
+	JWTGenerator nodeauthjwt.JWTGenerator
+
+	ShardOrchestratorClient shardorchestrator.ClientInterface
+
+	ShardAssignmentSettings *settings.Atomic
+
+	// OffchainCapabilitiesRegistry holds the offchain capabilities registry config delivered
+	// via the cresettings job (config_type=capabilities_registry). Read by the Launcher.
+	OffchainCapabilitiesRegistry *globalconfig.GlobalConfig
+}
+
+// Services contains all CRE-related services
+type Services struct {
+	commonsrv.Service
+
+	BillingClient metering.BillingClient
+
+	WorkflowRateLimiter *ratelimiter.RateLimiter
+
+	WorkflowLimits limits.ResourceLimiter[int]
+
+	GatewayConnectorWrapper *gatewayconnector.ServiceWrapper
+
+	GetPeerID func() (p2ptypes.PeerID, error)
+
+	WorkflowRegistrySyncer syncerV2.WorkflowRegistrySyncer
+
+	OrgResolver orgresolver.OrgResolver
+
+	OCRConfigService capregconfig.OCRConfigService
+
+	// callback to wire Delegates into CRE services (e.g. Launcher) when ready
+	SetDelegatesDeps func(*standardcapabilities.Delegate) (commonsrv.Service, error)
+
+	// callback to wire OCR2 Delegates into CRE services (e.g. Launcher) when ready
+	SetOCR2DelegatesDeps func(*ocr.Delegate) (commonsrv.Service, error)
+}
+
+func (s *Services) close() error {
+	return s.WorkflowLimits.Close()
+}
+
+// workflowRegistryConfigured is true when the workflow registry syncer should start:
+// a non-empty on-chain contract address and/or additional (e.g. gRPC) sources.
+func workflowRegistryConfigured(workflowRegistry config.CapabilitiesWorkflowRegistry) bool {
+	return strings.TrimSpace(workflowRegistry.Address()) != "" || len(workflowRegistry.AdditionalSources()) > 0
+}
+
+// newSubservices initializes and returns all CRE child services
+func (s *Services) newSubservices(
+	lggr logger.Logger,
+	ds sqlutil.DataSource,
+	keyStore Keystore,
+	cfg Config,
+	relayerChainInterops RelayerChainInterops,
+	singletonPeerWrapper *ocrcommon.SingletonPeerWrapper,
+	opts Opts,
+) ([]commonsrv.Service, error) {
+	var srvs []commonsrv.Service
+
+	capCfg := cfg.Capabilities()
+
+	workflowRateLimiter, err := ratelimiter.NewRateLimiter(ratelimiter.Config{
+		GlobalRPS:      capCfg.RateLimit().GlobalRPS(),
+		GlobalBurst:    capCfg.RateLimit().GlobalBurst(),
+		PerSenderRPS:   capCfg.RateLimit().PerSenderRPS(),
+		PerSenderBurst: capCfg.RateLimit().PerSenderBurst(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("could not instantiate workflow rate limiter: %w", err)
+	}
+	s.WorkflowRateLimiter = workflowRateLimiter
+	wCfg := cfg.Workflows()
+	if len(wCfg.Limits().PerOwnerOverrides()) > 0 {
+		lggr.Debugw("loaded per owner overrides", "overrides", wCfg.Limits().PerOwnerOverrides())
+	}
+
+	workflowLimits, err := syncerlimiter.NewWorkflowLimits(lggr, syncerlimiter.Config{
+		Global:            wCfg.Limits().Global(),
+		PerOwner:          wCfg.Limits().PerOwner(),
+		PerOwnerOverrides: wCfg.Limits().PerOwnerOverrides(),
+	}, opts.LimitsFactory)
+	if err != nil {
+		return nil, fmt.Errorf("could not instantiate workflow syncer limiter: %w", err)
+	}
+	s.WorkflowLimits = workflowLimits
+
+	if capCfg.GatewayConnector().DonID() != "" {
+		lggr.Debugw("Creating GatewayConnector wrapper", "donID", capCfg.GatewayConnector().DonID())
+		gwChainID, ok := new(big.Int).SetString(capCfg.GatewayConnector().ChainIDForNodeKey(), 0)
+		if !ok {
+			return nil, fmt.Errorf("could not create gateway connector wrapper: failed to parse gateway connector chain ID as integer: %s", capCfg.GatewayConnector().ChainIDForNodeKey())
+		}
+		gatewayConnectorWrapper := gatewayconnector.NewGatewayConnectorServiceWrapper(
+			capCfg.GatewayConnector(),
+			keys.NewStore(keystore.NewEthSigner(keyStore.Eth(), gwChainID)),
+			keyStore.Eth(),
+			gwChainID,
+			clockwork.NewRealClock(),
+			lggr,
+			keyStore.CSA())
+		var ierr error
+		s.GatewayConnectorWrapper = gatewayConnectorWrapper
+		srvs = append(srvs, gatewayConnectorWrapper)
+
+		if cfg.CRE().ConfidentialRelay().Enabled() {
+			var attestationValidator confidentialrelay.AttestationValidator
+			if cfg.CRE().ConfidentialRelay().TrustEnclaves() {
+				attestationValidator, ierr = passthrough.New()
+				if ierr != nil {
+					return nil, fmt.Errorf("could not create passthrough attestation validator: %w", ierr)
+				}
+			} else {
+				attestationValidator = confidentialrelay.NewAttestationValidator()
+			}
+			relayService := confidentialrelay.NewService(
+				gatewayConnectorWrapper,
+				opts.CapabilitiesRegistry,
+				opts.ExecutionHandlers,
+				keyStore.P2P(),
+				// [P2P].PeerID is not set on any node in practice; GetOrFirst falls back to the node's single P2P key.
+				cfg.P2P().PeerID(),
+				lggr,
+				opts.LimitsFactory,
+				attestationValidator,
+				cfg.CRE().ConfidentialRelay().RequireBFTQuorum(),
+			)
+			srvs = append(srvs, relayService)
+		}
+	}
+
+	if cfg.CRE().Linking().URL() != "" {
+		lggr.Debugw("Creating OrgResolver")
+		resolver, ierr := newOrgResolver(cfg, opts, ds, lggr)
+		if ierr != nil {
+			return nil, fmt.Errorf("could not create org resolver: %w", ierr)
+		}
+		s.OrgResolver = resolver
+		srvs = append(srvs, resolver)
+	} else {
+		lggr.Warn("Skipping orgResolver, no linking service configured")
+	}
+
+	dispatcherWrapper, err := newDispatcherWrapper(cfg, opts, keyStore, singletonPeerWrapper, lggr)
+	if err != nil {
+		return nil, fmt.Errorf("could not create dispatcher: %w", err)
+	}
+	s.GetPeerID = dispatcherWrapper.GetPeerID
+	srvs = append(srvs, dispatcherWrapper)
+
+	if dispatcherWrapper.dispatcher == nil {
+		lggr.Warn("Skipping capabilities and workflow registry syncer, no dispatcher configured (peering disabled)")
+		return srvs, nil
+	}
+
+	if capCfg.ExternalRegistry().Address() == "" {
+		lggr.Warn("Skipping capabilities registry syncer, not configured")
+		return srvs, nil
+	}
+
+	registrySyncerServices, donNotifier, shardIndexMapper, err := s.newRegistrySyncer(
+		lggr,
+		cfg,
+		relayerChainInterops,
+		ds,
+		opts,
+		dispatcherWrapper,
+	)
+	if err != nil {
+		return nil, err
+	}
+	srvs = append(srvs, registrySyncerServices...)
+
+	if !workflowRegistryConfigured(capCfg.WorkflowRegistry()) {
+		lggr.Warn("Skipping workflow registry syncer, not configured")
+		return srvs, nil
+	}
+
+	// Build the syncer's base metering identity once from node metering config;
+	// the handler resolves the workflow DON id later from the don notifier.
+	meterIdentity := newSyncerMeterIdentity(cfg)
+
+	wfSyncerLggr := logger.Named(lggr, "WorkflowRegistrySyncer")
+	wfSyncerLggr.Debugw("Creating WorkflowRegistrySyncer")
+	billingClient, err := newBillingClient(wfSyncerLggr, cfg, opts)
+	if err != nil {
+		wfSyncerLggr.Infof("failed to create billing client: %s", err)
+	}
+
+	wfSyncer, wfSyncerSrvcs, err := newWorkflowRegistrySyncerV2(
+		cfg,
+		relayerChainInterops,
+		billingClient,
+		opts,
+		wfSyncerLggr,
+		ds,
+		opts.DonTimeStore,
+		workflowRateLimiter,
+		workflowLimits,
+		donNotifier,
+		opts.LimitsFactory,
+		s.OrgResolver,
+		s.GatewayConnectorWrapper,
+		meterIdentity,
+		dispatcherWrapper.dispatcher,
+		shardIndexMapper,
+	)
+	if err != nil {
+		return nil, err
+	}
+	s.BillingClient = billingClient
+	s.WorkflowRegistrySyncer = wfSyncer
+	srvs = append(srvs, wfSyncerSrvcs...)
+
+	return srvs, nil
+}
+
+// Config is the minimal interface needed from GeneralConfig for CRE
+type Config interface {
+	Billing() config.Billing
+	Capabilities() config.Capabilities
+	Workflows() config.Workflows
+	CRE() config.CRE
+	P2P() config.P2P
+	Sharding() config.Sharding
+	Metering() config.Metering
+}
+
+// RelayerChainInterops is the minimal interface needed for relayer chain interops
+type RelayerChainInterops interface {
+	Get(commontypes.RelayID) (loop.Relayer, error)
+}
+
+// dispatcherWrapper is a service that encapsulates the dispatcher and its peer dependencies.
+// It manages the lifecycle of the shared peer and dispatcher as subservices.
+type dispatcherWrapper struct {
+	commonsrv.Service
+
+	dispatcher        remotetypes.Dispatcher
+	don2DonSharedPeer p2ptypes.SharedPeer
+}
+
+// GetPeerID returns the peer ID from the shared peer.
+func (w *dispatcherWrapper) GetPeerID() (p2ptypes.PeerID, error) {
+	if w.don2DonSharedPeer == nil {
+		return p2ptypes.PeerID{}, errors.New("don2DonSharedPeer is not initialized")
+	}
+	return w.don2DonSharedPeer.ID(), nil
+}
+
+// newRegistrySyncer creates a registry syncer based on the external registry version
+func (s *Services) newRegistrySyncer(
+	lggr logger.Logger,
+	cfg Config,
+	relayerChainInterops RelayerChainInterops,
+	ds sqlutil.DataSource,
+	opts Opts,
+	dispatcherWrapper *dispatcherWrapper,
+) ([]commonsrv.Service, capabilities.DonNotifyWaitSubscriber, *shardownership.ShardIndexMapper, error) {
+	var srvcs []commonsrv.Service
+
+	capCfg := cfg.Capabilities()
+
+	rid := capCfg.ExternalRegistry().RelayID()
+	registryAddress := capCfg.ExternalRegistry().Address()
+	relayer, err := relayerChainInterops.Get(rid)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("could not fetch relayer %s configured for capabilities registry: %w", rid, err)
+	}
+
+	var streamConfig config.StreamConfig
+	if capCfg.SharedPeering().Enabled() {
+		streamConfig = capCfg.SharedPeering().StreamConfig()
+	}
+
+	donNotifier := capabilities.NewDonNotifier()
+
+	registryChainID, err := strconv.ParseUint(rid.ChainID, 10, 64)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to parse registry chain ID for OCRConfigService: %w", err)
+	}
+	ocrConfigService := capregconfig.NewOCRConfigService(
+		lggr,
+		dispatcherWrapper.GetPeerID,
+		registryChainID,
+		registryAddress,
+	)
+	s.OCRConfigService = ocrConfigService
+
+	// Tracks workflow DONs from registry updates so shard indices used for
+	// failover ownership decisions can be remapped to their current DON IDs.
+	shardIndexMapper := shardownership.NewShardIndexMapper(lggr)
+
+	externalRegistryVersion, err := semver.NewVersion(capCfg.ExternalRegistry().ContractVersion())
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if externalRegistryVersion.Major() != 2 {
+		return nil, nil, nil, fmt.Errorf("unsupported external registry version: %s", externalRegistryVersion.String())
+	}
+
+	var (
+		shardingEnabled bool
+		shardIndex      uint16
+	)
+	if sharding := cfg.Sharding(); sharding != nil {
+		shardingEnabled = sharding.ShardingEnabled()
+		if shardingEnabled {
+			shardIndex = sharding.ShardIndex()
+		}
+	}
+
+	wfLauncher, err := capabilities.NewLauncher(
+		lggr,
+		dispatcherWrapper.don2DonSharedPeer,
+		streamConfig,
+		dispatcherWrapper.dispatcher,
+		opts.CapabilitiesRegistry,
+		donNotifier,
+		opts.LimitsFactory,
+		shardingEnabled,
+		shardIndex,
+	)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("could not create workflow launcher: %w", err)
+	}
+	srvcs = append(srvcs, wfLauncher)
+
+	localCfg := cfg.Capabilities().Local()
+	wfLauncher.SetOffchainRegistry(opts.OffchainCapabilitiesRegistry, localCfg != nil && localCfg.UseOffchainRegistry())
+
+	// callback to wire LocalCapabilityManager into the launcher if local capabilities are configured.
+	if localCfg != nil && len(localCfg.RegistryBasedLaunchAllowlist()) > 0 {
+		// Both delegates are wired into a single LocalCapabilityManager.
+		// The newServicesFn routes to the correct delegate based on the capability ID:
+		// - "dontime@1.0.0" → OCR2 delegate (DonTimePlugin)
+		// - everything else → standard capabilities delegate
+		s.SetDelegatesDeps = func(stdcapDelegate *standardcapabilities.Delegate) (commonsrv.Service, error) {
+			// ocr2Delegate will be set by SetOCR2DelegatesDeps later.
+			var ocr2Delegate *ocr.Delegate
+
+			newServicesFn := func(ctx context.Context, capID string, donID uint32, command string, configJSON string, ocr3Config *ocrtypes.ContractConfig) ([]job.ServiceCtx, error) {
+				if strings.HasPrefix(capID, "dontime") {
+					if ocr2Delegate == nil {
+						return nil, fmt.Errorf("OCR2 delegate not yet initialized for capability %q", capID)
+					}
+					return ocr2Delegate.NewServices(ctx, capID, donID, commontypes.DonTimePlugin, configJSON, ocr3Config)
+				}
+				// Enable the oracle factory only when there's an on-chain OCR3 config.
+				// ResolveOracleFactoryConfig then fills in all details from node config and keystore.
+				oracleFactoryConfig := &job.OracleFactoryConfig{Enabled: ocr3Config != nil}
+				return stdcapDelegate.NewServices(ctx, command, configJSON, 0, capID, uuid.New(), oracleFactoryConfig, donID, ocr3Config)
+			}
+
+			localCapMgr, lcmErr := localcapmgr.NewLocalCapabilityManager(lggr, localCfg, newServicesFn, localCfg.UseOffchainRegistry())
+			if lcmErr != nil {
+				return nil, fmt.Errorf("could not create local capability manager: %w", lcmErr)
+			}
+			wfLauncher.SetLocalCapabilityManager(localCapMgr)
+
+			// Store the OCR2 delegate setter so SetOCR2DelegatesDeps can wire it later.
+			s.SetOCR2DelegatesDeps = func(d *ocr.Delegate) (commonsrv.Service, error) {
+				ocr2Delegate = d
+				return nil, nil // already wired into the LocalCapabilityManager above
+			}
+
+			return localCapMgr, nil
+		}
+	}
+
+	registrySyncer, err := registrysyncerV2.New(
+		lggr,
+		dispatcherWrapper.GetPeerID,
+		relayer,
+		registryAddress,
+		registrysyncerV1.NewORM(ds, lggr),
+	)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("could not configure syncer: %w", err)
+	}
+
+	// The OCR config service must be started and receive each registry snapshot
+	// before capabilities using its dynamic config trackers are launched.
+	registrySyncer.AddListener(ocrConfigService, wfLauncher, shardIndexMapper)
+	srvcs = append(srvcs, ocrConfigService, registrySyncer)
+	return srvcs, donNotifier, shardIndexMapper, nil
+}
+
+func (w *dispatcherWrapper) newSubservices(
+	lggr logger.Logger,
+	cfg Config,
+	opts Opts,
+	keyStore Keystore,
+	singletonPeerWrapper *ocrcommon.SingletonPeerWrapper,
+) ([]commonsrv.Service, error) {
+	capCfg := cfg.Capabilities()
+
+	// Override for tests: a pre-built dispatcher is injected directly, bypassing
+	// the shared-peering setup entirely.
+	if opts.CapabilitiesDispatcher != nil && opts.CapabilitiesSharedPeer != nil {
+		w.dispatcher = opts.CapabilitiesDispatcher
+		w.don2DonSharedPeer = opts.CapabilitiesSharedPeer
+		return []commonsrv.Service{w.don2DonSharedPeer, w.dispatcher}, nil
+	}
+
+	if !capCfg.SharedPeering().Enabled() {
+		lggr.Info("SharedPeering must be enabled for CRE - CRE not starting")
+		return nil, nil
+	}
+	if !cfg.P2P().Enabled() {
+		return nil, errors.New("top-level P2P must be enabled in order to use SharedPeering")
+	}
+	if singletonPeerWrapper == nil {
+		return nil, errors.New("singleton peer wrapper is required for shared peering (are OCR and P2P enabled?)")
+	}
+
+	bootstrappers := capCfg.SharedPeering().Bootstrappers()
+	if len(bootstrappers) == 0 {
+		bootstrappers = cfg.P2P().V2().DefaultBootstrappers()
+	}
+	w.don2DonSharedPeer = p2pmain.NewDon2DonSharedPeer(singletonPeerWrapper, bootstrappers, lggr)
+
+	signer := p2pmain.NewSigner(keyStore.P2P(), cfg.P2P().PeerID())
+
+	remoteDispatcher, err := remote.NewDispatcher(capCfg.Dispatcher(), w.don2DonSharedPeer, signer, lggr, opts.LimitsFactory)
+	if err != nil {
+		return nil, fmt.Errorf("could not create dispatcher: %w", err)
+	}
+	w.dispatcher = remoteDispatcher
+	return []commonsrv.Service{w.don2DonSharedPeer, w.dispatcher}, nil
+}
+
+func newShardDonLookup(capRegistry *registry.Registry) func(ctx context.Context, shardID uint32) *commoncap.DON {
+	return func(ctx context.Context, shardID uint32) *commoncap.DON {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		don, err := capRegistry.DONByID(ctx, shardID)
+		if err != nil {
+			return nil
+		}
+		return &don
+	}
+}
+
+// newDispatcherWrapper creates a new dispatcherWrapper service with peer wrappers if peering is enabled
+func newDispatcherWrapper(
+	cfg Config,
+	opts Opts,
+	keyStore Keystore,
+	singletonPeerWrapper *ocrcommon.SingletonPeerWrapper,
+	lggr logger.Logger,
+) (*dispatcherWrapper, error) {
+	w := &dispatcherWrapper{}
+
+	var initErr error
+	w.Service = commonsrv.Config{
+		Name: "DispatcherWrapper",
+		NewSubServices: func(lggr logger.Logger) []commonsrv.Service {
+			subs, err := w.newSubservices(lggr, cfg, opts, keyStore, singletonPeerWrapper)
+			if err != nil {
+				initErr = err
+				return nil
+			}
+			return subs
+		},
+	}.NewService(lggr)
+
+	if initErr != nil {
+		return nil, initErr
+	}
+
+	return w, nil
+}
+
+// newOrgResolver creates a new OrgResolver if configured
+func newOrgResolver(
+	cfg Config,
+	opts Opts,
+	ds sqlutil.DataSource,
+	lggr logger.Logger,
+) (orgresolver.OrgResolver, error) {
+	// Workflow registry address and chain selector are intentionally left empty;
+	// the linking service falls back to its own configured registry.
+	orgResolverConfig := orgresolver.Config{
+		URL:            cfg.CRE().Linking().URL(),
+		TLSEnabled:     cfg.CRE().Linking().TLSEnabled(),
+		RequestTimeout: cfg.CRE().Linking().RequestTimeout(),
+		JWTGenerator:   opts.JWTGenerator,
+		Client:         opts.LinkingClient,
+		Meter:          opts.Meter,
+	}
+
+	resolver, err := orgResolverConfig.New(lggr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create org resolver: %w", err)
+	}
+
+	var cache orgresolver.Cache
+	if cfg.CRE().Linking().DurableCacheEnabled() {
+		cache = NewOrgResolverStore(ds)
+	} else {
+		cache = orgresolver.NewInMemoryCache()
+	}
+
+	cachingResolver, err := orgresolver.NewCachingResolver(resolver, orgresolver.CachingResolverConfig{
+		Cache: cache,
+		Meter: opts.Meter,
+	}, lggr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create caching org resolver: %w", err)
+	}
+
+	return cachingResolver, nil
+}
+
+func newBillingClient(lggr logger.Logger, cfg Config, opts Opts) (metering.BillingClient, error) {
+	if opts.BillingClient != nil {
+		return opts.BillingClient, nil
+	}
+
+	if cfg.Billing().URL() == "" {
+		return nil, nil
+	}
+
+	workflowOpts := []billing.WorkflowClientOpt{
+		billing.WithJWTGenerator(opts.JWTGenerator),
+	}
+	if cfg.Billing().TLSEnabled() {
+		workflowOpts = append(workflowOpts, billing.WithWorkflowTransportCredentials(credentials.NewClientTLSFromCert(nil, "")))
+	}
+	return billing.NewWorkflowClient(lggr, cfg.Billing().URL(), workflowOpts...)
+}
+
+// newSyncerMeterIdentity builds the syncer's base metering identity from node
+// metering config. Product/tenant/environment/zone and logical node_id are read
+// from [Metering]. The workflow DON id (don_id) is resolved later by the
+// registry from the don notifier (the engine runs on the workflow DON), so it
+// is intentionally left empty here. Service/resource_pool are stamped by
+// syncer.NewSpecMeter.
+// newDeploymentIdentity returns the node's [Metering] deployment dimensions.
+// emitFunc adapts the injected durable emit func to resourcemanager.Emitter.
+type emitFunc func(ctx context.Context, body []byte, attrKVs ...any) error
+
+func (f emitFunc) Emit(ctx context.Context, body []byte, attrKVs ...any) error {
+	return f(ctx, body, attrKVs...)
+}
+
+func newDeploymentIdentity(cfg Config) resourcemanager.DeploymentIdentity {
+	m := cfg.Metering()
+	if m == nil {
+		return resourcemanager.DeploymentIdentity{}
+	}
+	return resourcemanager.DeploymentIdentity{
+		Product:         m.Product(),
+		Tenant:          m.Tenant(),
+		NumericTenantID: m.NumericTenantID(),
+		Environment:     m.Environment(),
+		Zone:            m.Zone(),
+		NodeID:          m.NodeID(),
+	}
+}
+
+func newSyncerMeterIdentity(cfg Config) resourcemanager.ResourceIdentity {
+	m := cfg.Metering()
+	if m == nil {
+		return resourcemanager.ResourceIdentity{}
+	}
+	id := resourcemanager.ResourceIdentity{
+		Product:         m.Product(),
+		Tenant:          m.Tenant(),
+		NumericTenantID: m.NumericTenantID(),
+		Environment:     m.Environment(),
+		Zone:            m.Zone(),
+	}
+	if nodeID := m.NodeID(); nodeID != "" {
+		id.Don = &resourcemanager.DonIdentity{NodeID: nodeID}
+	}
+	return id
+}
+
+func newShardOrchestratorClient(cfg Config, lggr logger.Logger) (*shardorchestrator.Client, error) {
+	shardIndex := cfg.Sharding().ShardIndex()
+	if shardIndex == 0 {
+		return nil, nil
+	}
+
+	address := cfg.Sharding().ShardOrchestratorAddress()
+	if address == nil {
+		return nil, fmt.Errorf("shard %d requires ShardOrchestratorAddress configuration", shardIndex)
+	}
+
+	client, err := shardorchestrator.NewClient(address.String(), lggr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create ShardOrchestrator gRPC client: %w", err)
+	}
+
+	lggr.Infow("ShardOrchestrator gRPC client created", "shardIndex", shardIndex, "serverAddress", address)
+	return client, nil
+}
+
+func newContractReaderFactory(capCfg config.Capabilities, relayerChainInterops RelayerChainInterops) (func(ctx context.Context, bytes []byte) (commontypes.ContractReader, error), error) {
+	wfRegRid := capCfg.WorkflowRegistry().RelayID()
+	wfRegRelayer, err := relayerChainInterops.Get(wfRegRid)
+	if err != nil {
+		return nil, fmt.Errorf("could not fetch relayer %s configured for workflow registry: %w", wfRegRid, err)
+	}
+
+	return func(ctx context.Context, bytes []byte) (commontypes.ContractReader, error) {
+		return wfRegRelayer.NewContractReader(ctx, bytes)
+	}, nil
+}
+
+func chainSelector(chainID, networkID string) (string, error) {
+	wrChainDetails, err := chainselectors.GetChainDetailsByChainIDAndFamily(
+		chainID,
+		networkID,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to get workflow registry chain details by chain ID and network ID: %w", err)
+	}
+
+	return strconv.FormatUint(wrChainDetails.ChainSelector, 10), nil
+}
+
+func newFetcherServiceV2(
+	opts Opts,
+	capCfg config.Capabilities,
+	lggr logger.Logger,
+	gatewayConnectorWrapper *gatewayconnector.ServiceWrapper,
+) (wftypes.FetcherFunc, wftypes.LocationRetrieverFunc, []commonsrv.Service, error) {
+	if opts.FetcherFunc != nil {
+		return opts.FetcherFunc, nil, []commonsrv.Service{}, nil
+	}
+
+	wfReg := capCfg.WorkflowRegistry()
+	direct := wfReg.FetchMode() == config.WorkflowFetchModeDirect
+	if gatewayConnectorWrapper == nil && !direct {
+		return nil, nil, nil, errors.New("unable to create workflow registry syncer without gateway connector")
+	}
+
+	wfStorage := capCfg.WorkflowRegistry().WorkflowStorage()
+	storageClient := opts.StorageClient
+	if wfStorage.URL() != "" {
+		workflowOpts := []storage.WorkflowClientOpt{
+			storage.WithJWTGenerator(opts.JWTGenerator),
+		}
+		if wfStorage.TLSEnabled() {
+			workflowOpts = append(workflowOpts, storage.WithWorkflowTransportCredentials(credentials.NewClientTLSFromCert(nil, "")))
+		}
+
+		sc, err := storage.NewWorkflowClient(lggr, wfStorage.URL(), workflowOpts...)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to create storage client: %w", err)
+		}
+
+		storageClient = sc
+	}
+
+	if storageClient == nil {
+		return nil, nil, nil, errors.New("must have a storage client")
+	}
+
+	if direct {
+		httpClient, err := syncerV2.NewDirectHTTPClient(lggr, math.MaxUint32)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to create direct fetch http client: %w", err)
+		}
+		fetcher := syncerV2.NewFetcherService(lggr, nil, storageClient)
+		return syncerV2.NewDirectFetcherFunc(httpClient, wfReg.FetchAllowedHosts(), lggr), fetcher.RetrieveURL, []commonsrv.Service{}, nil
+	}
+
+	fetcher := syncerV2.NewFetcherService(lggr, gatewayConnectorWrapper, storageClient)
+	return fetcher.Fetch, fetcher.RetrieveURL, []commonsrv.Service{fetcher}, nil
+}
+
+func newWorkflowRegistrySyncerV2(
+	cfg Config,
+	relayerChainInterops RelayerChainInterops,
+	billingClient metering.BillingClient,
+	opts Opts,
+	lggr logger.Logger,
+	ds sqlutil.DataSource,
+	dontimeStore *dontime.Store,
+	workflowRateLimiter *ratelimiter.RateLimiter,
+	workflowLimits limits.ResourceLimiter[int],
+	workflowDonNotifier capabilities.DonNotifyWaitSubscriber,
+	lf limits.Factory,
+	orgResolver orgresolver.OrgResolver,
+	gatewayConnectorWrapper *gatewayconnector.ServiceWrapper,
+	meterIdentity resourcemanager.ResourceIdentity,
+	dispatcher remotetypes.Dispatcher,
+	shardIndexMapper *shardownership.ShardIndexMapper,
+) (syncerV2.WorkflowRegistrySyncer, []commonsrv.Service, error) {
+	capCfg := cfg.Capabilities()
+	wfReg := capCfg.WorkflowRegistry()
+	key := opts.WorkflowKey
+
+	fetcherFunc, retrieverFunc, srvcs, err := newFetcherServiceV2(opts, capCfg, lggr, gatewayConnectorWrapper)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	artifactsStore, err := artifactsV2.NewStore(
+		lggr,
+		artifactsV2.NewWorkflowRegistryDS(ds, lggr),
+		fetcherFunc,
+		retrieverFunc,
+		clockwork.NewRealClock(),
+		key,
+		custmsg.NewLabeler(),
+		lf,
+		artifactsV2.WithConfig(artifactsV2.StoreConfig{
+			ArtifactStorageHost: wfReg.WorkflowStorage().ArtifactStorageHost(),
+		}),
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to create artifact store: %w", err)
+	}
+
+	engineRegistry := syncerV2.NewEngineRegistry()
+
+	engineLimiters, err := v2.NewLimiters(lf, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not instantiate engine limiters: %w", err)
+	}
+
+	featureFlags, err := v2.NewFeatureFlags(lf, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not instantiate engine feature flags: %w", err)
+	}
+
+	selector, err := chainSelector(wfReg.ChainID(), wfReg.NetworkID())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	crFactory, err := newContractReaderFactory(capCfg, relayerChainInterops)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to instantiate contract reader factory: %w", err)
+	}
+
+	var shardOrchestratorClient shardorchestrator.ClientInterface
+	if opts.ShardOrchestratorClient != nil {
+		shardOrchestratorClient = opts.ShardOrchestratorClient
+	} else {
+		c, clientErr := newShardOrchestratorClient(cfg, lggr)
+		if clientErr != nil {
+			return nil, nil, clientErr
+		}
+		if c != nil {
+			shardOrchestratorClient = c
+		} else {
+			lggr.Debugw("ShardOrchestrator client not created (shard 0 runs the server)")
+		}
+	}
+
+	shardingEnabled := cfg.Sharding().ShardingEnabled()
+
+	var shardRoutingSteady *shardownership.SteadySignal
+	if shardingEnabled {
+		steadyMetrics, errSteady := wfmonitoring.GlobalSteadySignalMetrics()
+		if errSteady != nil {
+			lggr.Warnw("Failed to register shard routing steady signal metrics; continuing without steady instrumentation", "err", errSteady)
+		}
+		shardRoutingSteady = shardownership.NewSteadySignal(shardownership.WithSteadySignalMetrics(steadyMetrics))
+	}
+
+	assignmentMode := cfg.Sharding().ShardAssignmentMode()
+	assignmentMetrics, errAssignmentMetrics := wfmonitoring.GlobalShardAssignmentMetrics()
+	if errAssignmentMetrics != nil {
+		lggr.Warnw("Failed to register shard assignment metrics; continuing without assignment instrumentation", "err", errAssignmentMetrics)
+	}
+	var shardResolver shardownership.ShardResolver
+	switch assignmentMode {
+	case toml.ShardAssignmentModeManualOnly:
+		shardResolver = shardownership.NewManualShardResolver(opts.ShardAssignmentSettings, orgResolver, shardIndexMapper, lggr)
+		assignmentMetrics.RecordAssignmentMode(context.Background(), wfmonitoring.ShardAssignmentModeManualOnly)
+		lggr.Infow("Using manual-only shard assignment mode")
+	case toml.ShardAssignmentModeRingOCROverrides:
+		ringOCR := shardownership.NewRingOCRShardResolver(shardOrchestratorClient, lggr)
+		shardResolver = shardownership.NewOverrideShardResolver(opts.ShardAssignmentSettings, orgResolver, shardIndexMapper, ringOCR, lggr)
+		assignmentMetrics.RecordAssignmentMode(context.Background(), wfmonitoring.ShardAssignmentModeRingOCRWithOverrides)
+		lggr.Infow("Using ringocr-with-overrides shard assignment mode")
+	default:
+		shardResolver = shardownership.NewRingOCRShardResolver(shardOrchestratorClient, lggr)
+		assignmentMetrics.RecordAssignmentMode(context.Background(), wfmonitoring.ShardAssignmentModeRingOCROnly)
+		lggr.Infow("Using ringocr-only shard assignment mode")
+	}
+	meteringCfg := cfg.Metering()
+	meterRecordsEnabled := meteringCfg != nil && meteringCfg.MeterRecordsEnabled()
+	meterSnapshotsEnabled := meteringCfg != nil && meteringCfg.MeterSnapshotsEnabled()
+
+	coordinatorMetrics, err := wfmonitoring.InitMonitoringResources()
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to init trigger coordinator metrics: %w", err)
+	}
+	centralQueueMetrics, err := wfmonitoring.InitCentralTriggerQueueMetrics()
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to init central trigger queue metrics: %w", err)
+	}
+	drainerMetrics, err := wfmonitoring.InitTriggerDrainerMetrics()
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to init central trigger queue drainer metrics: %w", err)
+	}
+	coordinatorClock := clockwork.NewRealClock()
+
+	// Shadow mode copies coordinated trigger events to the central queue while
+	// FeatureShadowTriggerModeActivePeriod is open. The copies are for observation only.
+	// The drainer logs and discards them, and each event still executes on its workflow's own queue.
+	centralQueue := triggers.NewQueue(engineLimiters.CentralTriggerEventQueue,
+		wfmonitoring.NewCentralTriggerQueueMetricLabeler(commonmetrics.NewLabeler(), centralQueueMetrics), lggr)
+	centralQueueDrainer := triggers.NewCentralQueueDrainer(centralQueue, engineLimiters.CentralTriggerQueueDrainInterval,
+		wfmonitoring.NewTriggerDrainerMetricLabeler(commonmetrics.NewLabeler(), drainerMetrics), coordinatorClock, lggr)
+	triggerCoordinator := triggers.NewCoordinator(
+		triggers.RegisterDeps{
+			CapRegistry:  opts.CapabilitiesRegistry,
+			RegTimeout:   engineLimiters.TriggerRegistrationsTime,
+			ChainAllowed: engineLimiters.ChainAllowed,
+			Logger:       lggr,
+			Metrics:      wfmonitoring.NewWorkflowsMetricLabeler(commonmetrics.NewLabeler(), coordinatorMetrics),
+		},
+		engineLimiters.Admission(),
+		syncerV2.NewTriggerEngineRegistry(engineRegistry),
+		workflowLimits,
+		coordinatorClock,
+		triggers.WithShadowMode(centralQueue, engineLimiters.ShadowTriggerMode),
+		triggers.WithDrainer(centralQueueDrainer),
+	)
+
+	handlerOpts := []syncerV2.EventHandlerOption{
+		syncerV2.WithBillingClient(billingClient),
+		syncerV2.WithWorkflowRegistry(wfReg.Address(), selector),
+		syncerV2.WithOrgResolver(orgResolver),
+		syncerV2.WithDebugMode(cfg.CRE().DebugMode()),
+		syncerV2.WithCachedTriggerSubscriptionsEnabled(cfg.CRE().CachedTriggerSubscriptionsEnabled()),
+		syncerV2.WithLocalSecretOverrides(lggr, cfg.CRE().LocalSecretOverrides()),
+		syncerV2.WithShardExecutionGuard(shardOrchestratorClient, shardingEnabled),
+		syncerV2.WithShardRoutingSteady(shardRoutingSteady),
+		syncerV2.WithShardResolver(shardResolver),
+		syncerV2.WithShardIndex(uint32(cfg.Sharding().ShardIndex())),
+		syncerV2.WithTriggerCoordinator(triggerCoordinator),
+		// Shared emitter across handler and spawned engines.
+		syncerV2.WithEventEmitter(events.NewEmitter(nil, events.WithDurableEmit(opts.DurableEmit))),
+	}
+	if shardingEnabled && dispatcher != nil {
+		handlerOpts = append(handlerOpts,
+			syncerV2.WithDispatcher(dispatcher),
+			syncerV2.WithShardDonLookup(newShardDonLookup(opts.CapabilitiesRegistry)),
+		)
+	}
+
+	// The spec meter (and its ResourceManager) exists only when metering is
+	// enabled; a handler without one emits nothing. The meter owns the RM
+	// lifecycle and snapshot registration as a sub-service of the handler.
+	if meterRecordsEnabled || meterSnapshotsEnabled {
+		rm := resourcemanager.NewResourceManager(lggr, resourcemanager.ResourceManagerConfig{
+			MeterRecordsEnabled:   meterRecordsEnabled,
+			MeterSnapshotsEnabled: meterSnapshotsEnabled,
+			Emitter:               beholder.GetEmitter(),
+			SnapshotInterval:      resourcemanager.DefaultSnapshotInterval,
+		})
+		specMeter, smErr := syncerV2.NewSpecMeter(lggr, rm, meterIdentity, artifactsStore, orgResolver)
+		if smErr != nil {
+			return nil, nil, fmt.Errorf("unable to create workflow spec meter: %w", smErr)
+		}
+		handlerOpts = append(handlerOpts, syncerV2.WithSpecMeter(specMeter))
+	}
+
+	// Compute usage records share the [Metering].MeterRecordsEnabled gate.
+	if meterRecordsEnabled {
+		if opts.DurableEmit != nil { // injected, not the global, so tests can supply their own
+			handlerOpts = append(handlerOpts, syncerV2.WithUsageMetering(newDeploymentIdentity(cfg), emitFunc(opts.DurableEmit)))
+		} else {
+			lggr.Warnw("Compute usage metering enabled without a durable emitter; compute usage records disabled")
+		}
+	}
+
+	mc := wfReg.ModuleCache()
+	cacheEnabled := mc.Enabled()
+	diskMonitorEnabled := mc.DiskMonitorEnabled() || cacheEnabled
+
+	if diskMonitorEnabled {
+		fileStore, fsErr := artifactsV2.NewFileModuleStore(mc.CacheDir(), cacheEnabled)
+		if fsErr != nil {
+			return nil, nil, fmt.Errorf("unable to create file module store: %w", fsErr)
+		}
+
+		dm, dmErr := syncerV2.NewWorkflowModuleCacheDiskMonitor(
+			lggr,
+			fileStore.CacheDir(),
+			syncerV2.WorkflowModuleCacheDiskMonitorTickInterval,
+		)
+		if dmErr != nil {
+			return nil, nil, fmt.Errorf("unable to create module cache disk monitor: %w", dmErr)
+		}
+		srvcs = append(srvcs, dm)
+
+		lggr.Infow("Module cache disk monitor enabled", "cacheDir", fileStore.CacheDir())
+
+		if cacheEnabled {
+			cm, cmErr := syncerV2.NewCacheMetrics()
+			if cmErr != nil {
+				return nil, nil, fmt.Errorf("unable to create module cache metrics: %w", cmErr)
+			}
+
+			var idleTimeout time.Duration
+			if mc.IdleEviction() {
+				idleTimeout = mc.IdleTimeout()
+			}
+			moduleLRU := syncerV2.NewModuleLRU(
+				clockwork.NewRealClock(),
+				syncerV2.WithMaxLoadedModules(mc.MaxLoaded()),
+				syncerV2.WithCacheMetrics(cm),
+				syncerV2.WithIdleTimeout(idleTimeout),
+			)
+
+			handlerOpts = append(handlerOpts,
+				syncerV2.WithModuleLRU(moduleLRU),
+				syncerV2.WithModuleStore(fileStore),
+				syncerV2.WithModuleCacheMetrics(cm),
+				syncerV2.WithModuleEngineVersion(static.Version),
+			)
+
+			lggr.Infow("Module cache enabled",
+				"idleEviction", mc.IdleEviction(),
+				"idleTimeout", mc.IdleTimeout(),
+				"maxLoaded", mc.MaxLoaded(),
+				"cacheDir", fileStore.CacheDir(),
+				"engineVersion", static.Version,
+			)
+		}
+	}
+
+	eventHandler, err := syncerV2.NewEventHandler(
+		lggr,
+		workflowstore.NewInMemoryStore(lggr, clockwork.NewRealClock()),
+		dontimeStore,
+		opts.UseLocalTimeProvider,
+		opts.CapabilitiesRegistry,
+		opts.ExecutionHandlers,
+		engineRegistry,
+		custmsg.NewLabeler(),
+		engineLimiters,
+		featureFlags,
+		workflowRateLimiter,
+		workflowLimits,
+		artifactsStore,
+		key,
+		workflowDonNotifier,
+		handlerOpts...,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to create workflow registry event handler: %w", err)
+	}
+
+	addSources := wfReg.AdditionalSources()
+	addSourceConfigs := make([]syncerV2.AdditionalSourceConfig, len(addSources))
+	for i, src := range addSources {
+		addSourceConfigs[i] = syncerV2.AdditionalSourceConfig{
+			URL:          src.GetURL(),
+			Name:         src.GetName(),
+			TLSEnabled:   src.GetTLSEnabled(),
+			JWTGenerator: opts.JWTGenerator,
+		}
+	}
+
+	registryOpts := []syncerV2.Option{
+		// WithCentralizedOwnerVerification MUST be applied before WithAdditionalSources:
+		// WithAdditionalSources builds GRPC workflow sources eagerly and requires the
+		// owner-verification gate (and settings getter) to already be set on the registry.
+		// If it runs first, the gate is still nil and NewGRPCWorkflowSource fails with
+		// "CentralizedOwnerVerificationEnabled gate is required", silently dropping the
+		// centralized source and every workflow it serves.
+		syncerV2.WithCentralizedOwnerVerification(engineLimiters.CentralizedWorkflowOwnerVerificationEnabled, lf.Settings),
+		syncerV2.WithAdditionalSources(addSourceConfigs),
+		syncerV2.WithShardOrchestratorClient(shardOrchestratorClient),
+		syncerV2.WithRegistryShardResolver(shardResolver),
+		syncerV2.WithMaxConcurrency(wfReg.MaxConcurrency()),
+		syncerV2.WithMaxActivationRetries(wfReg.MaxActivationRetries()),
+	}
+	if shardingEnabled {
+		registryOpts = append(registryOpts,
+			syncerV2.WithShardEnabled(true),
+			syncerV2.WithShardFailoverEnabled(engineLimiters.ShardingFailoverEnabled),
+		)
+		if shardRoutingSteady != nil {
+			registryOpts = append(registryOpts, syncerV2.WithRegistryShardRoutingObserver(shardRoutingSteady))
+		}
+	}
+
+	workflowRegistrySyncerV2, err := syncerV2.NewWorkflowRegistry(
+		lggr,
+		crFactory,
+		wfReg.Address(),
+		selector,
+		syncerV2.Config{
+			QueryCount:   100,
+			SyncStrategy: syncerV2.SyncStrategy(wfReg.SyncStrategy()),
+		},
+		eventHandler,
+		workflowDonNotifier,
+		engineRegistry,
+		registryOpts...,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to create workflow registry syncer: %w", err)
+	}
+
+	srvcs = append(srvcs, workflowRegistrySyncerV2)
+	lggr.Debugw("Created WorkflowRegistrySyncer V2")
+	return workflowRegistrySyncerV2, srvcs, nil
+}
+
+// NewServices creates and initializes all CRE services
+func NewServices(
+	lggr logger.Logger,
+	ds sqlutil.DataSource,
+	keyStore Keystore,
+	cfg Config,
+	relayerChainInterops RelayerChainInterops,
+	singletonPeerWrapper *ocrcommon.SingletonPeerWrapper,
+	opts Opts,
+) (*Services, error) {
+	s := &Services{}
+
+	var subservicesErr error
+	s.Service = commonsrv.Config{
+		Name: "CRE",
+		NewSubServices: func(subLggr logger.Logger) []commonsrv.Service {
+			srvs, err := s.newSubservices(
+				subLggr,
+				ds,
+				keyStore,
+				cfg,
+				relayerChainInterops,
+				singletonPeerWrapper,
+				opts,
+			)
+			if err != nil {
+				subservicesErr = err
+				return nil
+			}
+			return srvs
+		},
+		Close: s.close,
+	}.NewService(lggr)
+
+	if subservicesErr != nil {
+		return nil, subservicesErr
+	}
+
+	return s, nil
+}

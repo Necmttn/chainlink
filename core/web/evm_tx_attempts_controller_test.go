@@ -4,30 +4,30 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
-	"github.com/smartcontractkit/chainlink/v2/core/web"
-	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
-
 	"github.com/manyminds/api2go/jsonapi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr/txmgrtest"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/v2/core/web"
+	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 )
 
 func TestTxAttemptsController_Index_Success(t *testing.T) {
 	t.Parallel()
 
 	app := cltest.NewApplicationWithKey(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
-	txStore := cltest.NewTestTxStore(t, app.GetSqlxDB(), app.GetConfig().Database())
+	txStore := txmgrtest.NewTestTxStore(t, app.GetDB())
 	client := app.NewHTTPClient(nil)
 
 	_, from := cltest.MustInsertRandomKey(t, app.KeyStore.Eth())
 
-	cltest.MustInsertConfirmedEthTxWithLegacyAttempt(t, txStore, 0, 1, from)
-	cltest.MustInsertConfirmedEthTxWithLegacyAttempt(t, txStore, 1, 2, from)
-	cltest.MustInsertConfirmedEthTxWithLegacyAttempt(t, txStore, 2, 3, from)
+	txmgrtest.MustInsertConfirmedEthTxWithLegacyAttempt(t, txStore, 0, 1, from)
+	txmgrtest.MustInsertConfirmedEthTxWithLegacyAttempt(t, txStore, 1, 2, from)
+	txmgrtest.MustInsertConfirmedEthTxWithLegacyAttempt(t, txStore, 2, 3, from)
 
 	resp, cleanup := client.Get("/v2/tx_attempts?size=2")
 	t.Cleanup(cleanup)
@@ -49,7 +49,7 @@ func TestTxAttemptsController_Index_Error(t *testing.T) {
 	t.Parallel()
 
 	app := cltest.NewApplicationWithKey(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	client := app.NewHTTPClient(nil)
 	resp, cleanup := client.Get("/v2/tx_attempts?size=TrainingDay")

@@ -9,10 +9,10 @@ import (
 	"github.com/pelletier/go-toml"
 	"github.com/pkg/errors"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/assets"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/vrfkey/secp256k1"
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
-	"github.com/smartcontractkit/chainlink/v2/core/services/signatures/secp256k1"
 )
 
 var (
@@ -46,9 +46,6 @@ func ValidatedVRFSpec(tomlString string) (job.Job, error) {
 	var empty secp256k1.PublicKey
 	if bytes.Equal(spec.PublicKey[:], empty[:]) {
 		return jb, errors.Wrap(ErrKeyNotSet, "publicKey")
-	}
-	if spec.MinIncomingConfirmations == 0 {
-		return jb, errors.Wrap(ErrKeyNotSet, "minIncomingConfirmations")
 	}
 	if spec.CoordinatorAddress.String() == "" {
 		return jb, errors.Wrap(ErrKeyNotSet, "coordinatorAddress")
@@ -84,18 +81,18 @@ func ValidatedVRFSpec(tomlString string) (job.Job, error) {
 
 	var foundVRFTask bool
 	for _, t := range jb.Pipeline.Tasks {
-		if t.Type() == pipeline.TaskTypeVRF || t.Type() == pipeline.TaskTypeVRFV2 || t.Type() == pipeline.TaskTypeVRFV2Plus {
+		if t.Type() == pipeline.TaskTypeVRFV2 || t.Type() == pipeline.TaskTypeVRFV2Plus {
 			foundVRFTask = true
 		}
 
 		if t.Type() == pipeline.TaskTypeVRFV2 || t.Type() == pipeline.TaskTypeVRFV2Plus {
 			if len(spec.FromAddresses) == 0 {
-				return jb, errors.Wrap(ErrKeyNotSet, "fromAddreses needs to have a non-zero length")
+				return jb, errors.Wrap(ErrKeyNotSet, "fromAddresses needs to have a non-zero length")
 			}
 		}
 	}
 	if !foundVRFTask {
-		return jb, errors.Wrapf(ErrKeyNotSet, "invalid pipeline, expected a vrf task")
+		return jb, errors.Wrapf(ErrKeyNotSet, "invalid pipeline, expected a vrfv2 or vrfv2plus task")
 	}
 
 	jb.VRFSpec = &spec

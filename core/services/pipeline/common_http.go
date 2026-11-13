@@ -3,15 +3,15 @@ package pipeline
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"io"
 	"net/http"
 	"time"
 
+	"github.com/goccy/go-json"
 	"github.com/pkg/errors"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
-	clhttp "github.com/smartcontractkit/chainlink/v2/core/utils/http"
+	clhttp "github.com/smartcontractkit/chainlink-common/pkg/http"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 )
 
 func makeHTTPRequest(
@@ -23,20 +23,23 @@ func makeHTTPRequest(
 	requestData MapParam,
 	client *http.Client,
 	httpLimit int64,
-) ([]byte, int, http.Header, time.Duration, error) {
-
+) (responseBytes []byte, statusCode int, respHeaders http.Header, start, finish time.Time, err error) {
 	var bodyReader io.Reader
 	if requestData != nil {
-		bodyBytes, err := json.Marshal(requestData)
+		var bodyBytes []byte
+		bodyBytes, err = json.Marshal(requestData)
 		if err != nil {
-			return nil, 0, nil, 0, errors.Wrap(err, "failed to encode request body as JSON")
+			err = errors.Wrap(err, "failed to encode request body as JSON")
+			return responseBytes, statusCode, respHeaders, start, finish, err
 		}
 		bodyReader = bytes.NewReader(bodyBytes)
 	}
 
-	request, err := http.NewRequestWithContext(ctx, string(method), url.String(), bodyReader)
+	var request *http.Request
+	request, err = http.NewRequestWithContext(ctx, string(method), url.String(), bodyReader)
 	if err != nil {
-		return nil, 0, nil, 0, errors.Wrap(err, "failed to create http.Request")
+		err = errors.Wrap(err, "failed to create http.Request")
+		return responseBytes, statusCode, respHeaders, start, finish, err
 	}
 	request.Header.Set("Content-Type", "application/json")
 	if len(reqHeaders)%2 != 0 {
@@ -46,28 +49,31 @@ func makeHTTPRequest(
 		request.Header.Set(reqHeaders[i], reqHeaders[i+1])
 	}
 
-	httpRequest := clhttp.HTTPRequest{
+	httpRequest := clhttp.Request{
 		Client:  client,
 		Request: request,
-		Config:  clhttp.HTTPRequestConfig{SizeLimit: httpLimit},
-		Logger:  lggr.Named("HTTPRequest"),
+		Config:  clhttp.RequestConfig{SizeLimit: httpLimit},
+		Logger:  logger.Sugared(lggr).Named("HTTPRequest"),
 	}
 
-	start := time.Now()
-	responseBytes, statusCode, respHeaders, err := httpRequest.SendRequest()
+	start = time.Now()
+	responseBytes, statusCode, respHeaders, err = httpRequest.SendRequest()
+	finish = time.Now()
 	if ctx.Err() != nil {
-		return nil, 0, nil, 0, errors.New("http request timed out or interrupted")
+		err = errors.New("http request timed out or interrupted")
+		return responseBytes, statusCode, respHeaders, start, finish, err
 	}
 	if err != nil {
-		return nil, 0, nil, 0, errors.Wrapf(err, "error making http request")
+		err = errors.Wrapf(err, "error making http request")
+		return responseBytes, statusCode, respHeaders, start, finish, err
 	}
-	elapsed := time.Since(start) // TODO: return elapsed from utils/http
 
 	if statusCode >= 400 {
-		maybeErr := bestEffortExtractError(responseBytes)
-		return nil, statusCode, respHeaders, 0, errors.Errorf("got error from %s: (status code %v) %s", url.String(), statusCode, maybeErr)
+		err = errors.Errorf("got error from %s: (status code %v) %s", url.String(), statusCode, bestEffortExtractError(responseBytes))
+	} else if statusCode >= 300 {
+		err = errors.Errorf("redirect error %s: (status code %v) %s", url.String(), statusCode, bestEffortExtractError(responseBytes))
 	}
-	return responseBytes, statusCode, respHeaders, elapsed, nil
+	return responseBytes, statusCode, respHeaders, start, finish, err
 }
 
 type PossibleErrorResponses struct {
@@ -103,5 +109,23 @@ func httpRequestCtx(ctx context.Context, t Task, cfg Config) (requestCtx context
 		requestCtx = ctx
 		cancel = func() {}
 	}
-	return
+	return requestCtx, cancel
+}
+
+// statusCodeGroup maps to course status code group (e.g. 2xx, 4xx, 5xx) to reduce metric cardinality.
+func statusCodeGroup(status int) string {
+	switch {
+	case status >= 100 && status < 200:
+		return "1xx"
+	case status >= 200 && status < 300:
+		return "2xx"
+	case status >= 300 && status < 400:
+		return "3xx"
+	case status >= 400 && status < 500:
+		return "4xx"
+	case status >= 500 && status < 600:
+		return "5xx"
+	default:
+		return "unknown"
+	}
 }

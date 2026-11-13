@@ -10,14 +10,13 @@ import (
 	"github.com/graph-gophers/graphql-go/gqltesting"
 	"github.com/stretchr/testify/mock"
 
+	"github.com/smartcontractkit/chainlink-evm/pkg/client/clienttest"
+	evmConfigMocks "github.com/smartcontractkit/chainlink-evm/pkg/config/mocks"
+	evmMonMocks "github.com/smartcontractkit/chainlink-evm/pkg/monitor/mocks"
+	legacyEvmORMMocks "github.com/smartcontractkit/chainlink/v2/common/chains/mocks"
+	evmtxmgrmocks "github.com/smartcontractkit/chainlink/v2/common/txmgr/mocks"
 	bridgeORMMocks "github.com/smartcontractkit/chainlink/v2/core/bridges/mocks"
-	evmClientMocks "github.com/smartcontractkit/chainlink/v2/core/chains/evm/client/mocks"
-	evmConfigMocks "github.com/smartcontractkit/chainlink/v2/core/chains/evm/config/mocks"
-	evmORMMocks "github.com/smartcontractkit/chainlink/v2/core/chains/evm/mocks"
-	evmtxmgrmocks "github.com/smartcontractkit/chainlink/v2/core/chains/evm/txmgr/mocks"
-	legacyEvmORMMocks "github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm/mocks"
 	coremocks "github.com/smartcontractkit/chainlink/v2/core/internal/mocks"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/evmtest"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/logger/audit"
@@ -26,7 +25,6 @@ import (
 	jobORMMocks "github.com/smartcontractkit/chainlink/v2/core/services/job/mocks"
 	keystoreMocks "github.com/smartcontractkit/chainlink/v2/core/services/keystore/mocks"
 	pipelineMocks "github.com/smartcontractkit/chainlink/v2/core/services/pipeline/mocks"
-	webhookmocks "github.com/smartcontractkit/chainlink/v2/core/services/webhook/mocks"
 	clsessions "github.com/smartcontractkit/chainlink/v2/core/sessions"
 	authProviderMocks "github.com/smartcontractkit/chainlink/v2/core/sessions/mocks"
 	"github.com/smartcontractkit/chainlink/v2/core/web/auth"
@@ -51,12 +49,17 @@ type mocks struct {
 	p2p                  *keystoreMocks.P2P
 	vrf                  *keystoreMocks.VRF
 	solana               *keystoreMocks.Solana
+	aptos                *keystoreMocks.Aptos
+	sui                  *keystoreMocks.Sui
+	stellar              *keystoreMocks.Stellar
+	starknet             *keystoreMocks.StarkNet
+	tron                 *keystoreMocks.Tron
+	ton                  *keystoreMocks.TON
 	chain                *legacyEvmORMMocks.Chain
 	legacyEVMChains      *legacyEvmORMMocks.LegacyChainContainer
 	relayerChainInterops *chainlinkMocks.FakeRelayerChainInteroperators
-	ethClient            *evmClientMocks.Client
-	eIMgr                *webhookmocks.ExternalInitiatorManager
-	balM                 *evmORMMocks.BalanceMonitor
+	ethClient            *clienttest.Client
+	balM                 *evmMonMocks.BalanceMonitor
 	txmStore             *evmtxmgrmocks.EvmTxStore
 	auditLogger          *audit.AuditLoggerService
 }
@@ -72,9 +75,6 @@ type gqlTestFramework struct {
 	// The root GQL schema
 	RootSchema *graphql.Schema
 
-	// Contains the context with an injected dataloader
-	Ctx context.Context
-
 	Mocks *mocks
 }
 
@@ -88,7 +88,6 @@ func setupFramework(t *testing.T) *gqlTestFramework {
 			schema.MustGetRootSchema(),
 			&Resolver{App: app},
 		)
-		ctx = loader.InjectDataloader(testutils.Context(t), app)
 	)
 
 	// Setup mocks
@@ -110,12 +109,17 @@ func setupFramework(t *testing.T) *gqlTestFramework {
 		p2p:                  keystoreMocks.NewP2P(t),
 		vrf:                  keystoreMocks.NewVRF(t),
 		solana:               keystoreMocks.NewSolana(t),
+		aptos:                keystoreMocks.NewAptos(t),
+		starknet:             keystoreMocks.NewStarkNet(t),
+		sui:                  keystoreMocks.NewSui(t),
+		stellar:              keystoreMocks.NewStellar(t),
+		tron:                 keystoreMocks.NewTron(t),
+		ton:                  keystoreMocks.NewTON(t),
 		chain:                legacyEvmORMMocks.NewChain(t),
 		legacyEVMChains:      legacyEvmORMMocks.NewLegacyChainContainer(t),
 		relayerChainInterops: &chainlinkMocks.FakeRelayerChainInteroperators{},
-		ethClient:            evmClientMocks.NewClient(t),
-		eIMgr:                webhookmocks.NewExternalInitiatorManager(t),
-		balM:                 evmORMMocks.NewBalanceMonitor(t),
+		ethClient:            clienttest.NewClient(t),
+		balM:                 evmMonMocks.NewBalanceMonitor(t),
 		txmStore:             evmtxmgrmocks.NewEvmTxStore(t),
 		auditLogger:          &audit.AuditLoggerService{},
 	}
@@ -128,7 +132,6 @@ func setupFramework(t *testing.T) *gqlTestFramework {
 		t:          t,
 		App:        app,
 		RootSchema: rootSchema,
-		Ctx:        ctx,
 		Mocks:      m,
 	}
 
@@ -146,22 +149,20 @@ func (f *gqlTestFramework) Timestamp() time.Time {
 	return time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
 }
 
-// injectAuthenticatedUser injects a session into the request context
-func (f *gqlTestFramework) injectAuthenticatedUser() {
-	f.t.Helper()
-
+// withAuthenticatedUser injects a session into the request context
+func (f *gqlTestFramework) withAuthenticatedUser(ctx context.Context) context.Context {
 	user := clsessions.User{Email: "gqltester@chain.link", Role: clsessions.UserRoleAdmin}
 
-	f.Ctx = auth.SetGQLAuthenticatedSession(f.Ctx, user, "gqltesterSession")
+	return auth.WithGQLAuthenticatedSession(ctx, user, "gqltesterSession")
 }
 
 // GQLTestCase represents a single GQL request test.
 type GQLTestCase struct {
 	name          string
 	authenticated bool
-	before        func(*gqlTestFramework)
+	before        func(context.Context, *gqlTestFramework)
 	query         string
-	variables     map[string]interface{}
+	variables     map[string]any
 	result        string
 	errors        []*gqlerrors.QueryError
 }
@@ -171,29 +172,27 @@ func RunGQLTests(t *testing.T, testCases []GQLTestCase) {
 	t.Helper()
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			var (
-				f = setupFramework(t)
-			)
+			f := setupFramework(t)
+			ctx := loader.InjectDataloader(t.Context(), f.App)
 
 			if tc.authenticated {
-				f.injectAuthenticatedUser()
+				ctx = f.withAuthenticatedUser(ctx)
 			}
 
 			if tc.before != nil {
-				tc.before(f)
+				tc.before(ctx, f)
 			}
 
 			// This does not print out the correct stack trace as the `RunTest`
-			// function does not call t.Helper(). It insteads displays the file
+			// function does not call t.Helper(). It instead displays the file
 			// and line location of the `gqltesting` package.
 			//
 			// This would need to be fixed upstream.
 			gqltesting.RunTest(t, &gqltesting.Test{
-				Context:        f.Ctx,
+				Context:        ctx,
 				Schema:         f.RootSchema,
 				Query:          tc.query,
 				Variables:      tc.variables,
@@ -208,7 +207,7 @@ func RunGQLTests(t *testing.T, testCases []GQLTestCase) {
 // case.
 //
 // The paths will be the query/mutation definition name
-func unauthorizedTestCase(tc GQLTestCase, paths ...interface{}) GQLTestCase {
+func unauthorizedTestCase(tc GQLTestCase, paths ...any) GQLTestCase {
 	tc.name = "not authorized"
 	tc.authenticated = false
 	tc.result = "null"
@@ -217,7 +216,7 @@ func unauthorizedTestCase(tc GQLTestCase, paths ...interface{}) GQLTestCase {
 			ResolverError: unauthorizedError{},
 			Path:          paths,
 			Message:       "Unauthorized",
-			Extensions: map[string]interface{}{
+			Extensions: map[string]any{
 				"code": "UNAUTHORIZED",
 			},
 		},

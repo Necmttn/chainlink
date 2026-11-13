@@ -2,31 +2,36 @@ package evm
 
 import (
 	"github.com/smartcontractkit/chainlink-common/pkg/loop"
-
-	"github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm"
+	"github.com/smartcontractkit/chainlink-common/pkg/types"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
+	evmrelay "github.com/smartcontractkit/chainlink-evm/pkg/relay"
 	"github.com/smartcontractkit/chainlink/v2/core/services/relay"
 )
 
-//go:generate mockery --quiet --name LoopRelayAdapter --output ./mocks/ --case=underscore
-type LoopRelayAdapter interface {
+// RelayAdapter extends loop.Relayer with a method for accessing the internal legacy chain type.
+// Only available in embedded mode, not LOOPP mode.
+type RelayAdapter interface {
 	loop.Relayer
-	Chain() legacyevm.Chain
+	Chain() types.ChainService
 }
-type LoopRelayer struct {
+type relayAdapter struct {
 	loop.Relayer
-	ext EVMChainRelayerExtender
+	chain types.ChainService
 }
 
-var _ loop.Relayer = &LoopRelayer{}
+var _ RelayAdapter = &relayAdapter{}
 
-func NewLoopRelayServerAdapter(r *Relayer, cs EVMChainRelayerExtender) *LoopRelayer {
-	ra := relay.NewServerAdapter(r, cs)
-	return &LoopRelayer{
-		Relayer: ra,
-		ext:     cs,
+func NewLOOPAdapter(r loop.Relayer) *relayAdapter {
+	return &relayAdapter{Relayer: r, chain: r}
+}
+
+func NewLegacyAdapter(r *evmrelay.Relayer, chain legacyevm.Chain) *relayAdapter {
+	return &relayAdapter{
+		Relayer: relay.NewServerAdapter(r),
+		chain:   chain,
 	}
 }
 
-func (la *LoopRelayer) Chain() legacyevm.Chain {
-	return la.ext.Chain()
+func (la *relayAdapter) Chain() types.ChainService {
+	return la.chain
 }

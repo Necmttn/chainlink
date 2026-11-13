@@ -8,26 +8,43 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/smartcontractkit/chainlink-common/pkg/utils/tests"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services"
 )
 
-func TestNewInBackupHealthReport(t *testing.T) {
+func TestNewStartUpHealthReport(t *testing.T) {
 	lggr, observed := logger.TestLoggerObserved(t, zapcore.InfoLevel)
-	ibhr := services.NewInBackupHealthReport(1234, lggr)
+	ibhr := services.NewStartUpHealthReport(1234, lggr)
 
-	ibhr.Start()
-	require.Eventually(t, func() bool { return observed.Len() >= 1 }, time.Second*5, time.Millisecond*100)
-	require.Equal(t, "Starting InBackupHealthReport", observed.TakeAll()[0].Message)
+	func() {
+		ibhr.Start()
+		defer ibhr.Stop()
+		require.Eventually(t, func() bool { return observed.Len() >= 1 }, time.Second*5, time.Millisecond*100)
+		require.Equal(t, "Starting StartUpHealthReport", observed.TakeAll()[0].Message)
 
-	req, err := http.NewRequestWithContext(tests.Context(t), "GET", "http://localhost:1234/health", nil)
-	require.NoError(t, err)
-	res, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	require.Equal(t, http.StatusNoContent, res.StatusCode)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost:1234/health", nil)
+		require.NoError(t, err)
+		res, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		defer res.Body.Close()
+		require.Equal(t, http.StatusNoContent, res.StatusCode)
+
+		req, err = http.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost:1234/", nil)
+		require.NoError(t, err)
+		res, err = http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		defer res.Body.Close()
+		require.Equal(t, http.StatusServiceUnavailable, res.StatusCode)
+
+		req, err = http.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost:1234/unknown", nil)
+		require.NoError(t, err)
+		res, err = http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		defer res.Body.Close()
+		require.Equal(t, http.StatusServiceUnavailable, res.StatusCode)
+	}()
 
 	ibhr.Stop()
 	require.Eventually(t, func() bool { return observed.Len() >= 1 }, time.Second*5, time.Millisecond*100)
-	require.Equal(t, "InBackupHealthReport shutdown complete", observed.TakeAll()[0].Message)
+	require.Equal(t, "StartUpHealthReport shutdown complete", observed.TakeAll()[0].Message)
 }

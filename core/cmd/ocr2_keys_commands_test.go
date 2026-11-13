@@ -11,11 +11,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli"
 
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ocr2key"
 	"github.com/smartcontractkit/chainlink-common/pkg/utils"
 	"github.com/smartcontractkit/chainlink/v2/core/cmd"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ocr2key"
 	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 )
 
@@ -32,7 +32,7 @@ func TestOCR2KeyBundlePresenter_RenderTable(t *testing.T) {
 	pubKeyConfig := key.ConfigEncryptionPublicKey()
 	pubKey := key.OffchainPublicKey()
 	p := cmd.OCR2KeyBundlePresenter{
-		JAID: cmd.JAID{ID: bundleID},
+		JAID: cmd.NewJAID(bundleID),
 		OCR2KeysBundleResource: presenters.OCR2KeysBundleResource{
 			JAID:              presenters.NewJAID(key.ID()),
 			ChainType:         "evm",
@@ -71,23 +71,25 @@ func TestShell_OCR2Keys(t *testing.T) {
 	app := startNewApplicationV2(t, nil)
 	ks := app.GetKeyStore().OCR2()
 	cleanup := func() {
+		ctx := t.Context()
 		keys, err := app.GetKeyStore().OCR2().GetAll()
 		require.NoError(t, err)
 		for _, key := range keys {
-			require.NoError(t, ks.Delete(key.ID()))
+			require.NoError(t, ks.Delete(ctx, key.ID()))
 		}
 		requireOCR2KeyCount(t, app, 0)
 	}
 
 	t.Run("ListOCR2KeyBundles", func(tt *testing.T) {
 		defer cleanup()
+		ctx := t.Context()
 		client, r := app.NewShellAndRenderer()
 
-		key, err := app.GetKeyStore().OCR2().Create("evm")
+		key, err := app.GetKeyStore().OCR2().Create(ctx, "evm")
 		require.NoError(t, err)
 		requireOCR2KeyCount(t, app, 1)
-		assert.Nil(t, client.ListOCR2KeyBundles(cltest.EmptyCLIContext()))
-		require.Equal(t, 1, len(r.Renders))
+		require.NoError(t, client.ListOCR2KeyBundles(cltest.EmptyCLIContext()))
+		require.Len(t, r.Renders, 1)
 		output := *r.Renders[0].(*cmd.OCR2KeyBundlePresenters)
 		require.Equal(t, key.ID(), output[0].ID)
 	})
@@ -106,16 +108,17 @@ func TestShell_OCR2Keys(t *testing.T) {
 		keys, err := app.GetKeyStore().OCR2().GetAll()
 		require.NoError(t, err)
 		require.Len(t, keys, 1)
-		require.Equal(t, 1, len(r.Renders))
+		require.Len(t, r.Renders, 1)
 		output := (*r.Renders[0].(*cmd.OCR2KeyBundlePresenter))
 		require.Equal(t, output.ID, keys[0].ID())
 	})
 
 	t.Run("DeleteOCR2KeyBundle", func(tt *testing.T) {
 		defer cleanup()
+		ctx := t.Context()
 		client, r := app.NewShellAndRenderer()
 
-		key, err := app.GetKeyStore().OCR2().Create("evm")
+		key, err := app.GetKeyStore().OCR2().Create(ctx, "evm")
 		require.NoError(t, err)
 		requireOCR2KeyCount(t, app, 1)
 		set := flag.NewFlagSet("test", 0)
@@ -127,18 +130,18 @@ func TestShell_OCR2Keys(t *testing.T) {
 		c := cli.NewContext(nil, set, nil)
 		require.NoError(t, client.DeleteOCR2KeyBundle(c))
 		requireOCR2KeyCount(t, app, 0)
-		require.Equal(t, 1, len(r.Renders))
+		require.Len(t, r.Renders, 1)
 		output := *r.Renders[0].(*cmd.OCR2KeyBundlePresenter)
 		assert.Equal(t, key.ID(), output.ID)
-
 	})
 
 	t.Run("ImportExportOCR2Key", func(tt *testing.T) {
 		defer cleanup()
 		defer deleteKeyExportFile(t)
+		ctx := t.Context()
 		client, _ := app.NewShellAndRenderer()
 
-		err := app.KeyStore.OCR2().Add(cltest.DefaultOCR2Key)
+		err := app.KeyStore.OCR2().Add(ctx, cltest.DefaultOCR2Key)
 		require.NoError(t, err)
 
 		keys := requireOCR2KeyCount(t, app, 1)
@@ -171,7 +174,7 @@ func TestShell_OCR2Keys(t *testing.T) {
 		require.NoError(t, client.ExportOCR2Key(c))
 		require.NoError(t, utils.JustError(os.Stat(keyName)))
 
-		require.NoError(t, app.GetKeyStore().OCR2().Delete(key.ID()))
+		require.NoError(t, app.GetKeyStore().OCR2().Delete(ctx, key.ID()))
 		requireOCR2KeyCount(t, app, 0)
 
 		set = flag.NewFlagSet("test OCR2 import", 0)

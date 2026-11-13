@@ -2,12 +2,12 @@ package pipeline
 
 import (
 	"context"
+	stderrors "errors"
 
 	"github.com/pkg/errors"
 	"github.com/shopspring/decimal"
-	"go.uber.org/multierr"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 )
 
 // Return types:
@@ -26,7 +26,7 @@ func (t *MeanTask) Type() TaskType {
 	return TaskTypeMean
 }
 
-func (t *MeanTask) Run(ctx context.Context, lggr logger.Logger, vars Vars, inputs []Result) (result Result, runInfo RunInfo) {
+func (t *MeanTask) Run(_ context.Context, _ logger.Logger, vars Vars, inputs []Result) (result Result, runInfo RunInfo) {
 	var (
 		maybeAllowedFaults MaybeUint64Param
 		maybePrecision     MaybeInt32Param
@@ -35,7 +35,7 @@ func (t *MeanTask) Run(ctx context.Context, lggr logger.Logger, vars Vars, input
 		allowedFaults      int
 		faults             int
 	)
-	err := multierr.Combine(
+	err := stderrors.Join(
 		errors.Wrap(ResolveParam(&maybeAllowedFaults, From(t.AllowedFaults)), "allowedFaults"),
 		errors.Wrap(ResolveParam(&maybePrecision, From(VarExpr(t.Precision, vars), t.Precision)), "precision"),
 		errors.Wrap(ResolveParam(&valuesAndErrs, From(VarExpr(t.Values, vars), JSONWithVarExprs(t.Values, vars, true), Inputs(inputs))), "values"),
@@ -45,7 +45,7 @@ func (t *MeanTask) Run(ctx context.Context, lggr logger.Logger, vars Vars, input
 	}
 
 	if allowed, isSet := maybeAllowedFaults.Uint64(); isSet {
-		allowedFaults = int(allowed)
+		allowedFaults = int(allowed) //nolint:gosec // G115
 	} else {
 		allowedFaults = len(valuesAndErrs) - 1
 	}

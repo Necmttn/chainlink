@@ -1,15 +1,17 @@
 package resolver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/big"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/p2pkey"
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/p2pkey"
 )
 
 func TestResolver_GetP2PKeys(t *testing.T) {
@@ -27,9 +29,9 @@ func TestResolver_GetP2PKeys(t *testing.T) {
 		}
 	`
 
-	fakeKeys := []p2pkey.KeyV2{}
-	expectedKeys := []map[string]string{}
-	for i := 0; i < 2; i++ {
+	fakeKeys := make([]p2pkey.KeyV2, 0, 2)
+	expectedKeys := make([]map[string]string, 0, 2)
+	for range 2 {
 		k := p2pkey.MustNewV2XXXTestingOnly(big.NewInt(1))
 		fakeKeys = append(fakeKeys, k)
 		expectedKeys = append(expectedKeys, map[string]string{
@@ -39,12 +41,12 @@ func TestResolver_GetP2PKeys(t *testing.T) {
 		})
 	}
 
-	d, err := json.Marshal(map[string]interface{}{
-		"p2pKeys": map[string]interface{}{
+	d, err := json.Marshal(map[string]any{
+		"p2pKeys": map[string]any{
 			"results": expectedKeys,
 		},
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	expected := string(d)
 
 	testCases := []GQLTestCase{
@@ -52,7 +54,7 @@ func TestResolver_GetP2PKeys(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.Mocks.p2p.On("GetAll").Return(fakeKeys, nil)
 				f.Mocks.keystore.On("P2P").Return(f.Mocks.p2p)
 				f.App.On("GetKeyStore").Return(f.Mocks.keystore)
@@ -84,16 +86,16 @@ func TestResolver_CreateP2PKey(t *testing.T) {
 
 	fakeKey := p2pkey.MustNewV2XXXTestingOnly(big.NewInt(1))
 
-	d, err := json.Marshal(map[string]interface{}{
-		"createP2PKey": map[string]interface{}{
-			"p2pKey": map[string]interface{}{
+	d, err := json.Marshal(map[string]any{
+		"createP2PKey": map[string]any{
+			"p2pKey": map[string]any{
 				"id":        fakeKey.ID(),
 				"peerID":    fakeKey.PeerID().String(),
 				"publicKey": fakeKey.PublicKeyHex(),
 			},
 		},
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	expected := string(d)
 
 	testCases := []GQLTestCase{
@@ -101,8 +103,8 @@ func TestResolver_CreateP2PKey(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.Mocks.p2p.On("Create").Return(fakeKey, nil)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.Mocks.p2p.On("Create", mock.Anything).Return(fakeKey, nil)
 				f.Mocks.keystore.On("P2P").Return(f.Mocks.p2p)
 				f.App.On("GetKeyStore").Return(f.Mocks.keystore)
 			},
@@ -138,23 +140,23 @@ func TestResolver_DeleteP2PKey(t *testing.T) {
 		}
 	`
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"id": fakeKey.ID(),
 	}
 
 	peerID, err := p2pkey.MakePeerID(fakeKey.ID())
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	d, err := json.Marshal(map[string]interface{}{
-		"deleteP2PKey": map[string]interface{}{
-			"p2pKey": map[string]interface{}{
+	d, err := json.Marshal(map[string]any{
+		"deleteP2PKey": map[string]any{
+			"p2pKey": map[string]any{
 				"id":        fakeKey.ID(),
 				"peerID":    fakeKey.PeerID().String(),
 				"publicKey": fakeKey.PublicKeyHex(),
 			},
 		},
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	expected := string(d)
 
 	testCases := []GQLTestCase{
@@ -162,8 +164,8 @@ func TestResolver_DeleteP2PKey(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.Mocks.p2p.On("Delete", peerID).Return(fakeKey, nil)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.Mocks.p2p.On("Delete", mock.Anything, peerID).Return(fakeKey, nil)
 				f.Mocks.keystore.On("P2P").Return(f.Mocks.p2p)
 				f.App.On("GetKeyStore").Return(f.Mocks.keystore)
 			},
@@ -174,9 +176,9 @@ func TestResolver_DeleteP2PKey(t *testing.T) {
 		{
 			name:          "not found error",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.Mocks.p2p.
-					On("Delete", peerID).
+					On("Delete", mock.Anything, peerID).
 					Return(
 						p2pkey.KeyV2{},
 						keystore.KeyNotFoundError{ID: peerID.String(), KeyType: "P2P"},

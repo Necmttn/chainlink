@@ -10,11 +10,11 @@ import (
 	"time"
 
 	"github.com/mitchellh/go-homedir"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 	"go.uber.org/zap/zapcore"
 
 	commonassets "github.com/smartcontractkit/chainlink-common/pkg/assets"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/assets"
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
 	"github.com/smartcontractkit/chainlink/v2/core/static"
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
 )
@@ -63,17 +63,17 @@ func F32(s string) (float32, error) {
 }
 
 // URL converts string to parsed URL type
-func URL(s string) (interface{}, error) {
+func URL(s string) (any, error) {
 	return url.Parse(s)
 }
 
 // IP converts string to parsed IP type
-func IP(s string) (interface{}, error) {
+func IP(s string) (any, error) {
 	return net.ParseIP(s), nil
 }
 
 // Duration converts string to parsed Duratin type
-func Duration(s string) (interface{}, error) {
+func Duration(s string) (any, error) {
 	return time.ParseDuration(s)
 }
 
@@ -84,7 +84,7 @@ func FileSize(s string) (utils.FileSize, error) {
 }
 
 // Bool parses string as a bool type
-func Bool(s string) (interface{}, error) {
+func Bool(s string) (any, error) {
 	return strconv.ParseBool(s)
 }
 
@@ -113,7 +113,7 @@ func HomeDir(str string) (string, error) {
 func DatabaseURL(s string) (url.URL, error) {
 	uri, err := url.Parse(s)
 	if err != nil {
-		return url.URL{}, errors.Wrapf(err, "invalid database url %s", s)
+		return url.URL{}, pkgerrors.Wrapf(err, "invalid database url %s", s)
 	}
 	if uri.String() == "" {
 		return *uri, nil

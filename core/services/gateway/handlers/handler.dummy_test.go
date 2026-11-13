@@ -2,15 +2,22 @@ package handlers_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/stretchr/testify/require"
 
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	jsonrpc "github.com/smartcontractkit/chainlink-common/pkg/jsonrpc2"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/api"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/config"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/handlers"
+	hc "github.com/smartcontractkit/chainlink/v2/core/services/gateway/handlers/common"
+)
+
+const (
+	privateKey = "6c358b4f16344f03cfce12ebf7b768301bbe6a8977c98a2a2d76699f8bc56161"
 )
 
 type testConnManager struct {
@@ -18,11 +25,11 @@ type testConnManager struct {
 	sendCounter int
 }
 
-func (m *testConnManager) SetHandler(handler handlers.Handler) {
+func (m *testConnManager) SetHandler(_ string, handler handlers.Handler) {
 	m.handler = handler
 }
 
-func (m *testConnManager) SendToNode(ctx context.Context, nodeAddress string, msg *api.Message) error {
+func (m *testConnManager) SendToNode(ctx context.Context, nodeAddress string, resp *jsonrpc.Request[json.RawMessage]) error {
 	m.sendCounter++
 	return nil
 }
@@ -30,29 +37,56 @@ func (m *testConnManager) SendToNode(ctx context.Context, nodeAddress string, ms
 func TestDummyHandler_BasicFlow(t *testing.T) {
 	t.Parallel()
 
-	config := config.DONConfig{
-		Members: []config.NodeConfig{
-			{Name: "node one", Address: "addr_1"},
-			{Name: "node two", Address: "addr_2"},
+	shardedDONs := []config.ShardedDONConfig{
+		{
+			DonName: "test_don",
+			Shards: []config.Shard{
+				{
+					Nodes: []config.NodeConfig{
+						{Name: "node one", Address: "addr_1"},
+						{Name: "node two", Address: "addr_2"},
+					},
+				},
+			},
 		},
 	}
 
 	connMgr := testConnManager{}
-	handler, err := handlers.NewDummyHandler(&config, &connMgr, logger.TestLogger(t))
+	dons, err := handlers.NewShardedDONs(shardedDONs, [][]handlers.DON{{&connMgr}})
 	require.NoError(t, err)
-	connMgr.SetHandler(handler)
+	handler, err := handlers.NewDummyHandler(dons, logger.Test(t))
+	require.NoError(t, err)
+	connMgr.SetHandler("", handler)
 
-	ctx := testutils.Context(t)
+	ctx := t.Context()
 
 	// User request
-	msg := api.Message{Body: api.MessageBody{MessageId: "1234"}}
-	callbackCh := make(chan handlers.UserCallbackPayload, 1)
-	require.NoError(t, handler.HandleUserMessage(ctx, &msg, callbackCh))
+	msg := api.Message{
+		Body: api.MessageBody{
+			MessageID: "1234",
+			Method:    "testMethod",
+			DonID:     "test_don",
+		},
+	}
+	key, err := crypto.HexToECDSA(privateKey)
+	require.NoError(t, err)
+	err = msg.Sign(key)
+	require.NoError(t, err)
+	err = msg.Validate()
+	require.NoError(t, err)
+	cb := hc.NewCallback()
+	require.NoError(t, handler.HandleLegacyUserMessage(ctx, &msg, cb))
 	require.Equal(t, 2, connMgr.sendCounter)
 
 	// Responses from both nodes
-	require.NoError(t, handler.HandleNodeMessage(ctx, &msg, "addr_1"))
-	require.NoError(t, handler.HandleNodeMessage(ctx, &msg, "addr_2"))
-	response := <-callbackCh
-	require.Equal(t, "1234", response.Msg.Body.MessageId)
+	resp, err := hc.ValidatedResponseFromMessage(&msg)
+	require.NoError(t, err)
+	require.NoError(t, handler.HandleNodeMessage(ctx, resp, msg.Body.Sender))
+	require.NoError(t, handler.HandleNodeMessage(ctx, resp, msg.Body.Sender))
+	response, err := cb.Wait(t.Context())
+	require.NoError(t, err)
+	codec := api.JSONRPCCodec{}
+	responseMsg, err := codec.DecodeLegacyResponse(response.RawResponse)
+	require.NoError(t, err)
+	require.Equal(t, "1234", responseMsg.Body.MessageID)
 }

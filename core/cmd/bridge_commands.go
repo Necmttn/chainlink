@@ -5,7 +5,6 @@ import (
 	"strconv"
 
 	"github.com/urfave/cli"
-	"go.uber.org/multierr"
 
 	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 )
@@ -53,14 +52,15 @@ func (p *BridgePresenter) FriendlyConfirmations() string {
 // RenderTable implements TableRenderer
 func (p *BridgePresenter) RenderTable(rt RendererTable) error {
 	table := rt.newTable([]string{"Name", "URL", "Default Confirmations", "Outgoing Token"})
-	table.Append([]string{
+	if err := table.Append([]string{
 		p.Name,
 		p.URL,
 		p.FriendlyConfirmations(),
 		p.OutgoingToken,
-	})
-	render("Bridge", table)
-	return nil
+	}); err != nil {
+		return err
+	}
+	return render("Bridge", table)
 }
 
 type BridgePresenters []BridgePresenter
@@ -69,15 +69,16 @@ type BridgePresenters []BridgePresenter
 func (ps BridgePresenters) RenderTable(rt RendererTable) error {
 	table := rt.newTable([]string{"Name", "URL", "Confirmations"})
 	for _, p := range ps {
-		table.Append([]string{
+		if err := table.Append([]string{
 			p.Name,
 			p.URL,
 			p.FriendlyConfirmations(),
-		})
+		}); err != nil {
+			return err
+		}
 	}
 
-	render("Bridges", table)
-	return nil
+	return render("Bridges", table)
 }
 
 // IndexBridges returns all bridges.
@@ -97,7 +98,7 @@ func (s *Shell) ShowBridge(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = errors.Join(err, cerr)
 		}
 	}()
 
@@ -121,7 +122,30 @@ func (s *Shell) CreateBridge(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = errors.Join(err, cerr)
+		}
+	}()
+
+	return s.renderAPIResponse(resp, &BridgePresenter{})
+}
+
+func (s *Shell) UpdateBridge(c *cli.Context) (err error) {
+	if !c.Args().Present() {
+		return s.errorOut(errors.New("must pass the name of the bridge to be updated"))
+	}
+	bridgeName := c.Args().First()
+	buf, err := getBufferFromJSON(c.Args().Get(1))
+	if err != nil {
+		return s.errorOut(err)
+	}
+
+	resp, err := s.HTTP.Patch(s.ctx(), "/v2/bridge_types/"+bridgeName, buf)
+	if err != nil {
+		return s.errorOut(err)
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
 		}
 	}()
 
@@ -140,7 +164,7 @@ func (s *Shell) RemoveBridge(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = errors.Join(err, cerr)
 		}
 	}()
 

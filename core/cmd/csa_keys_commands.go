@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,7 +11,6 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
-	"go.uber.org/multierr"
 
 	cutils "github.com/smartcontractkit/chainlink-common/pkg/utils"
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
@@ -93,7 +93,7 @@ type CSAKeyPresenters []CSAKeyPresenter
 // RenderTable implements TableRenderer
 func (ps CSAKeyPresenters) RenderTable(rt RendererTable) error {
 	headers := []string{"Public key"}
-	rows := [][]string{}
+	rows := make([][]string, 0, len(ps))
 
 	for _, p := range ps {
 		rows = append(rows, p.ToRow())
@@ -114,7 +114,7 @@ func (s *Shell) ListCSAKeys(_ *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -129,7 +129,7 @@ func (s *Shell) CreateCSAKey(_ *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -157,21 +157,21 @@ func (s *Shell) ImportCSAKey(c *cli.Context) (err error) {
 		return s.errorOut(err)
 	}
 
-	exportUrl := url.URL{
+	exportURL := url.URL{
 		Path: "/v2/keys/csa/import",
 	}
 
-	query := exportUrl.Query()
+	query := exportURL.Query()
 	query.Set("oldpassword", normalizePassword(string(oldPassword)))
 
-	exportUrl.RawQuery = query.Encode()
-	resp, err := s.HTTP.Post(s.ctx(), exportUrl.String(), bytes.NewReader(keyJSON))
+	exportURL.RawQuery = query.Encode()
+	resp, err := s.HTTP.Post(s.ctx(), exportURL.String(), bytes.NewReader(keyJSON))
 	if err != nil {
 		return s.errorOut(err)
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -200,21 +200,21 @@ func (s *Shell) ExportCSAKey(c *cli.Context) (err error) {
 	}
 
 	ID := c.Args().Get(0)
-	exportUrl := url.URL{
+	exportURL := url.URL{
 		Path: "/v2/keys/csa/export/" + ID,
 	}
 
-	query := exportUrl.Query()
+	query := exportURL.Query()
 	query.Set("newpassword", normalizePassword(string(newPassword)))
 
-	exportUrl.RawQuery = query.Encode()
-	resp, err := s.HTTP.Post(s.ctx(), exportUrl.String(), nil)
+	exportURL.RawQuery = query.Encode()
+	resp, err := s.HTTP.Post(s.ctx(), exportURL.String(), nil)
 	if err != nil {
 		return s.errorOut(errors.Wrap(err, "Could not make HTTP request"))
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -232,7 +232,7 @@ func (s *Shell) ExportCSAKey(c *cli.Context) (err error) {
 		return s.errorOut(errors.Wrapf(err, "Could not write %v", filepath))
 	}
 
-	_, err = os.Stderr.WriteString(fmt.Sprintf("🔑 Exported P2P key %s to %s\n", ID, filepath))
+	_, err = fmt.Fprintf(os.Stderr, "🔑 Exported P2P key %s to %s\n", ID, filepath)
 	if err != nil {
 		return s.errorOut(err)
 	}

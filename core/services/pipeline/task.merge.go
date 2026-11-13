@@ -2,11 +2,12 @@ package pipeline
 
 import (
 	"context"
+	stderrors "errors"
+	"maps"
 
 	"github.com/pkg/errors"
-	"go.uber.org/multierr"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 )
 
 // Return types:
@@ -34,7 +35,7 @@ func (t *MergeTask) Run(_ context.Context, _ logger.Logger, vars Vars, inputs []
 		lMap MapParam
 		rMap MapParam
 	)
-	err = multierr.Combine(
+	err = stderrors.Join(
 		errors.Wrap(ResolveParam(&lMap, From(VarExpr(t.Left, vars), JSONWithVarExprs(t.Left, vars, false), Input(inputs, 0))), "left-side"),
 		errors.Wrap(ResolveParam(&rMap, From(VarExpr(t.Right, vars), JSONWithVarExprs(t.Right, vars, false))), "right-side"),
 	)
@@ -44,9 +45,7 @@ func (t *MergeTask) Run(_ context.Context, _ logger.Logger, vars Vars, inputs []
 
 	// clobber lMap with rMap values
 	// "nil" values on the right will clobber
-	for key, value := range rMap {
-		lMap[key] = value
-	}
+	maps.Copy(lMap, rMap)
 
 	return Result{Value: lMap.Map()}, runInfo
 }

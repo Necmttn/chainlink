@@ -3,11 +3,11 @@ package web
 import (
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
 )
 
@@ -46,32 +46,34 @@ func (bdc *ReplayController) ReplayFromBlock(c *gin.Context) {
 		return
 	}
 
-	chain, err := getChain(bdc.App.GetRelayers().LegacyEVMChains(), c.Query("evmChainID"))
-	if err != nil {
-		if errors.Is(err, ErrInvalidChainID) || errors.Is(err, ErrMultipleChains) || errors.Is(err, ErrMissingChainID) {
-			jsonAPIError(c, http.StatusUnprocessableEntity, err)
-			return
-		}
-		jsonAPIError(c, http.StatusInternalServerError, err)
+	chainFamily := c.Query("family")
+	if chainFamily == "" {
+		jsonAPIError(c, http.StatusUnprocessableEntity, errors.New("chain family was not provided"))
 		return
 	}
-	chainID := chain.ID()
 
-	if err := bdc.App.ReplayFromBlock(chainID, uint64(blockNumber), force); err != nil {
+	chainID := c.Query("ChainID")
+	if strings.TrimSpace(chainID) == "" {
+		jsonAPIError(c, http.StatusUnprocessableEntity, errors.New("chain-id was not provided"))
+		return
+	}
+
+	ctx := c.Request.Context()
+	if err := bdc.App.ReplayFromBlock(ctx, chainFamily, chainID, uint64(blockNumber), force); err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
 	response := ReplayResponse{
-		Message:    "Replay started",
-		EVMChainID: big.New(chainID),
+		Message: "Replay started",
+		ChainID: chainID,
 	}
 	jsonAPIResponse(c, &response, "response")
 }
 
 type ReplayResponse struct {
-	Message    string   `json:"message"`
-	EVMChainID *big.Big `json:"evmChainID"`
+	Message string `json:"message"`
+	ChainID string `json:"ChainID"`
 }
 
 // GetID returns the jsonapi ID.

@@ -1,0 +1,252 @@
+package events_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/beholder/beholdertest"
+	pb "github.com/smartcontractkit/chainlink-protos/workflows/go/events"
+	eventsv2 "github.com/smartcontractkit/chainlink-protos/workflows/go/v2"
+	"github.com/smartcontractkit/chainlink/v2/core/platform"
+	"github.com/smartcontractkit/chainlink/v2/core/services/workflows/events"
+)
+
+func TestEmit(t *testing.T) {
+	t.Parallel()
+
+	triggerID := "trigger_" + uuid.NewString()
+	executionID := "execution_" + uuid.NewString()
+	capabilityID := "capability_" + uuid.NewString()
+	stepRef := "step"
+	labels := map[string]string{
+		platform.KeyWorkflowOwner: "owner",
+	}
+
+	t.Run(events.WorkflowExecutionStarted, func(t *testing.T) {
+		t.Parallel()
+
+		rec := beholdertest.NewRecorder()
+		e := events.NewEmitter(rec, events.WithNoDurableEmit())
+		require.NoError(t, e.EmitExecutionStartedEvent(t.Context(), labels, triggerID, executionID))
+		require.Len(t, labels, 1)
+
+		msgs := rec.Messages(t, "beholder_entity", "workflows.v2."+events.WorkflowExecutionStarted)
+		require.Len(t, msgs, 1)
+
+		var got eventsv2.WorkflowExecutionStarted
+
+		require.NoError(t, proto.Unmarshal(msgs[0].Body, &got))
+		assert.Equal(t, executionID, got.WorkflowExecutionID)
+	})
+
+	t.Run(events.WorkflowExecutionFinished, func(t *testing.T) {
+		t.Parallel()
+
+		rec := beholdertest.NewRecorder()
+		e := events.NewEmitter(rec, events.WithNoDurableEmit())
+		require.NoError(t, e.EmitExecutionFinishedEvent(t.Context(), labels, "status", executionID, nil, events.ErrorClassificationUnspecified, nil))
+		require.Len(t, labels, 1)
+
+		msgs := rec.Messages(t, "beholder_entity", "workflows.v2."+events.WorkflowExecutionFinished)
+		require.Len(t, msgs, 1)
+
+		var got eventsv2.WorkflowExecutionFinished
+
+		require.NoError(t, proto.Unmarshal(msgs[0].Body, &got))
+		assert.Equal(t, executionID, got.WorkflowExecutionID)
+	})
+
+	t.Run(events.WorkflowExecutionFinished+"_with_error", func(t *testing.T) {
+		t.Parallel()
+
+		rec := beholdertest.NewRecorder()
+		e := events.NewEmitter(rec, events.WithNoDurableEmit())
+		testErr := errors.New("something went wrong")
+		require.NoError(t, e.EmitExecutionFinishedEvent(t.Context(), labels, "errored", executionID, testErr, events.ErrorClassificationSystem, nil))
+
+		v2Msgs := rec.Messages(t, "beholder_entity", "workflows.v2."+events.WorkflowExecutionFinished)
+		require.NotEmpty(t, v2Msgs)
+
+		// Check the latest v2 message contains the error
+		var v2Event eventsv2.WorkflowExecutionFinished
+		require.NoError(t, proto.Unmarshal(v2Msgs[len(v2Msgs)-1].Body, &v2Event))
+		assert.Equal(t, "something went wrong", v2Event.Error)
+		assert.Equal(t, eventsv2.ExecutionStatus_EXECUTION_STATUS_FAILED, v2Event.Status)
+		assert.Equal(t, eventsv2.ClassifiedExecutionStatus_CLASSIFIED_EXECUTION_STATUS_SYSTEM_ERROR, v2Event.ClassifiedStatus)
+	})
+
+	t.Run(events.CapabilityExecutionStarted, func(t *testing.T) {
+		t.Parallel()
+
+		rec := beholdertest.NewRecorder()
+		e := events.NewEmitter(rec, events.WithNoDurableEmit())
+		require.NoError(t, e.EmitCapabilityStartedEvent(t.Context(), labels, executionID, capabilityID, stepRef, "test-method"))
+		require.Len(t, labels, 1)
+
+		msgs := rec.Messages(t, "beholder_entity", "workflows.v2."+events.CapabilityExecutionStarted)
+		require.Len(t, msgs, 1)
+
+		var got eventsv2.CapabilityExecutionStarted
+
+		require.NoError(t, proto.Unmarshal(msgs[0].Body, &got))
+		assert.Equal(t, executionID, got.WorkflowExecutionID)
+	})
+
+	t.Run(events.CapabilityExecutionFinished, func(t *testing.T) {
+		t.Parallel()
+
+		rec := beholdertest.NewRecorder()
+		e := events.NewEmitter(rec, events.WithNoDurableEmit())
+		require.NoError(t, e.EmitCapabilityFinishedEvent(t.Context(), labels, executionID, capabilityID, stepRef, "status", "test-method", nil))
+		require.Len(t, labels, 1)
+
+		msgs := rec.Messages(t, "beholder_entity", "workflows.v2."+events.CapabilityExecutionFinished)
+		require.Len(t, msgs, 1)
+
+		var got eventsv2.CapabilityExecutionFinished
+
+		require.NoError(t, proto.Unmarshal(msgs[0].Body, &got))
+		assert.Equal(t, executionID, got.WorkflowExecutionID)
+	})
+
+	t.Run(events.WorkflowUserLog, func(t *testing.T) {
+		t.Parallel()
+
+		rec := beholdertest.NewRecorder()
+		e := events.NewEmitter(rec, events.WithNoDurableEmit())
+		logLines := []*pb.LogLine{
+			{
+				NodeTimestamp: "2024-01-01T00:00:00Z",
+				Message:       "Test log message",
+			},
+			{
+				NodeTimestamp: "2024-01-01T00:01:00Z",
+				Message:       "Second log message",
+			},
+		}
+		require.NoError(t, e.EmitUserLogs(t.Context(), labels, logLines, executionID))
+		require.Len(t, labels, 1)
+
+		// One event per log line
+		v2Msgs := rec.Messages(t, "beholder_entity", "workflows.v2."+events.WorkflowUserLog)
+		require.Len(t, v2Msgs, 2)
+
+		var msg1 eventsv2.WorkflowUserLog
+		require.NoError(t, proto.Unmarshal(v2Msgs[0].Body, &msg1))
+		assert.Equal(t, executionID, msg1.WorkflowExecutionID)
+		assert.Equal(t, logLines[0].NodeTimestamp, msg1.Timestamp)
+		assert.Equal(t, logLines[0].Message, msg1.Msg)
+		assert.NotNil(t, msg1.CreInfo)
+		assert.NotNil(t, msg1.Workflow)
+
+		var msg2 eventsv2.WorkflowUserLog
+		require.NoError(t, proto.Unmarshal(v2Msgs[1].Body, &msg2))
+		assert.Equal(t, executionID, msg2.WorkflowExecutionID)
+		assert.Equal(t, logLines[1].NodeTimestamp, msg2.Timestamp)
+		assert.Equal(t, logLines[1].Message, msg2.Msg)
+		assert.NotNil(t, msg2.CreInfo)
+		assert.NotNil(t, msg2.Workflow)
+		// Labels not utilized, left unchecked
+	})
+
+	t.Run(events.WorkflowExecutionProfile, func(t *testing.T) {
+		t.Parallel()
+
+		rec := beholdertest.NewRecorder()
+		e := events.NewEmitter(rec, events.WithNoDurableEmit())
+		workflowID := "workflow_" + uuid.NewString()
+		start := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+		end := start.Add(2 * time.Second)
+		stepStart := start.Add(100 * time.Millisecond)
+		stepEnd := start.Add(500 * time.Millisecond)
+		profile, err := e.EmitExecutionProfile(t.Context(), workflowID, executionID, start, end, "completed", []events.ExecutionProfileStepInput{
+			{
+				StepID:       "1",
+				StartTime:    stepStart,
+				EndTime:      stepEnd,
+				CapabilityID: capabilityID,
+			},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, profile)
+
+		msgs := rec.Messages(t, "beholder_entity", "workflows.v2."+events.WorkflowExecutionProfile)
+		require.Len(t, msgs, 1)
+
+		var received eventsv2.ExecutionProfile
+		require.NoError(t, proto.Unmarshal(msgs[0].Body, &received))
+		assert.Equal(t, workflowID, received.WorkflowID)
+		assert.Equal(t, executionID, received.WorkflowExecutionID)
+		assert.Equal(t, "completed", received.Status)
+		require.Len(t, received.Steps, 1)
+		assert.Equal(t, "1", received.Steps[0].StepID)
+		assert.Equal(t, capabilityID, received.Steps[0].CapabilityID)
+		assert.Equal(t, stepStart.UTC().Format(time.RFC3339Nano), received.Steps[0].StartTime)
+		assert.Equal(t, stepEnd.UTC().Format(time.RFC3339Nano), received.Steps[0].EndTime)
+		assert.False(t, received.Steps[0].HasError)
+	})
+}
+
+func TestEmitter_WithDurableEmit(t *testing.T) {
+	t.Parallel()
+
+	rec := beholdertest.NewRecorder()
+	var durableAttrs []any
+	e := events.NewEmitter(rec, events.WithDurableEmit(func(_ context.Context, _ []byte, attrKVs ...any) error {
+		durableAttrs = attrKVs
+		return nil
+	}))
+	require.NoError(t, e.EmitUserMetric(t.Context(), map[string]string{}, &eventsv2.WorkflowUserMetric{}))
+
+	entity := "workflows.v2." + events.WorkflowUserMetric
+	assert.Equal(t, 1, rec.Len(t, "beholder_entity", entity))
+	assert.Equal(t, []any{"source", "platform", "type", entity}, durableAttrs)
+
+	durableErr := errors.New("durable down")
+	e = events.NewEmitter(rec, events.WithDurableEmit(func(context.Context, []byte, ...any) error { return durableErr }))
+	require.ErrorIs(t, e.EmitUserMetric(t.Context(), map[string]string{}, &eventsv2.WorkflowUserMetric{}), durableErr)
+
+	// Nil keeps the default durable emitter without panicking.
+	e = events.NewEmitter(rec, events.WithDurableEmit(nil))
+	require.NoError(t, e.EmitUserMetric(t.Context(), map[string]string{}, &eventsv2.WorkflowUserMetric{}))
+}
+
+func TestEmit_CreInfoShardAndWorkflowDon(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		labels       map[string]string
+		wantDonID    int32
+		wantWorkflow int32
+		wantShardIdx uint32
+	}{
+		{"both set", map[string]string{platform.KeyDonID: "7", platform.KeyWorkflowDonID: "7", platform.KeyShardIndex: "2"}, 7, 7, 2},
+		{"missing labels default to zero", map[string]string{platform.KeyDonID: "7"}, 7, 0, 0},
+		{"invalid values ignored", map[string]string{platform.KeyWorkflowDonID: "x", platform.KeyShardIndex: "-1"}, 0, 0, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := beholdertest.NewRecorder()
+			e := events.NewEmitter(rec, events.WithNoDurableEmit())
+			require.NoError(t, e.EmitCapabilityStartedEvent(t.Context(), tt.labels, "exec", "cap", "step", "method"))
+
+			msgs := rec.Messages(t, "beholder_entity", "workflows.v2.CapabilityExecutionStarted")
+			require.Len(t, msgs, 1)
+			var got eventsv2.CapabilityExecutionStarted
+			require.NoError(t, proto.Unmarshal(msgs[0].Body, &got))
+			assert.Equal(t, tt.wantDonID, got.CreInfo.DonID)
+			assert.Equal(t, tt.wantWorkflow, got.CreInfo.WorkflowDonID)
+			assert.Equal(t, tt.wantShardIdx, got.CreInfo.ShardIndex)
+		})
+	}
+}

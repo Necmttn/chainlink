@@ -3,7 +3,6 @@ package cmd_test
 import (
 	"bytes"
 	"flag"
-	"fmt"
 	"os"
 	"testing"
 
@@ -11,11 +10,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli"
 
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/solkey"
 	"github.com/smartcontractkit/chainlink-common/pkg/utils"
 	"github.com/smartcontractkit/chainlink/v2/core/cmd"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/solkey"
 	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 )
 
@@ -58,25 +57,26 @@ func TestShell_SolanaKeys(t *testing.T) {
 	app := startNewApplicationV2(t, nil)
 	ks := app.GetKeyStore().Solana()
 	cleanup := func() {
+		ctx := t.Context()
 		keys, err := ks.GetAll()
 		require.NoError(t, err)
 		for _, key := range keys {
-			require.NoError(t, utils.JustError(ks.Delete(key.ID())))
+			require.NoError(t, utils.JustError(ks.Delete(ctx, key.ID())))
 		}
 		requireSolanaKeyCount(t, app, 0)
 	}
 
 	t.Run("ListSolanaKeys", func(tt *testing.T) {
 		defer cleanup()
+		ctx := t.Context()
 		client, r := app.NewShellAndRenderer()
-		key, err := app.GetKeyStore().Solana().Create()
+		key, err := app.GetKeyStore().Solana().Create(ctx)
 		require.NoError(t, err)
 		requireSolanaKeyCount(t, app, 1)
-		assert.Nil(t, cmd.NewSolanaKeysClient(client).ListKeys(cltest.EmptyCLIContext()))
-		require.Equal(t, 1, len(r.Renders))
+		require.NoError(t, cmd.NewSolanaKeysClient(client).ListKeys(cltest.EmptyCLIContext()))
+		require.Len(t, r.Renders, 1)
 		keys := *r.Renders[0].(*cmd.SolanaKeyPresenters)
-		assert.True(t, key.PublicKeyStr() == keys[0].PubKey)
-
+		assert.Equal(t, key.PublicKeyStr(), keys[0].PubKey)
 	})
 
 	t.Run("CreateSolanaKey", func(tt *testing.T) {
@@ -90,8 +90,9 @@ func TestShell_SolanaKeys(t *testing.T) {
 
 	t.Run("DeleteSolanaKey", func(tt *testing.T) {
 		defer cleanup()
+		ctx := t.Context()
 		client, _ := app.NewShellAndRenderer()
-		key, err := app.GetKeyStore().Solana().Create()
+		key, err := app.GetKeyStore().Solana().Create(ctx)
 		require.NoError(t, err)
 		requireSolanaKeyCount(t, app, 1)
 		set := flag.NewFlagSet("test", 0)
@@ -111,9 +112,10 @@ func TestShell_SolanaKeys(t *testing.T) {
 	t.Run("ImportExportSolanaKey", func(tt *testing.T) {
 		defer cleanup()
 		defer deleteKeyExportFile(t)
+		ctx := t.Context()
 		client, _ := app.NewShellAndRenderer()
 
-		_, err := app.GetKeyStore().Solana().Create()
+		_, err := app.GetKeyStore().Solana().Create(ctx)
 		require.NoError(t, err)
 
 		keys := requireSolanaKeyCount(t, app, 1)
@@ -137,7 +139,7 @@ func TestShell_SolanaKeys(t *testing.T) {
 		set = flag.NewFlagSet("test Solana export", 0)
 		flagSetApplyFromAction(cmd.NewSolanaKeysClient(client).ExportKey, set, "solana")
 
-		require.NoError(tt, set.Parse([]string{fmt.Sprint(key.ID())}))
+		require.NoError(tt, set.Parse([]string{key.ID()}))
 		require.NoError(tt, set.Set("new-password", "../internal/fixtures/incorrect_password.txt"))
 		require.NoError(tt, set.Set("output", keyName))
 
@@ -146,7 +148,7 @@ func TestShell_SolanaKeys(t *testing.T) {
 		require.NoError(t, cmd.NewSolanaKeysClient(client).ExportKey(c))
 		require.NoError(t, utils.JustError(os.Stat(keyName)))
 
-		require.NoError(t, utils.JustError(app.GetKeyStore().Solana().Delete(key.ID())))
+		require.NoError(t, utils.JustError(app.GetKeyStore().Solana().Delete(ctx, key.ID())))
 		requireSolanaKeyCount(t, app, 0)
 
 		set = flag.NewFlagSet("test Solana import", 0)

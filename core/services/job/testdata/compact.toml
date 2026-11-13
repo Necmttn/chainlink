@@ -10,7 +10,7 @@ contractConfigTrackerPollInterval = '1s'
 contractConfigConfirmations = 1
 pluginType = 'median'
 captureEATelemetry = false
-captureAutomationCustomTelemetry = false
+allowNoBootstrappers = false
 
 [relayConfig]
 chainID = 1337
@@ -23,12 +23,19 @@ contractABI = "[\n  {\n    \"anonymous\": false,\n    \"inputs\": [\n      {\n  
 
 [relayConfig.chainReader.contracts.median.configs]
 LatestRoundRequested = "{\n  \"chainSpecificName\": \"RoundRequested\",\n  \"readType\": \"event\"\n}\n"
-LatestTransmissionDetails = "{\n  \"chainSpecificName\": \"latestTransmissionDetails\",\n  \"outputModifications\": [\n    {\n      \"Fields\": [\n        \"LatestTimestamp_\"\n      ],\n      \"Type\": \"epoch to time\"\n    },\n    {\n      \"Fields\": {\n        \"LatestAnswer_\": \"LatestAnswer\",\n        \"LatestTimestamp_\": \"LatestTimestamp\"\n      },\n      \"Type\": \"rename\"\n    }\n  ]\n}\n"
+LatestTransmissionDetails = "{\n  \"chainSpecificName\": \"latestTransmissionDetails\",\n  \"outputModifications\": [\n    {\n      \"EnablePathTraverse\": false,\n      \"Fields\": [\n        \"LatestTimestamp_\"\n      ],\n      \"Type\": \"epoch to time\"\n    },\n    {\n      \"EnablePathTraverse\": false,\n      \"Fields\": {\n        \"LatestAnswer_\": \"LatestAnswer\",\n        \"LatestTimestamp_\": \"LatestTimestamp\"\n      },\n      \"Type\": \"rename\"\n    }\n  ]\n}\n"
 
 [relayConfig.codec]
 [relayConfig.codec.configs]
 [relayConfig.codec.configs.MedianReport]
 typeABI = "[\n  {\n    \"Name\": \"Timestamp\",\n    \"Type\": \"uint32\"\n  },\n  {\n    \"Name\": \"Observers\",\n    \"Type\": \"bytes32\"\n  },\n  {\n    \"Name\": \"Observations\",\n    \"Type\": \"int192[]\"\n  },\n  {\n    \"Name\": \"JuelsPerFeeCoin\",\n    \"Type\": \"int192\"\n  }\n]\n"
+
+[onchainSigningStrategy]
+strategyName = 'single-chain'
+
+[onchainSigningStrategy.config]
+evm = ''
+publicKey = '0xdeadbeef'
 
 [pluginConfig]
 juelsPerFeeCoinSource = "  // data source 1\n  ds1          [type=bridge name=\"%s\"];\n  ds1_parse    [type=jsonparse path=\"data\"];\n  ds1_multiply [type=multiply times=2];\n\n  // data source 2\n  ds2          [type=http method=GET url=\"%s\"];\n  ds2_parse    [type=jsonparse path=\"data\"];\n  ds2_multiply [type=multiply times=2];\n\n  ds1 -> ds1_parse -> ds1_multiply -> answer1;\n  ds2 -> ds2_parse -> ds2_multiply -> answer1;\n\n  answer1 [type=median index=0];\n"

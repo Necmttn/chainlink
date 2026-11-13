@@ -8,18 +8,26 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/assets"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils"
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
+	"github.com/smartcontractkit/chainlink-evm/pkg/utils"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/services/vrf/vrfcommon"
-	"github.com/smartcontractkit/chainlink/v2/core/services/webhook"
+	"github.com/smartcontractkit/chainlink/v2/core/store/models"
 )
 
 var (
+	CRESettingsSpec = `
+type = "cresettings"
+schemaVersion = 1
+externalJobID = "7dcfa33b-8ed9-4e9f-9216-5b4d3f5c7887"
+hash = "7b9852545d50f9657d63da45789a0147858a67bc1284255209293a573ec4e3d7"
+settings = '''
+Foo = "bar"'''`
 	CronSpecTemplate = `
 type                = "cron"
 schemaVersion       = 1
 schedule            = "CRON_TZ=UTC * 0 0 1 1 *"
-externalJobID       =  "%s"
+externalJobID       = "%s"
 observationSource   = """
 ds          [type=http method=GET url="https://chain.link/ETH-USD"];
 ds_parse    [type=jsonparse path="data,price"];
@@ -31,7 +39,7 @@ ds -> ds_parse -> ds_multiply;
 type                = "cron"
 schemaVersion       = 1
 schedule            = "CRON_TZ=UTC * 0 0 1 1 *"
-externalJobID       =  "%s"
+externalJobID       = "%s"
 observationSource   = """
 ds          [type=http method=GET url="https://chain.link/ETH-USD"];
 ds_parse    [type=jsonparse path="data.price" separator="."];
@@ -39,78 +47,17 @@ ds_multiply [type=multiply times=100];
 ds -> ds_parse -> ds_multiply;
 """
 `
-	DirectRequestSpecNoExternalJobID = `
-type                = "directrequest"
+	CronSpecEVMChainIDTemplate = `
+type                = "cron"
 schemaVersion       = 1
-name                = "%s"
-contractAddress     = "0x613a38AC1659769640aaE063C651F48E0250454C"
-evmChainID 			= "0"
+schedule            = "CRON_TZ=UTC * 0 0 1 1 *"
+externalJobID       = "%s"
+evmChainID          = "42"
 observationSource   = """
-    ds1          [type=http method=GET url="http://example.com" allowunrestrictednetworkaccess="true"];
-    ds1_parse    [type=jsonparse path="USD"];
-    ds1_multiply [type=multiply times=100];
-    ds1 -> ds1_parse -> ds1_multiply;
-"""
-`
-	DirectRequestSpecTemplate = `
-type                = "directrequest"
-schemaVersion       = 1
-name                = "%s"
-contractAddress     = "0x613a38AC1659769640aaE063C651F48E0250454C"
-externalJobID       =  "%s"
-evmChainID 			= "0"
-observationSource   = """
-    ds1          [type=http method=GET url="http://example.com" allowunrestrictednetworkaccess="true"];
-    ds1_parse    [type=jsonparse path="USD"];
-    ds1_multiply [type=multiply times=100];
-    ds1 -> ds1_parse -> ds1_multiply;
-"""
-`
-	DirectRequestSpecWithRequestersAndMinContractPaymentTemplate = `
-type                         = "directrequest"
-schemaVersion                = 1
-requesters                   = ["0xaaaa1F8ee20f5565510B84f9353F1E333E753B7a", "0xbbbb70F0e81C6F3430dfdC9fa02fB22BdD818C4e"]
-minContractPaymentLinkJuels  = "1000000000000000000000"
-name                         = "%s"
-contractAddress              = "0x613a38AC1659769640aaE063C651F48E0250454C"
-externalJobID                = "%s"
-evmChainID                   = 0
-observationSource            = """
-    ds1          [type=http method=GET url="http://example.com" allowunrestrictednetworkaccess="true"];
-    ds1_parse    [type=jsonparse path="USD"];
-    ds1_multiply [type=multiply times=100];
-    ds1 -> ds1_parse -> ds1_multiply;
-"""
-`
-	FluxMonitorSpecTemplate = `
-type                = "fluxmonitor"
-schemaVersion       = 1
-name                = "%s"
-contractAddress     = "0x3cCad4715152693fE3BC4460591e3D3Fbd071b42"
-externalJobID       =  "%s"
-evmChainID          = 0
-threshold = 0.5
-absoluteThreshold = 0.0 # optional
-
-idleTimerPeriod = "1s"
-idleTimerDisabled = false
-
-pollTimerPeriod = "1m"
-pollTimerDisabled = false
-
-observationSource = """
-// data source 1
-ds1 [type=http method=GET url="https://pricesource1.com" requestData="{\\"coin\\": \\"ETH\\", \\"market\\": \\"USD\\"}"];
-ds1_parse [type=jsonparse path="latest"];
-
-// data source 2
-ds2 [type=http method=GET url="https://pricesource1.com" requestData="{\\"coin\\": \\"ETH\\", \\"market\\": \\"USD\\"}"];
-ds2_parse [type=jsonparse path="latest"];
-
-ds1 -> ds1_parse -> answer1;
-ds2 -> ds2_parse -> answer1;
-
-answer1 [type=median index=0];
+ds          [type=http method=GET url="https://chain.link/ETH-USD"];
+ds_parse    [type=jsonparse path="data.price" separator="."];
+ds_multiply [type=multiply times=100];
+ds -> ds_parse -> ds_multiply;
 """
 `
 
@@ -118,7 +65,7 @@ answer1 [type=median index=0];
 schemaVersion = 1
 name = "%s"
 relay = "evm"
-contractID = "0x613a38AC1659769640aaE063C651F48E0250454C"
+contractID = "%s"
 p2pv2Bootstrappers = []
 transmitterID = "0xF67D0290337bca0847005C7ffD1BC75BA9AAE6e4"
 pluginType         = "median"
@@ -129,7 +76,7 @@ observationSource = """
 	ds -> ds_parse -> ds_multiply;
 """
 [relayConfig]
-chainID = 0
+chainID = "%s"
 [pluginConfig]
 `
 	WebhookSpecNoBodyTemplate = `
@@ -168,62 +115,92 @@ contractID		= "0x613a38AC1659769640aaE063C651F48E0250454C"
 [relayConfig]
 chainID			= 1337
 `
+
+	GatewaySpec = `
+type = "gateway"
+schemaVersion = 1
+externalJobID = "%s"
+name = "Gateway"
+forwardingAllowed = false
+[gatewayConfig.ConnectionManagerConfig]
+AuthChallengeLen = 10
+AuthGatewayId = "%s"
+AuthTimestampToleranceSec = 5
+HeartbeatIntervalSec = 20
+[[gatewayConfig.Dons]]
+DonId = "1"
+F = 1
+HandlerName = "web-api-capabilities"
+	[gatewayConfig.Dons.HandlerConfig]
+	MaxAllowedMessageAgeSec = 1_000
+		[gatewayConfig.Dons.HandlerConfig.NodeRateLimiter]
+		GlobalBurst = 10
+		GlobalRPS = 50
+		PerSenderBurst = 10
+		PerSenderRPS = 10
+	[[gatewayConfig.Dons.Members]]
+	Address = "%s"
+	Name = "Workflow Node 1"
+	[[gatewayConfig.Dons.Members]]
+	Address = "%s"
+	Name = "Workflow Node 2"
+	[[gatewayConfig.Dons.Members]]
+	Address = "%s"
+	Name = "Workflow Node 3"
+	[[gatewayConfig.Dons.Members]]
+	Address = "%s"
+	Name = "Workflow Node 4"
+[gatewayConfig.NodeServerConfig]
+HandshakeTimeoutMillis = 1_000
+MaxRequestBytes = 100_000
+Path = "%s"
+Port = %d
+ReadTimeoutMillis = 1_000
+RequestTimeoutMillis = 10_000
+WriteTimeoutMillis = 1_000
+[gatewayConfig.UserServerConfig]
+ContentTypeHeader = "application/jsonrpc"
+MaxRequestBytes = 100_000
+Path = "%s"
+Port = %d
+ReadTimeoutMillis = 1_000
+RequestTimeoutMillis = 10_000
+WriteTimeoutMillis = 1_000
+CORSEnabled = false
+CORSAllowedOrigins = []
+[gatewayConfig.HTTPClientConfig]
+MaxResponseBytes = 100_000_000
+`
+
+	StandardCapabilitySpec = `
+type = "standardcapabilities"
+schemaVersion = 1
+externalJobID = "%s"
+name = "%s"
+forwardingAllowed = false
+command = "/home/capabilities/%s"
+config = "%s"
+`
 )
+
+func GetStandardCapabilitySpec() string {
+	return fmt.Sprintf(StandardCapabilitySpec, uuid.New(), "some-capability", "some_capability_linux_amd64", "")
+}
+
+func GetGatewaySpec() string {
+	return fmt.Sprintf(GatewaySpec, uuid.New(), "gateway", "0xABA5eDc1a551E55b1A570c0e1f1055e5BE11eca1", "0xABA5eDc1a551E55b1A570c0e1f1055e5BE11eca2", "0xABA5eDc1a551E55b1A570c0e1f1055e5BE11eca3", "0xABA5eDc1a551E55b1A570c0e1f1055e5BE11eca4", "/node", 8080, "/user", 8081)
+}
 
 func GetOCRBootstrapSpec() string {
 	return fmt.Sprintf(OCRBootstrapSpec, uuid.New())
 }
 
-func GetDirectRequestSpec() string {
-	uuid := uuid.New()
-	return GetDirectRequestSpecWithUUID(uuid)
-}
-
-func GetDirectRequestSpecWithUUID(u uuid.UUID) string {
-	return fmt.Sprintf(DirectRequestSpecTemplate, u, u)
-}
-
 func GetOCR2EVMSpecMinimal() string {
-	return fmt.Sprintf(OCR2EVMSpecMinimalTemplate, uuid.New())
+	return fmt.Sprintf(OCR2EVMSpecMinimalTemplate, uuid.New(), testutils.NewAddress().Hex(), testutils.FixtureChainID.String())
 }
 
 func GetWebhookSpecNoBody(u uuid.UUID, fetchBridge, submitBridge string) string {
 	return fmt.Sprintf(WebhookSpecNoBodyTemplate, u, fetchBridge, submitBridge)
-}
-
-type KeeperSpecParams struct {
-	Name              string
-	ContractAddress   string
-	FromAddress       string
-	EvmChainID        int
-	ObservationSource string
-}
-
-type KeeperSpec struct {
-	KeeperSpecParams
-	toml string
-}
-
-func (os KeeperSpec) Toml() string {
-	return os.toml
-}
-
-func GenerateKeeperSpec(params KeeperSpecParams) KeeperSpec {
-	template := `
-type            		 	= "keeper"
-schemaVersion   		 	= 1
-name            		 	= "%s"
-contractAddress 		 	= "%s"
-fromAddress     		 	= "%s"
-evmChainID      		 	= %d
-externalJobID   		 	=  "123e4567-e89b-12d3-a456-426655440002"
-observationSource = """%s"""
-`
-	escapedObvSource := strings.ReplaceAll(params.ObservationSource, `\`, `\\`)
-	return KeeperSpec{
-		KeeperSpecParams: params,
-		toml:             fmt.Sprintf(template, params.Name, params.ContractAddress, params.FromAddress, params.EvmChainID, escapedObvSource),
-	}
 }
 
 type VRFSpecParams struct {
@@ -232,9 +209,7 @@ type VRFSpecParams struct {
 	CoordinatorAddress            string
 	VRFVersion                    vrfcommon.Version
 	BatchCoordinatorAddress       string
-	VRFOwnerAddress               string
 	BatchFulfillmentEnabled       bool
-	CustomRevertsPipelineEnabled  bool
 	BatchFulfillmentGasMultiplier float64
 	MinIncomingConfirmations      int
 	FromAddresses                 []string
@@ -248,7 +223,11 @@ type VRFSpecParams struct {
 	BackoffInitialDelay           time.Duration
 	BackoffMaxDelay               time.Duration
 	GasLanePrice                  *assets.Wei
-	PollPeriod                    time.Duration
+	// OmitGasLanePrice omits the gasLanePrice field from the generated TOML, resulting in a
+	// nil GasLanePrice on the parsed spec. Useful for testing code paths that only run when
+	// a gas lane price is explicitly configured.
+	OmitGasLanePrice bool
+	PollPeriod       time.Duration
 }
 
 type VRFSpec struct {
@@ -269,7 +248,7 @@ func GenerateVRFSpec(params VRFSpecParams) VRFSpec {
 	if params.Name != "" {
 		name = params.Name
 	}
-	vrfVersion := vrfcommon.V2
+	vrfVersion := vrfcommon.V2Plus
 	if params.VRFVersion != "" {
 		vrfVersion = params.VRFVersion
 	}
@@ -281,12 +260,8 @@ func GenerateVRFSpec(params VRFSpecParams) VRFSpec {
 	if params.BatchCoordinatorAddress != "" {
 		batchCoordinatorAddress = params.BatchCoordinatorAddress
 	}
-	vrfOwnerAddress := "0x5383C25DA15b1253463626243215495a3718beE4"
-	if params.VRFOwnerAddress != "" && vrfVersion == vrfcommon.V2 {
-		vrfOwnerAddress = params.VRFOwnerAddress
-	}
 	pollPeriod := 5 * time.Second
-	if params.PollPeriod > 0 && (vrfVersion == vrfcommon.V2 || vrfVersion == vrfcommon.V2Plus) {
+	if params.PollPeriod > 0 && vrfVersion == vrfcommon.V2Plus {
 		pollPeriod = params.PollPeriod
 	}
 	batchFulfillmentGasMultiplier := 1.0
@@ -314,55 +289,6 @@ func GenerateVRFSpec(params VRFSpecParams) VRFSpec {
 		chunkSize = params.ChunkSize
 	}
 	observationSource := fmt.Sprintf(`
-decode_log   [type=ethabidecodelog
-              abi="RandomnessRequest(bytes32 keyHash,uint256 seed,bytes32 indexed jobID,address sender,uint256 fee,bytes32 requestID)"
-              data="$(jobRun.logData)"
-              topics="$(jobRun.logTopics)"]
-vrf          [type=vrf
-              publicKey="$(jobSpec.publicKey)"
-              requestBlockHash="$(jobRun.logBlockHash)"
-              requestBlockNumber="$(jobRun.logBlockNumber)"
-              topics="$(jobRun.logTopics)"]
-encode_tx    [type=ethabiencode
-              abi="fulfillRandomnessRequest(bytes proof)"
-              data="{\\"proof\\": $(vrf)}"]
-submit_tx  [type=ethtx to="%s"
-            data="$(encode_tx)"
-            minConfirmations="0"
-            from="$(jobSpec.from)"
-            txMeta="{\\"requestTxHash\\": $(jobRun.logTxHash),\\"requestID\\": $(decode_log.requestID),\\"jobID\\": $(jobSpec.databaseID)}"
-            transmitChecker="{\\"CheckerType\\": \\"vrf_v1\\", \\"VRFCoordinatorAddress\\": \\"%s\\"}"]
-decode_log->vrf->encode_tx->submit_tx
-`, coordinatorAddress, coordinatorAddress)
-	if params.V2 {
-		observationSource = fmt.Sprintf(`
-decode_log   [type=ethabidecodelog
-              abi="RandomWordsRequested(bytes32 indexed keyHash,uint256 requestId,uint256 preSeed,uint64 indexed subId,uint16 minimumRequestConfirmations,uint32 callbackGasLimit,uint32 numWords,address indexed sender)"
-              data="$(jobRun.logData)"
-              topics="$(jobRun.logTopics)"]
-vrf          [type=vrfv2
-              publicKey="$(jobSpec.publicKey)"
-              requestBlockHash="$(jobRun.logBlockHash)"
-              requestBlockNumber="$(jobRun.logBlockNumber)"
-              topics="$(jobRun.logTopics)"]
-estimate_gas [type=estimategaslimit
-              to="%s"
-              multiplier="1.1"
-              data="$(vrf.output)"
-]
-simulate [type=ethcall
-          to="%s"
-		  gas="$(estimate_gas)"
-		  gasPrice="$(jobSpec.maxGasPrice)"
-		  extractRevertReason=true
-		  contract="%s"
-		  data="$(vrf.output)"
-]
-decode_log->vrf->estimate_gas->simulate
-`, coordinatorAddress, coordinatorAddress, coordinatorAddress)
-	}
-	if vrfVersion == vrfcommon.V2Plus {
-		observationSource = fmt.Sprintf(`
 decode_log              [type=ethabidecodelog
                          abi="RandomWordsRequested(bytes32 indexed keyHash,uint256 requestId,uint256 preSeed,uint256 indexed subId,uint16 minimumRequestConfirmations,uint32 callbackGasLimit,uint32 numWords,bytes extraArgs,address indexed sender)"
                          data="$(jobRun.logData)"
@@ -376,6 +302,7 @@ estimate_gas            [type=estimategaslimit
                          to="%s"
                          multiplier="1.1"
                          data="$(generate_proof.output)"
+						 block="latest"
 ]
 simulate_fulfillment    [type=ethcall
                          to="%s"
@@ -384,10 +311,10 @@ simulate_fulfillment    [type=ethcall
 		                 extractRevertReason=true
 		                 contract="%s"
 		                 data="$(generate_proof.output)"
+						 block="latest"
 ]
 decode_log->generate_proof->estimate_gas->simulate_fulfillment
 `, coordinatorAddress, coordinatorAddress, coordinatorAddress)
-	}
 	if params.ObservationSource != "" {
 		observationSource = params.ObservationSource
 	}
@@ -404,7 +331,6 @@ evmChainID         =  "%s"
 batchCoordinatorAddress = "%s"
 batchFulfillmentEnabled = %v
 batchFulfillmentGasMultiplier = %s
-customRevertsPipelineEnabled = %v
 minIncomingConfirmations = %d
 requestedConfsDelay = %d
 requestTimeout = "%s"
@@ -412,8 +338,11 @@ publicKey = "%s"
 chunkSize = %d
 backoffInitialDelay = "%s"
 backoffMaxDelay = "%s"
-gasLanePrice = "%s"
-pollPeriod = "%s"
+`
+	if !params.OmitGasLanePrice {
+		template += `gasLanePrice = "` + gasLanePrice.String() + `"` + "\n"
+	}
+	template += `pollPeriod = "%s"
 observationSource = """
 %s
 """
@@ -421,20 +350,18 @@ observationSource = """
 	toml := fmt.Sprintf(template,
 		jobID, name, coordinatorAddress, params.EVMChainID, batchCoordinatorAddress,
 		params.BatchFulfillmentEnabled, strconv.FormatFloat(batchFulfillmentGasMultiplier, 'f', 2, 64),
-		params.CustomRevertsPipelineEnabled,
 		confirmations, params.RequestedConfsDelay, requestTimeout.String(), publicKey, chunkSize,
-		params.BackoffInitialDelay.String(), params.BackoffMaxDelay.String(), gasLanePrice.String(),
+		params.BackoffInitialDelay.String(), params.BackoffMaxDelay.String(),
 		pollPeriod.String(), observationSource)
-	if len(params.FromAddresses) != 0 {
-		var addresses []string
-		for _, address := range params.FromAddresses {
-			addresses = append(addresses, fmt.Sprintf("%q", address))
-		}
-		toml = toml + "\n" + fmt.Sprintf(`fromAddresses = [%s]`, strings.Join(addresses, ", "))
+	fromAddrs := params.FromAddresses
+	if len(fromAddrs) == 0 {
+		fromAddrs = []string{"0x1111111111111111111111111111111111111111"}
 	}
-	if vrfVersion == vrfcommon.V2 {
-		toml = toml + "\n" + fmt.Sprintf(`vrfOwnerAddress = "%s"`, vrfOwnerAddress)
+	var addresses []string
+	for _, address := range fromAddrs {
+		addresses = append(addresses, fmt.Sprintf("%q", address))
 	}
+	toml = toml + "\n" + fmt.Sprintf(`fromAddresses = [%s]`, strings.Join(addresses, ", "))
 
 	return VRFSpec{VRFSpecParams: VRFSpecParams{
 		JobID:                    jobID,
@@ -451,7 +378,6 @@ observationSource = """
 		ChunkSize:                chunkSize,
 		BackoffInitialDelay:      params.BackoffInitialDelay,
 		BackoffMaxDelay:          params.BackoffMaxDelay,
-		VRFOwnerAddress:          vrfOwnerAddress,
 		VRFVersion:               vrfVersion,
 		PollPeriod:               pollPeriod,
 	}, toml: toml}
@@ -485,7 +411,7 @@ func GenerateOCRSpec(params OCRSpecParams) OCRSpec {
 	if params.TransmitterAddress != "" {
 		transmitterAddress = params.TransmitterAddress
 	}
-	contractAddress := "0x613a38AC1659769640aaE063C651F48E0250454C"
+	contractAddress := testutils.NewAddress().Hex()
 	if params.ContractAddress != "" {
 		contractAddress = params.ContractAddress
 	}
@@ -502,11 +428,50 @@ func GenerateOCRSpec(params OCRSpecParams) OCRSpec {
 		ds2BridgeName = params.DS2BridgeName
 	}
 
-	evmChainID := "0"
+	evmChainID := testutils.FixtureChainID.String()
 	if params.EVMChainID != "" {
 		evmChainID = params.EVMChainID
 	}
-	template := `
+
+	// When both bridge names are supplied by the caller, use bridges for both observation
+	// paths so tests that execute the pipeline do not depend on external HTTP (chain.link).
+	explicitBridgeDataSources := params.DS1BridgeName != "" && params.DS2BridgeName != ""
+	var observationBlock string
+	if explicitBridgeDataSources {
+		observationBlock = fmt.Sprintf(`    // data source 1
+    ds1          [type=bridge name="%s"];
+    ds1_parse    [type=jsonparse path="one,two"];
+    ds1_multiply [type=multiply times=1.23];
+
+    // data source 2
+    ds2          [type=bridge name="%s"];
+    ds2_parse    [type=jsonparse path="three,four"];
+    ds2_multiply [type=multiply times=4.56];
+
+    ds1 -> ds1_parse -> ds1_multiply -> answer1;
+    ds2 -> ds2_parse -> ds2_multiply -> answer1;
+
+    answer1 [type=median                      index=0];
+    answer2 [type=bridge name="%s" index=1];`, ds1BridgeName, ds2BridgeName, ds2BridgeName)
+	} else {
+		observationBlock = fmt.Sprintf(`    // data source 1
+    ds1          [type=bridge name="%s"];
+    ds1_parse    [type=jsonparse path="one,two"];
+    ds1_multiply [type=multiply times=1.23];
+
+    // data source 2
+    ds2          [type=http method=GET url="https://chain.link/voter_turnout/USA-2020" requestData="{\\"hi\\": \\"hello\\"}"];
+    ds2_parse    [type=jsonparse path="three,four"];
+    ds2_multiply [type=multiply times=4.56];
+
+    ds1 -> ds1_parse -> ds1_multiply -> answer1;
+    ds2 -> ds2_parse -> ds2_multiply -> answer1;
+
+    answer1 [type=median                      index=0];
+    answer2 [type=bridge name="%s" index=1];`, ds1BridgeName, ds2BridgeName)
+	}
+
+	header := `
 type               = "offchainreporting"
 schemaVersion      = 1
 name               = "%s"
@@ -525,21 +490,7 @@ contractConfigTrackerSubscribeInterval = "2m"
 contractConfigTrackerPollInterval = "1m"
 contractConfigConfirmations = 3
 observationSource = """
-    // data source 1
-    ds1          [type=bridge name="%s"];
-    ds1_parse    [type=jsonparse path="one,two"];
-    ds1_multiply [type=multiply times=1.23];
-
-    // data source 2
-    ds2          [type=http method=GET url="https://chain.link/voter_turnout/USA-2020" requestData="{\\"hi\\": \\"hello\\"}"];
-    ds2_parse    [type=jsonparse path="three,four"];
-    ds2_multiply [type=multiply times=4.56];
-
-    ds1 -> ds1_parse -> ds1_multiply -> answer1;
-    ds2 -> ds2_parse -> ds2_multiply -> answer1;
-
-    answer1 [type=median                      index=0];
-    answer2 [type=bridge name="%s" index=1];
+%s
 """
 `
 	return OCRSpec{OCRSpecParams: OCRSpecParams{
@@ -548,11 +499,16 @@ observationSource = """
 		TransmitterAddress: transmitterAddress,
 		DS1BridgeName:      ds1BridgeName,
 		DS2BridgeName:      ds2BridgeName,
-	}, toml: fmt.Sprintf(template, name, contractAddress, evmChainID, jobID, transmitterAddress, ds1BridgeName, ds2BridgeName)}
+	}, toml: fmt.Sprintf(header, name, contractAddress, evmChainID, jobID, transmitterAddress, observationBlock)}
+}
+
+type TOMLWebhookSpecExternalInitiator struct {
+	Name string      `toml:"name"`
+	Spec models.JSON `toml:"spec"`
 }
 
 type WebhookSpecParams struct {
-	ExternalInitiators []webhook.TOMLWebhookSpecExternalInitiator
+	ExternalInitiators []TOMLWebhookSpecExternalInitiator
 }
 
 type WebhookSpec struct {
@@ -594,7 +550,6 @@ ds -> ds_parse -> ds_multiply;
 type BlockhashStoreSpecParams struct {
 	JobID                          string
 	Name                           string
-	CoordinatorV1Address           string
 	CoordinatorV2Address           string
 	CoordinatorV2PlusAddress       string
 	WaitBlocks                     int
@@ -628,18 +583,6 @@ func GenerateBlockhashStoreSpec(params BlockhashStoreSpecParams) BlockhashStoreS
 
 	if params.Name == "" {
 		params.Name = "blockhash-store"
-	}
-
-	if params.CoordinatorV1Address == "" {
-		params.CoordinatorV1Address = "0x19D20b4Ec0424A530C3C1cDe874445E37747eb18"
-	}
-
-	if params.CoordinatorV2Address == "" {
-		params.CoordinatorV2Address = "0x2498e651Ae17C2d98417C4826F0816Ac6366A95E"
-	}
-
-	if params.CoordinatorV2PlusAddress == "" {
-		params.CoordinatorV2PlusAddress = "0x92B5e28Ac583812874e4271380c7d070C5FB6E6b"
 	}
 
 	if params.TrustedBlockhashStoreAddress == "" {
@@ -681,28 +624,33 @@ func GenerateBlockhashStoreSpec(params BlockhashStoreSpecParams) BlockhashStoreS
 		formattedFromAddresses = fmt.Sprintf("[%s]", strings.Join(addresses, ", "))
 	}
 
-	template := `
-type = "blockhashstore"
-schemaVersion = 1
-name = "%s"
-coordinatorV1Address = "%s"
-coordinatorV2Address = "%s"
-coordinatorV2PlusAddress = "%s"
-waitBlocks = %d
-lookbackBlocks = %d
-blockhashStoreAddress = "%s"
-trustedBlockhashStoreAddress = "%s"
-trustedBlockhashStoreBatchSize = %d
-pollPeriod = "%s"
-runTimeout = "%s"
-evmChainID = "%d"
-fromAddresses = %s
-heartbeatPeriod = "%s"
-`
-	toml := fmt.Sprintf(template, params.Name, params.CoordinatorV1Address,
-		params.CoordinatorV2Address, params.CoordinatorV2PlusAddress, params.WaitBlocks, params.LookbackBlocks,
-		params.BlockhashStoreAddress, params.TrustedBlockhashStoreAddress, params.TrustedBlockhashStoreBatchSize, params.PollPeriod.String(), params.RunTimeout.String(),
-		params.EVMChainID, formattedFromAddresses, params.HeartbeatPeriod.String())
+	// Build TOML conditionally including coordinator addresses only if provided.
+	var lines []string
+	lines = append(lines,
+		`type = "blockhashstore"`,
+		`schemaVersion = 1`,
+		fmt.Sprintf(`name = "%s"`, params.Name),
+	)
+	if params.CoordinatorV2Address != "" {
+		lines = append(lines, fmt.Sprintf(`coordinatorV2Address = "%s"`, params.CoordinatorV2Address))
+	}
+	if params.CoordinatorV2PlusAddress != "" {
+		lines = append(lines, fmt.Sprintf(`coordinatorV2PlusAddress = "%s"`, params.CoordinatorV2PlusAddress))
+	}
+	lines = append(lines,
+		fmt.Sprintf(`waitBlocks = %d`, params.WaitBlocks),
+		fmt.Sprintf(`lookbackBlocks = %d`, params.LookbackBlocks),
+		fmt.Sprintf(`blockhashStoreAddress = "%s"`, params.BlockhashStoreAddress),
+		fmt.Sprintf(`trustedBlockhashStoreAddress = "%s"`, params.TrustedBlockhashStoreAddress),
+		fmt.Sprintf(`trustedBlockhashStoreBatchSize = %d`, params.TrustedBlockhashStoreBatchSize),
+		fmt.Sprintf(`pollPeriod = "%s"`, params.PollPeriod.String()),
+		fmt.Sprintf(`runTimeout = "%s"`, params.RunTimeout.String()),
+		fmt.Sprintf(`evmChainID = "%d"`, params.EVMChainID),
+		fmt.Sprintf(`fromAddresses = %s`, formattedFromAddresses),
+		fmt.Sprintf(`heartbeatPeriod = "%s"`, params.HeartbeatPeriod.String()),
+	)
+	lines = append(lines, "") // trailing newline
+	toml := strings.Join(lines, "\n")
 
 	return BlockhashStoreSpec{BlockhashStoreSpecParams: params, toml: toml}
 }
@@ -711,7 +659,6 @@ heartbeatPeriod = "%s"
 type BlockHeaderFeederSpecParams struct {
 	JobID                      string
 	Name                       string
-	CoordinatorV1Address       string
 	CoordinatorV2Address       string
 	CoordinatorV2PlusAddress   string
 	WaitBlocks                 int
@@ -745,18 +692,6 @@ func GenerateBlockHeaderFeederSpec(params BlockHeaderFeederSpecParams) BlockHead
 
 	if params.Name == "" {
 		params.Name = "blockheaderfeeder"
-	}
-
-	if params.CoordinatorV1Address == "" {
-		params.CoordinatorV1Address = "0x2d7F888fE0dD469bd81A12f77e6291508f714d4B"
-	}
-
-	if params.CoordinatorV2Address == "" {
-		params.CoordinatorV2Address = "0x2d7F888fE0dD469bd81A12f77e6291508f714d4B"
-	}
-
-	if params.CoordinatorV2PlusAddress == "" {
-		params.CoordinatorV2PlusAddress = "0x2d7F888fE0dD469bd81A12f77e6291508f714d4B"
 	}
 
 	if params.WaitBlocks == 0 {
@@ -802,35 +737,40 @@ func GenerateBlockHeaderFeederSpec(params BlockHeaderFeederSpecParams) BlockHead
 		formattedFromAddresses = fmt.Sprintf("[%s]", strings.Join(addresses, ", "))
 	}
 
-	template := `
-type = "blockheaderfeeder"
-schemaVersion = 1
-name = "%s"
-coordinatorV1Address = "%s"
-coordinatorV2Address = "%s"
-coordinatorV2PlusAddress = "%s"
-waitBlocks = %d
-lookbackBlocks = %d
-blockhashStoreAddress = "%s"
-batchBlockhashStoreAddress = "%s"
-pollPeriod = "%s"
-runTimeout = "%s"
-evmChainID = "%d"
-fromAddresses = %s
-getBlockhashesBatchSize = %d
-storeBlockhashesBatchSize = %d
-`
-	toml := fmt.Sprintf(template, params.Name, params.CoordinatorV1Address,
-		params.CoordinatorV2Address, params.CoordinatorV2PlusAddress, params.WaitBlocks, params.LookbackBlocks,
-		params.BlockhashStoreAddress, params.BatchBlockhashStoreAddress, params.PollPeriod.String(),
-		params.RunTimeout.String(), params.EVMChainID, formattedFromAddresses, params.GetBlockhashesBatchSize,
-		params.StoreBlockhashesBatchSize)
+	// Build TOML conditionally including coordinator addresses only if provided.
+	var lines []string
+	lines = append(lines,
+		`type = "blockheaderfeeder"`,
+		`schemaVersion = 1`,
+		fmt.Sprintf(`name = "%s"`, params.Name),
+	)
+	if params.CoordinatorV2Address != "" {
+		lines = append(lines, fmt.Sprintf(`coordinatorV2Address = "%s"`, params.CoordinatorV2Address))
+	}
+	if params.CoordinatorV2PlusAddress != "" {
+		lines = append(lines, fmt.Sprintf(`coordinatorV2PlusAddress = "%s"`, params.CoordinatorV2PlusAddress))
+	}
+	lines = append(lines,
+		fmt.Sprintf(`waitBlocks = %d`, params.WaitBlocks),
+		fmt.Sprintf(`lookbackBlocks = %d`, params.LookbackBlocks),
+		fmt.Sprintf(`blockhashStoreAddress = "%s"`, params.BlockhashStoreAddress),
+		fmt.Sprintf(`batchBlockhashStoreAddress = "%s"`, params.BatchBlockhashStoreAddress),
+		fmt.Sprintf(`pollPeriod = "%s"`, params.PollPeriod.String()),
+		fmt.Sprintf(`runTimeout = "%s"`, params.RunTimeout.String()),
+		fmt.Sprintf(`evmChainID = "%d"`, params.EVMChainID),
+		fmt.Sprintf(`fromAddresses = %s`, formattedFromAddresses),
+		fmt.Sprintf(`getBlockhashesBatchSize = %d`, params.GetBlockhashesBatchSize),
+		fmt.Sprintf(`storeBlockhashesBatchSize = %d`, params.StoreBlockhashesBatchSize),
+	)
+	lines = append(lines, "") // trailing newline
+	toml := strings.Join(lines, "\n")
 
 	return BlockHeaderFeederSpec{BlockHeaderFeederSpecParams: params, toml: toml}
 }
 
 type StreamSpecParams struct {
-	Name string
+	Name     string
+	StreamID uint64
 }
 
 type StreamSpec struct {
@@ -848,6 +788,7 @@ func GenerateStreamSpec(params StreamSpecParams) StreamSpec {
 type = "stream"
 schemaVersion = 1
 name = "%s"
+streamID = %d
 observationSource = """
 ds          [type=http method=GET url="https://chain.link/ETH-USD"];
 ds_parse    [type=jsonparse path="data,price"];
@@ -856,6 +797,34 @@ ds -> ds_parse -> ds_multiply;
 """
 `
 
-	toml := fmt.Sprintf(template, params.Name)
+	toml := fmt.Sprintf(template, params.Name, params.StreamID)
 	return StreamSpec{StreamSpecParams: params, toml: toml}
 }
+
+var OCR2EVMDualTransmissionSpecMinimalTemplate = `
+type = "offchainreporting2"
+schemaVersion = 1
+name = "test-job"
+relay = "evm"
+contractID = "0x613a38AC1659769640aaE063C651F48E0250454C"
+p2pv2Bootstrappers = []
+transmitterID = "%s"
+pluginType         = "median"
+observationSource = """
+	ds          [type=http method=GET url="https://chain.link/ETH-USD"];
+	ds_parse    [type=jsonparse path="data.price" separator="."];
+	ds_multiply [type=multiply times=100];
+	ds -> ds_parse -> ds_multiply;
+"""
+[pluginConfig]
+juelsPerFeeCoinSource = """
+	ds          [type=http method=GET url="https://chain.link/ETH-USD"];
+	ds_parse    [type=jsonparse path="data.price" separator="."];
+	ds_multiply [type=multiply times=100];
+	ds -> ds_parse -> ds_multiply;
+"""
+[relayConfig]
+chainID = 0
+`
+
+func GetCRESettingsSpec() string { return CRESettingsSpec }

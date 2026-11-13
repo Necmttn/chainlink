@@ -3,22 +3,21 @@ package models
 import (
 	"bytes"
 	"database/sql/driver"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/pkg/errors"
 	"github.com/robfig/cron/v3"
 	"github.com/tidwall/gjson"
-	"go.uber.org/multierr"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/assets"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
 )
 
 // CronParser is the global parser for crontabs.
@@ -47,7 +46,7 @@ func (j JSON) Value() (driver.Value, error) {
 }
 
 // Scan reads the database value and returns an instance.
-func (j *JSON) Scan(value interface{}) error {
+func (j *JSON) Scan(value any) error {
 	switch v := value.(type) {
 	case string:
 		*j = JSON{Result: gjson.Parse(v)}
@@ -89,7 +88,7 @@ func (j JSON) MarshalJSON() ([]byte, error) {
 	return []byte("{}"), nil
 }
 
-func (j *JSON) UnmarshalTOML(val interface{}) error {
+func (j *JSON) UnmarshalTOML(val any) error {
 	var bs []byte
 	switch v := val.(type) {
 	case string:
@@ -151,7 +150,7 @@ func (w WebURL) Value() (driver.Value, error) {
 }
 
 // Scan reads the database value and returns an instance.
-func (w *WebURL) Scan(value interface{}) error {
+func (w *WebURL) Scan(value any) error {
 	s, ok := value.(string)
 	if !ok {
 		return fmt.Errorf("unable to convert %v of %T to WebURL", value, value)
@@ -197,62 +196,12 @@ func (c Cron) String() string {
 	return string(c)
 }
 
-// Interval represents a time.Duration stored as a Postgres interval type
-type Interval time.Duration
-
-// NewInterval creates Interval for specified duration
-func NewInterval(d time.Duration) *Interval {
-	i := new(Interval)
-	*i = Interval(d)
-	return i
-}
-
-func (i Interval) Duration() time.Duration {
-	return time.Duration(i)
-}
-
-// MarshalText implements the text.Marshaler interface.
-func (i Interval) MarshalText() ([]byte, error) {
-	return []byte(time.Duration(i).String()), nil
-}
-
-// UnmarshalText implements the text.Unmarshaler interface.
-func (i *Interval) UnmarshalText(input []byte) error {
-	v, err := time.ParseDuration(string(input))
-	if err != nil {
-		return err
-	}
-	*i = Interval(v)
-	return nil
-}
-
-func (i *Interval) Scan(v interface{}) error {
-	if v == nil {
-		*i = Interval(time.Duration(0))
-		return nil
-	}
-	asInt64, is := v.(int64)
-	if !is {
-		return errors.Errorf("models.Interval#Scan() wanted int64, got %T", v)
-	}
-	*i = Interval(time.Duration(asInt64) * time.Nanosecond)
-	return nil
-}
-
-func (i Interval) Value() (driver.Value, error) {
-	return time.Duration(i).Nanoseconds(), nil
-}
-
-func (i Interval) IsZero() bool {
-	return time.Duration(i) == time.Duration(0)
-}
-
 // SendEtherRequest represents a request to transfer ETH.
 type SendEtherRequest struct {
 	DestinationAddress common.Address `json:"address"`
 	FromAddress        common.Address `json:"from"`
 	Amount             assets.Eth     `json:"amount"`
-	EVMChainID         *big.Big       `json:"evmChainID"`
+	EVMChainID         *sqlutil.Big   `json:"evmChainID"`
 	AllowHigherAmounts bool           `json:"allowHigherAmounts"`
 	SkipWaitTxAttempt  bool           `json:"skipWaitTxAttempt"`
 	WaitAttemptTimeout *time.Duration `json:"waitAttemptTimeout"`
@@ -279,7 +228,7 @@ func (r AddressCollection) Value() (driver.Value, error) {
 }
 
 // Scan parses the database value as a string.
-func (r *AddressCollection) Scan(value interface{}) error {
+func (r *AddressCollection) Scan(value any) error {
 	str, ok := value.(string)
 	if !ok {
 		return fmt.Errorf("unable to convert %v of %T to AddressCollection", value, value)
@@ -301,14 +250,12 @@ func (r *AddressCollection) Scan(value interface{}) error {
 // Merge returns a new map with all keys merged from left to right
 // On conflicting keys, rightmost inputs will clobber leftmost inputs
 func Merge(inputs ...JSON) (JSON, error) {
-	output := make(map[string]interface{})
+	output := make(map[string]any)
 
 	for _, input := range inputs {
 		switch v := input.Result.Value().(type) {
-		case map[string]interface{}:
-			for key, value := range v {
-				output[key] = value
-			}
+		case map[string]any:
+			maps.Copy(output, v)
 		case nil:
 		default:
 			return JSON{}, errors.New("can only merge JSON objects")
@@ -321,83 +268,6 @@ func Merge(inputs ...JSON) (JSON, error) {
 	}
 
 	return JSON{Result: gjson.ParseBytes(bytes)}, nil
-}
-
-// Explicit type indicating a 32-byte sha256 hash
-type Sha256Hash [32]byte
-
-var EmptySha256Hash = new(Sha256Hash)
-
-// MarshalJSON converts a Sha256Hash to a JSON byte slice.
-func (s Sha256Hash) MarshalJSON() ([]byte, error) {
-	return json.Marshal(s.String())
-}
-
-// UnmarshalJSON converts a bytes slice of JSON to a TaskType.
-func (s *Sha256Hash) UnmarshalJSON(input []byte) error {
-	var shaHash string
-	if err := json.Unmarshal(input, &shaHash); err != nil {
-		return err
-	}
-
-	sha, err := Sha256HashFromHex(shaHash)
-	if err != nil {
-		return err
-	}
-
-	*s = sha
-	return nil
-}
-
-func Sha256HashFromHex(x string) (Sha256Hash, error) {
-	bs, err := hex.DecodeString(x)
-	if err != nil {
-		return Sha256Hash{}, err
-	}
-	var hash Sha256Hash
-	copy(hash[:], bs)
-	return hash, nil
-}
-
-func MustSha256HashFromHex(x string) Sha256Hash {
-	bs, err := hex.DecodeString(x)
-	if err != nil {
-		panic(err)
-	}
-	var hash Sha256Hash
-	copy(hash[:], bs)
-	return hash
-}
-
-func (s Sha256Hash) String() string {
-	return hex.EncodeToString(s[:])
-}
-
-func (s *Sha256Hash) MarshalText() ([]byte, error) {
-	return []byte(s.String()), nil
-}
-
-func (s *Sha256Hash) UnmarshalText(bs []byte) (err error) {
-	*s, err = Sha256HashFromHex(string(bs))
-	return
-}
-
-func (s *Sha256Hash) Scan(value interface{}) error {
-	bytes, ok := value.([]byte)
-	if !ok {
-		return errors.Errorf("Failed to unmarshal Sha256Hash value: %v", value)
-	}
-	if s == nil {
-		*s = Sha256Hash{}
-	}
-	copy((*s)[:], bytes)
-	return nil
-}
-
-func (s Sha256Hash) Value() (driver.Value, error) {
-	b := make([]byte, 32)
-	copy(b, s[:])
-	return b, nil
 }
 
 // ServiceHeader is an HTTP header to include in POST to log service.
@@ -425,18 +295,18 @@ type ServiceHeaders []ServiceHeader
 
 func (sh *ServiceHeaders) UnmarshalText(input []byte) error {
 	if sh == nil {
-		return errors.New("Cannot unmarshal to a nil receiver")
+		return errors.New("cannot unmarshal to a nil receiver")
 	}
 
 	headers := string(input)
 
 	var parsedHeaders []ServiceHeader
 	if headers != "" {
-		headerLines := strings.Split(headers, "\\")
-		for _, header := range headerLines {
+		headerLines := strings.SplitSeq(headers, "\\")
+		for header := range headerLines {
 			keyValue := strings.Split(header, "||")
 			if len(keyValue) != 2 {
-				return errors.Errorf("invalid headers provided for the audit logger. Value, single pair split on || required, got: %s", keyValue)
+				return fmt.Errorf("invalid headers provided for the audit logger. Value, single pair split on || required, got: %s", keyValue)
 			}
 			h := ServiceHeader{
 				Header: keyValue[0],
@@ -456,7 +326,7 @@ func (sh *ServiceHeaders) UnmarshalText(input []byte) error {
 
 func (sh *ServiceHeaders) MarshalText() ([]byte, error) {
 	if sh == nil {
-		return nil, errors.New("Cannot marshal to a nil receiver")
+		return nil, errors.New("cannot marshal to a nil receiver")
 	}
 
 	sb := strings.Builder{}
@@ -485,13 +355,13 @@ var (
 	headerValueRegex = regexp.MustCompile("^[A-Za-z_ :;.,\\/\"'?!(){}[\\]@<>=\\-+*#$&`|~^%]+$")
 )
 
-func (h ServiceHeader) Validate() (err error) {
+func (h *ServiceHeader) Validate() (err error) {
 	if !headerNameRegex.MatchString(h.Header) {
-		err = multierr.Append(err, errors.Errorf("invalid header name: %s", h.Header))
+		err = errors.Join(err, fmt.Errorf("invalid header name: %s", h.Header))
 	}
 
 	if !headerValueRegex.MatchString(h.Value) {
-		err = multierr.Append(err, errors.Errorf("invalid header value: %s", h.Value))
+		err = errors.Join(err, fmt.Errorf("invalid header value: %s", h.Value))
 	}
-	return
+	return err
 }

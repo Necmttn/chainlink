@@ -1,41 +1,38 @@
 package keystore
 
 import (
+	"context"
 	"database/sql"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
-	"github.com/smartcontractkit/chainlink/v2/core/services/pg"
-
-	"github.com/jmoiron/sqlx"
 	"github.com/pkg/errors"
+
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ethkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/models"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
 )
 
-func NewORM(db *sqlx.DB, lggr logger.Logger, cfg pg.QConfig) ksORM {
-	namedLogger := lggr.Named("KeystoreORM")
+func NewORM(ds sqlutil.DataSource) ksORM {
 	return ksORM{
-		q:    pg.NewQ(db, namedLogger, cfg),
-		lggr: namedLogger,
+		ds: ds,
 	}
 }
 
 type ksORM struct {
-	q    pg.Q
-	lggr logger.Logger
+	ds sqlutil.DataSource
 }
 
-func (orm ksORM) isEmpty() (bool, error) {
+func (orm ksORM) isEmpty(ctx context.Context) (bool, error) {
 	var count int64
-	err := orm.q.QueryRow("SELECT count(*) FROM encrypted_key_rings").Scan(&count)
+	err := orm.ds.QueryRowxContext(ctx, "SELECT count(*) FROM encrypted_key_rings").Scan(&count)
 	if err != nil {
 		return false, err
 	}
 	return count == 0, nil
 }
 
-func (orm ksORM) saveEncryptedKeyRing(kr *encryptedKeyRing, callbacks ...func(pg.Queryer) error) error {
-	return orm.q.Transaction(func(tx pg.Queryer) error {
-		_, err := tx.Exec(`
+func (orm ksORM) saveEncryptedKeyRing(ctx context.Context, kr *models.EncryptedKeyRing, callbacks ...func(sqlutil.DataSource) error) error {
+	return sqlutil.TransactDataSource(ctx, orm.ds, nil, func(tx sqlutil.DataSource) error {
+		_, err := tx.ExecContext(ctx, `
 		UPDATE encrypted_key_rings
 		SET encrypted_keys = $1
 	`, kr.EncryptedKeys)
@@ -52,11 +49,11 @@ func (orm ksORM) saveEncryptedKeyRing(kr *encryptedKeyRing, callbacks ...func(pg
 	})
 }
 
-func (orm ksORM) getEncryptedKeyRing() (kr encryptedKeyRing, err error) {
-	err = orm.q.Get(&kr, `SELECT * FROM encrypted_key_rings LIMIT 1`)
+func (orm ksORM) getEncryptedKeyRing(ctx context.Context) (kr models.EncryptedKeyRing, err error) {
+	err = orm.ds.GetContext(ctx, &kr, `SELECT * FROM encrypted_key_rings LIMIT 1`)
 	if errors.Is(err, sql.ErrNoRows) {
 		sql := `INSERT INTO encrypted_key_rings (encrypted_keys, updated_at) VALUES (NULL, NOW()) RETURNING *;`
-		err2 := orm.q.Get(&kr, sql)
+		err2 := orm.ds.GetContext(ctx, &kr, sql)
 
 		if err2 != nil {
 			return kr, err2
@@ -67,14 +64,14 @@ func (orm ksORM) getEncryptedKeyRing() (kr encryptedKeyRing, err error) {
 	return kr, nil
 }
 
-func (orm ksORM) loadKeyStates() (*keyStates, error) {
-	ks := newKeyStates()
+func (orm ksORM) loadKeyStates(ctx context.Context) (*models.KeyStates, error) {
+	ks := models.NewKeyStates()
 	var ethkeystates []*ethkey.State
-	if err := orm.q.Select(&ethkeystates, `SELECT id, address, evm_chain_id, disabled, created_at, updated_at FROM evm.key_states`); err != nil {
+	if err := orm.ds.SelectContext(ctx, &ethkeystates, `SELECT id, address, evm_chain_id, disabled, created_at, updated_at FROM evm.key_states`); err != nil {
 		return ks, errors.Wrap(err, "error loading evm.key_states from DB")
 	}
 	for _, state := range ethkeystates {
-		ks.add(state)
+		ks.Add(state)
 	}
 	return ks, nil
 }

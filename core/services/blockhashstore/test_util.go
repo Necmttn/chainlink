@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"math/big"
+	"slices"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/pkg/errors"
@@ -18,7 +19,7 @@ func (t *TestCoordinator) Addresses() []common.Address {
 	return []common.Address{}
 }
 
-func (t *TestCoordinator) Requests(_ context.Context, fromBlock uint64, toBlock uint64) ([]Event, error) {
+func (t *TestCoordinator) Requests(_ context.Context, fromBlock, toBlock uint64) ([]Event, error) {
 	var result []Event
 	for _, req := range t.RequestEvents {
 		if req.Block >= fromBlock && req.Block <= toBlock {
@@ -30,9 +31,9 @@ func (t *TestCoordinator) Requests(_ context.Context, fromBlock uint64, toBlock 
 
 func (t *TestCoordinator) Fulfillments(_ context.Context, fromBlock uint64) ([]Event, error) {
 	var result []Event
-	for _, ful := range t.FulfillmentEvents {
-		if ful.Block >= fromBlock {
-			result = append(result, ful)
+	for _, full := range t.FulfillmentEvents {
+		if full.Block >= fromBlock {
+			result = append(result, full)
 		}
 	}
 	return result, nil
@@ -51,10 +52,8 @@ type TestBHS struct {
 }
 
 func (t *TestBHS) Store(_ context.Context, blockNum uint64) error {
-	for _, e := range t.ErrorsStore {
-		if e == blockNum {
-			return errors.New("error storing")
-		}
+	if slices.Contains(t.ErrorsStore, blockNum) {
+		return errors.New("error storing")
 	}
 
 	t.Stored = append(t.Stored, blockNum)
@@ -72,16 +71,12 @@ func (t *TestBHS) StoreTrusted(
 }
 
 func (t *TestBHS) IsStored(_ context.Context, blockNum uint64) (bool, error) {
-	for _, e := range t.ErrorsIsStored {
-		if e == blockNum {
-			return false, errors.New("error checking if stored")
-		}
+	if slices.Contains(t.ErrorsIsStored, blockNum) {
+		return false, errors.New("error checking if stored")
 	}
 
-	for _, s := range t.Stored {
-		if s == blockNum {
-			return true, nil
-		}
+	if slices.Contains(t.Stored, blockNum) {
+		return true, nil
 	}
 	return false, nil
 }
@@ -134,13 +129,12 @@ func (t *TestBatchBHS) StoreVerifyHeader(ctx context.Context, blockNumbers []*bi
 	return nil
 }
 
-type TestBlockHeaderProvider struct {
-}
+type TestBlockHeaderProvider struct{}
 
 func (p *TestBlockHeaderProvider) RlpHeadersBatch(ctx context.Context, blockRange []*big.Int) ([][]byte, error) {
 	var headers [][]byte
 	for range blockRange {
-		var randomBytes [30]byte //random length
+		var randomBytes [30]byte // random length
 		_, err := rand.Read(randomBytes[:])
 		if err != nil {
 			return nil, err

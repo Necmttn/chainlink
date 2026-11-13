@@ -1,26 +1,25 @@
 package job_test
 
 import (
+	"math/big"
 	"testing"
 	"time"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jmoiron/sqlx"
-
 	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/pkg/client"
 	"github.com/smartcontractkit/chainlink/v2/core/bridges"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/evmtest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
-	evmrelay "github.com/smartcontractkit/chainlink/v2/core/services/relay/evm"
-	"github.com/smartcontractkit/chainlink/v2/core/store/models"
 )
 
 func clearJobsDb(t *testing.T, db *sqlx.DB) {
@@ -28,6 +27,7 @@ func clearJobsDb(t *testing.T, db *sqlx.DB) {
 }
 
 func TestPipelineORM_Integration(t *testing.T) {
+	ctx := t.Context()
 	const DotStr = `
         // data source 1
         ds1          [type=bridge name=voter_turnout];
@@ -50,11 +50,11 @@ func TestPipelineORM_Integration(t *testing.T) {
 		c.JobPipeline.HTTPRequest.DefaultTimeout = commonconfig.MustNewDuration(30 * time.Millisecond)
 	})
 	db := pgtest.NewSqlxDB(t)
-	keyStore := cltest.NewKeyStore(t, db, config.Database())
+	keyStore := cltest.NewKeyStore(t, db)
 	ethKeyStore := keyStore.Eth()
 
 	_, transmitterAddress := cltest.MustInsertRandomKey(t, ethKeyStore)
-	require.NoError(t, keyStore.OCR().Add(cltest.DefaultOCRKey))
+	require.NoError(t, keyStore.OCR().Add(ctx, cltest.DefaultOCRKey))
 
 	var specID int32
 
@@ -64,19 +64,19 @@ func TestPipelineORM_Integration(t *testing.T) {
 	answer2 := &pipeline.BridgeTask{
 		Name: "election_winner",
 	}
-	ds1_multiply := &pipeline.MultiplyTask{
+	ds1Multiply := &pipeline.MultiplyTask{
 		Times: "1.23",
 	}
-	ds1_parse := &pipeline.JSONParseTask{
+	ds1Parse := &pipeline.JSONParseTask{
 		Path: "one,two",
 	}
 	ds1 := &pipeline.BridgeTask{
 		Name: "voter_turnout",
 	}
-	ds2_multiply := &pipeline.MultiplyTask{
+	ds2Multiply := &pipeline.MultiplyTask{
 		Times: "4.56",
 	}
-	ds2_parse := &pipeline.JSONParseTask{
+	ds2Parse := &pipeline.JSONParseTask{
 		Path: "three,four",
 	}
 	ds2 := &pipeline.HTTPTask{
@@ -89,50 +89,57 @@ func TestPipelineORM_Integration(t *testing.T) {
 		6,
 		"answer1",
 		[]pipeline.TaskDependency{
-			{PropagateResult: true, InputTask: pipeline.Task(ds1_multiply)},
-			{PropagateResult: true, InputTask: pipeline.Task(ds2_multiply)}},
+			{PropagateResult: true, InputTask: pipeline.Task(ds1Multiply)},
+			{PropagateResult: true, InputTask: pipeline.Task(ds2Multiply)},
+		},
 		nil,
-		0)
+		0,
+	)
 	answer2.BaseTask = pipeline.NewBaseTask(7, "answer2", nil, nil, 1)
-	ds1_multiply.BaseTask = pipeline.NewBaseTask(
+	ds1Multiply.BaseTask = pipeline.NewBaseTask(
 		2,
 		"ds1_multiply",
-		[]pipeline.TaskDependency{{PropagateResult: true, InputTask: pipeline.Task(ds1_parse)}},
+		[]pipeline.TaskDependency{{PropagateResult: true, InputTask: pipeline.Task(ds1Parse)}},
 		[]pipeline.Task{answer1},
-		0)
-	ds2_multiply.BaseTask = pipeline.NewBaseTask(
+		0,
+	)
+	ds2Multiply.BaseTask = pipeline.NewBaseTask(
 		5,
 		"ds2_multiply",
-		[]pipeline.TaskDependency{{PropagateResult: true, InputTask: pipeline.Task(ds2_parse)}},
+		[]pipeline.TaskDependency{{PropagateResult: true, InputTask: pipeline.Task(ds2Parse)}},
 		[]pipeline.Task{answer1},
-		0)
-	ds1_parse.BaseTask = pipeline.NewBaseTask(
+		0,
+	)
+	ds1Parse.BaseTask = pipeline.NewBaseTask(
 		1,
 		"ds1_parse",
 		[]pipeline.TaskDependency{{PropagateResult: true, InputTask: pipeline.Task(ds1)}},
-		[]pipeline.Task{ds1_multiply},
-		0)
-	ds2_parse.BaseTask = pipeline.NewBaseTask(
+		[]pipeline.Task{ds1Multiply},
+		0,
+	)
+	ds2Parse.BaseTask = pipeline.NewBaseTask(
 		4,
 		"ds2_parse",
 		[]pipeline.TaskDependency{{PropagateResult: true, InputTask: pipeline.Task(ds2)}},
-		[]pipeline.Task{ds2_multiply},
-		0)
-	ds1.BaseTask = pipeline.NewBaseTask(0, "ds1", nil, []pipeline.Task{ds1_parse}, 0)
-	ds2.BaseTask = pipeline.NewBaseTask(3, "ds2", nil, []pipeline.Task{ds2_parse}, 0)
-	expectedTasks := []pipeline.Task{ds1, ds1_parse, ds1_multiply, ds2, ds2_parse, ds2_multiply, answer1, answer2}
-	_, bridge := cltest.MustCreateBridge(t, db, cltest.BridgeOpts{}, config.Database())
-	_, bridge2 := cltest.MustCreateBridge(t, db, cltest.BridgeOpts{}, config.Database())
+		[]pipeline.Task{ds2Multiply},
+		0,
+	)
+	ds1.BaseTask = pipeline.NewBaseTask(0, "ds1", nil, []pipeline.Task{ds1Parse}, 0)
+	ds2.BaseTask = pipeline.NewBaseTask(3, "ds2", nil, []pipeline.Task{ds2Parse}, 0)
+	expectedTasks := []pipeline.Task{ds1, ds1Parse, ds1Multiply, ds2, ds2Parse, ds2Multiply, answer1, answer2}
+	_, bridge := cltest.MustCreateBridge(t, db, cltest.BridgeOpts{})
+	_, bridge2 := cltest.MustCreateBridge(t, db, cltest.BridgeOpts{})
 
 	t.Run("creates task DAGs", func(t *testing.T) {
+		ctx := t.Context()
 		clearJobsDb(t, db)
 
-		orm := pipeline.NewORM(db, logger.TestLogger(t), config.Database(), config.JobPipeline().MaxSuccessfulRuns())
+		orm := pipeline.NewORM(db, logger.TestLogger(t), config.JobPipeline().MaxSuccessfulRuns())
 
 		p, err := pipeline.Parse(DotStr)
 		require.NoError(t, err)
 
-		specID, err = orm.CreateSpec(*p, models.Interval(0))
+		specID, err = orm.CreateSpec(ctx, *p, sqlutil.Interval(0))
 		require.NoError(t, err)
 
 		var pipelineSpecs []pipeline.Spec
@@ -143,36 +150,42 @@ func TestPipelineORM_Integration(t *testing.T) {
 		require.Equal(t, specID, pipelineSpecs[0].ID)
 		require.Equal(t, DotStr, pipelineSpecs[0].DotDagSource)
 
-		_, err = db.Exec(`DELETE FROM pipeline_specs`)
+		_, err = db.ExecContext(ctx, `DELETE FROM pipeline_specs`)
 		require.NoError(t, err)
 	})
 
 	t.Run("creates runs", func(t *testing.T) {
 		lggr := logger.TestLogger(t)
-		cfg := configtest.NewTestGeneralConfig(t)
 		clearJobsDb(t, db)
-		orm := pipeline.NewORM(db, logger.TestLogger(t), cfg.Database(), cfg.JobPipeline().MaxSuccessfulRuns())
-		btORM := bridges.NewORM(db, logger.TestLogger(t), cfg.Database())
-		relayExtenders := evmtest.NewChainRelayExtenders(t, evmtest.TestChainOpts{Client: evmtest.NewEthClientMockWithDefaultChain(t), DB: db, GeneralConfig: config, KeyStore: ethKeyStore})
-		legacyChains := evmrelay.NewLegacyChainsFromRelayerExtenders(relayExtenders)
-		runner := pipeline.NewRunner(orm, btORM, config.JobPipeline(), cfg.WebServer(), legacyChains, nil, nil, lggr, nil, nil)
+		orm := pipeline.NewORM(db, logger.TestLogger(t), config.JobPipeline().MaxSuccessfulRuns())
+		btORM := bridges.NewORM(db)
+		legacyChains := evmtest.NewLegacyChains(t, evmtest.TestChainOpts{
+			ChainConfigs:   config.EVMConfigs(),
+			DatabaseConfig: config.Database(),
+			FeatureConfig:  config.Feature(),
+			ListenerConfig: config.Database().Listener(),
+			Client:         client.NewNullClient(big.NewInt(evmtest.NullClientChainID), logger.TestLogger(t)),
+			DB:             db,
+			KeyStore:       keyStore.Eth(),
+		})
+		runner := pipeline.NewRunner(orm, btORM, config.JobPipeline(), config.WebServer(), legacyChains, nil, nil, lggr, nil, nil)
 
-		jobORM := NewTestORM(t, db, orm, btORM, keyStore, cfg.Database())
+		jobORM := NewTestORM(t, db, orm, btORM, keyStore)
 
 		dbSpec := makeVoterTurnoutOCRJobSpec(t, transmitterAddress, bridge.Name.String(), bridge2.Name.String())
 
 		// Need a job in order to create a run
-		require.NoError(t, jobORM.CreateJob(dbSpec))
+		require.NoError(t, jobORM.CreateJob(t.Context(), dbSpec))
 
 		var pipelineSpecs []pipeline.Spec
-		sql := `SELECT * FROM pipeline_specs;`
+		sql := `SELECT pipeline_specs.*, job_pipeline_specs.job_id FROM pipeline_specs JOIN job_pipeline_specs ON (pipeline_specs.id = job_pipeline_specs.pipeline_spec_id);`
 		require.NoError(t, db.Select(&pipelineSpecs, sql))
 		require.Len(t, pipelineSpecs, 1)
 		require.Equal(t, dbSpec.PipelineSpecID, pipelineSpecs[0].ID)
 		pipelineSpecID := pipelineSpecs[0].ID
 
 		// Create the run
-		runID, _, err := runner.ExecuteAndInsertFinishedRun(testutils.Context(t), pipelineSpecs[0], pipeline.NewVarsFrom(nil), lggr, true)
+		runID, _, err := runner.ExecuteAndInsertFinishedRun(t.Context(), pipelineSpecs[0], pipeline.NewVarsFrom(nil), true)
 		require.NoError(t, err)
 
 		// Check the DB for the pipeline.Run

@@ -1,6 +1,9 @@
 package resolver
 
 import (
+	"math"
+	"strconv"
+
 	"github.com/graph-gophers/graphql-go"
 
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
@@ -38,14 +41,6 @@ func (r *SpecResolver) ToFluxMonitorSpec() (*FluxMonitorSpecResolver, bool) {
 	}
 
 	return &FluxMonitorSpecResolver{spec: *r.j.FluxMonitorSpec}, true
-}
-
-func (r *SpecResolver) ToKeeperSpec() (*KeeperSpecResolver, bool) {
-	if r.j.Type != job.Keeper {
-		return nil, false
-	}
-
-	return &KeeperSpecResolver{spec: *r.j.KeeperSpec}, true
 }
 
 func (r *SpecResolver) ToOCRSpec() (*OCRSpecResolver, bool) {
@@ -117,12 +112,84 @@ func (r *SpecResolver) ToGatewaySpec() (*GatewaySpecResolver, bool) {
 	return &GatewaySpecResolver{spec: *r.j.GatewaySpec}, true
 }
 
+func (r *SpecResolver) ToWorkflowSpec() (*WorkflowSpecResolver, bool) {
+	if r.j.Type != job.Workflow {
+		return nil, false
+	}
+
+	return &WorkflowSpecResolver{spec: *r.j.WorkflowSpec}, true
+}
+
+func (r *SpecResolver) ToStandardCapabilitiesSpec() (*StandardCapabilitiesSpecResolver, bool) {
+	if r.j.Type != job.StandardCapabilities {
+		return nil, false
+	}
+
+	return &StandardCapabilitiesSpecResolver{spec: *r.j.StandardCapabilitiesSpec}, true
+}
+
+func (r *SpecResolver) ToStreamSpec() (*StreamSpecResolver, bool) {
+	if r.j.Type != job.Stream {
+		return nil, false
+	}
+	res := &StreamSpecResolver{}
+	if r.j.StreamID != nil {
+		sid := strconv.FormatUint(uint64(*r.j.StreamID), 10)
+		res.streamID = &sid
+	}
+
+	return res, true
+}
+
+func (r *SpecResolver) ToCCIPSpec() (*CCIPSpecResolver, bool) {
+	if r.j.Type != job.CCIP {
+		return nil, false
+	}
+
+	return &CCIPSpecResolver{spec: *r.j.CCIPSpec}, true
+}
+
+func (r *SpecResolver) ToCCVCommitteeVerifierSpec() (*CCVCommitteeVerifierSpecResolver, bool) {
+	if r.j.Type != job.CCVCommitteeVerifier {
+		return nil, false
+	}
+
+	return &CCVCommitteeVerifierSpecResolver{spec: *r.j.CCVCommitteeVerifierSpec}, true
+}
+
+func (r *SpecResolver) ToCCVExecutorSpec() (*CCVExecutorSpecResolver, bool) {
+	if r.j.Type != job.CCVExecutor {
+		return nil, false
+	}
+
+	return &CCVExecutorSpecResolver{spec: *r.j.CCVExecutorSpec}, true
+}
+
+func (r *SpecResolver) ToCRESettingsSpec() (*CRESettingsSpecResolver, bool) {
+	if r.j.Type != job.CRESettings {
+		return nil, false
+	}
+
+	return &CRESettingsSpecResolver{spec: *r.j.CRESettingsSpec}, true
+}
+
 type CronSpecResolver struct {
 	spec job.CronSpec
 }
 
 func (r *CronSpecResolver) Schedule() string {
 	return r.spec.CronSchedule
+}
+
+// EVMChainID resolves the spec's evm chain id.
+func (r *CronSpecResolver) EVMChainID() *string {
+	if r.spec.EVMChainID == nil {
+		return nil
+	}
+
+	chainID := r.spec.EVMChainID.String()
+
+	return &chainID
 }
 
 // CreatedAt resolves the spec's created at timestamp.
@@ -158,6 +225,9 @@ func (r *DirectRequestSpecResolver) EVMChainID() *string {
 // MinIncomingConfirmations resolves the spec's min incoming confirmations.
 func (r *DirectRequestSpecResolver) MinIncomingConfirmations() int32 {
 	if r.spec.MinIncomingConfirmations.Valid {
+		if r.spec.MinIncomingConfirmations.Uint32 > math.MaxInt32 {
+			return math.MaxInt32
+		}
 		return int32(r.spec.MinIncomingConfirmations.Uint32)
 	}
 
@@ -248,9 +318,9 @@ func (r *FluxMonitorSpecResolver) IdleTimerPeriod() string {
 // MinPayment resolves the spec's min payment.
 func (r *FluxMonitorSpecResolver) MinPayment() *string {
 	if r.spec.MinPayment != nil {
-		min := r.spec.MinPayment.String()
+		minPayment := r.spec.MinPayment.String()
 
-		return &min
+		return &minPayment
 	}
 	return nil
 }
@@ -268,44 +338,6 @@ func (r *FluxMonitorSpecResolver) PollTimerPeriod() string {
 // Threshold resolves the spec's deviation threshold.
 func (r *FluxMonitorSpecResolver) Threshold() float64 {
 	return float64(r.spec.Threshold)
-}
-
-type KeeperSpecResolver struct {
-	spec job.KeeperSpec
-}
-
-// ContractAddress resolves the spec's contract address.
-func (r *KeeperSpecResolver) ContractAddress() string {
-	return r.spec.ContractAddress.String()
-}
-
-// CreatedAt resolves the spec's created at timestamp.
-func (r *KeeperSpecResolver) CreatedAt() graphql.Time {
-	return graphql.Time{Time: r.spec.CreatedAt}
-}
-
-// EVMChainID resolves the spec's evm chain id.
-func (r *KeeperSpecResolver) EVMChainID() *string {
-	if r.spec.EVMChainID == nil {
-		return nil
-	}
-
-	chainID := r.spec.EVMChainID.String()
-
-	return &chainID
-}
-
-// FromAddress resolves the spec's from contract address.
-//
-// Because VRF has an non required field of the same name, we have to be
-// consistent in our return value of using a *string instead of a string even
-// though this is a required field for the KeeperSpec.
-//
-// http://spec.graphql.org/draft/#sec-Field-Selection-Merging
-func (r *KeeperSpecResolver) FromAddress() *string {
-	addr := r.spec.FromAddress.String()
-
-	return &addr
 }
 
 type OCRSpecResolver struct {
@@ -558,12 +590,19 @@ func (r *OCR2SpecResolver) FeedID() *string {
 	return &feedID
 }
 
+func (r *OCR2SpecResolver) AllowNoBootstrappers() bool {
+	return r.spec.AllowNoBootstrappers
+}
+
 type VRFSpecResolver struct {
 	spec job.VRFSpec
 }
 
 // MinIncomingConfirmations resolves the spec's min incoming confirmations.
 func (r *VRFSpecResolver) MinIncomingConfirmations() int32 {
+	if r.spec.MinIncomingConfirmations > math.MaxInt32 {
+		return math.MaxInt32
+	}
 	return int32(r.spec.MinIncomingConfirmations)
 }
 
@@ -614,6 +653,12 @@ func (r *VRFSpecResolver) PublicKey() string {
 // RequestedConfsDelay resolves the spec's requested conf delay.
 func (r *VRFSpecResolver) RequestedConfsDelay() int32 {
 	// GraphQL doesn't support 64 bit integers, so we have to cast.
+	if r.spec.RequestedConfsDelay > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if r.spec.RequestedConfsDelay < math.MinInt32 {
+		return math.MinInt32
+	}
 	return int32(r.spec.RequestedConfsDelay)
 }
 
@@ -648,6 +693,9 @@ func (r *VRFSpecResolver) CustomRevertsPipelineEnabled() *bool {
 
 // ChunkSize resolves the spec's chunk size.
 func (r *VRFSpecResolver) ChunkSize() int32 {
+	if r.spec.ChunkSize > math.MaxInt32 {
+		return math.MaxInt32
+	}
 	return int32(r.spec.ChunkSize)
 }
 
@@ -693,7 +741,7 @@ type BlockhashStoreSpecResolver struct {
 	spec job.BlockhashStoreSpec
 }
 
-// CoordinatorV1Address returns the address of the V1 Coordinator, if any.
+// CoordinatorV1Address returns the legacy V1 coordinator address from persisted jobs, if any.
 func (b *BlockhashStoreSpecResolver) CoordinatorV1Address() *string {
 	if b.spec.CoordinatorV1Address == nil {
 		return nil
@@ -792,7 +840,7 @@ type BlockHeaderFeederSpecResolver struct {
 	spec job.BlockHeaderFeederSpec
 }
 
-// CoordinatorV1Address returns the address of the V1 Coordinator, if any.
+// CoordinatorV1Address returns the legacy V1 coordinator address from persisted jobs, if any.
 func (b *BlockHeaderFeederSpecResolver) CoordinatorV1Address() *string {
 	if b.spec.CoordinatorV1Address == nil {
 		return nil
@@ -950,6 +998,11 @@ func (r *BootstrapSpecResolver) ContractConfigConfirmations() *int32 {
 	return &confirmations
 }
 
+// RelayConfig resolves the spec's onchain signing strategy config
+func (r *OCR2SpecResolver) OnchainSigningStrategy() gqlscalar.Map {
+	return gqlscalar.Map(r.spec.OnchainSigningStrategy)
+}
+
 // CreatedAt resolves the spec's created at timestamp.
 func (r *BootstrapSpecResolver) CreatedAt() graphql.Time {
 	return graphql.Time{Time: r.spec.CreatedAt}
@@ -969,4 +1022,174 @@ func (r *GatewaySpecResolver) GatewayConfig() gqlscalar.Map {
 
 func (r *GatewaySpecResolver) CreatedAt() graphql.Time {
 	return graphql.Time{Time: r.spec.CreatedAt}
+}
+
+type WorkflowSpecResolver struct {
+	spec job.WorkflowSpec
+}
+
+func (r *WorkflowSpecResolver) ID() graphql.ID {
+	return graphql.ID(stringutils.FromInt32(r.spec.ID))
+}
+
+func (r *WorkflowSpecResolver) WorkflowID() string {
+	return r.spec.WorkflowID
+}
+
+func (r *WorkflowSpecResolver) Workflow() string {
+	return r.spec.Workflow
+}
+
+func (r *WorkflowSpecResolver) WorkflowOwner() string {
+	return r.spec.WorkflowOwner
+}
+
+func (r *WorkflowSpecResolver) CreatedAt() graphql.Time {
+	return graphql.Time{Time: r.spec.CreatedAt}
+}
+
+func (r *WorkflowSpecResolver) UpdatedAt() graphql.Time {
+	return graphql.Time{Time: r.spec.UpdatedAt}
+}
+
+type StandardCapabilitiesSpecResolver struct {
+	spec job.StandardCapabilitiesSpec
+}
+
+func (r *StandardCapabilitiesSpecResolver) ID() graphql.ID {
+	return graphql.ID(stringutils.FromInt32(r.spec.ID))
+}
+
+func (r *StandardCapabilitiesSpecResolver) CreatedAt() graphql.Time {
+	return graphql.Time{Time: r.spec.CreatedAt}
+}
+
+func (r *StandardCapabilitiesSpecResolver) Command() string {
+	return r.spec.Command
+}
+
+func (r *StandardCapabilitiesSpecResolver) Config() *string {
+	return &r.spec.Config
+}
+
+type StreamSpecResolver struct {
+	streamID *string
+}
+
+func (r *StreamSpecResolver) StreamID() *string {
+	return r.streamID
+}
+
+type CCVCommitteeVerifierSpecResolver struct {
+	spec job.CCVCommitteeVerifierSpec
+}
+
+func (r *CCVCommitteeVerifierSpecResolver) CreatedAt() graphql.Time {
+	return graphql.Time{Time: r.spec.CreatedAt}
+}
+
+func (r *CCVCommitteeVerifierSpecResolver) UpdatedAt() graphql.Time {
+	return graphql.Time{Time: r.spec.UpdatedAt}
+}
+
+func (r *CCVCommitteeVerifierSpecResolver) ID() graphql.ID {
+	return graphql.ID(stringutils.FromInt32(r.spec.ID))
+}
+
+func (r *CCVCommitteeVerifierSpecResolver) CommitteeVerifierConfig() string {
+	return r.spec.CommitteeVerifierConfig
+}
+
+type CCVExecutorSpecResolver struct {
+	spec job.CCVExecutorSpec
+}
+
+func (r *CCVExecutorSpecResolver) CreatedAt() graphql.Time {
+	return graphql.Time{Time: r.spec.CreatedAt}
+}
+
+func (r *CCVExecutorSpecResolver) UpdatedAt() graphql.Time {
+	return graphql.Time{Time: r.spec.UpdatedAt}
+}
+
+func (r *CCVExecutorSpecResolver) ID() graphql.ID {
+	return graphql.ID(stringutils.FromInt32(r.spec.ID))
+}
+
+func (r *CCVExecutorSpecResolver) ExecutorConfig() string {
+	return r.spec.ExecutorConfig
+}
+
+type CCIPSpecResolver struct {
+	spec job.CCIPSpec
+}
+
+func (r *CCIPSpecResolver) CreatedAt() graphql.Time {
+	return graphql.Time{Time: r.spec.CreatedAt}
+}
+
+func (r *CCIPSpecResolver) UpdatedAt() graphql.Time {
+	return graphql.Time{Time: r.spec.UpdatedAt}
+}
+
+func (r *CCIPSpecResolver) ID() graphql.ID {
+	return graphql.ID(stringutils.FromInt32(r.spec.ID))
+}
+
+func (r *CCIPSpecResolver) CapabilityLabelledName() string {
+	return r.spec.CapabilityLabelledName
+}
+
+func (r *CCIPSpecResolver) CapabilityVersion() string {
+	return r.spec.CapabilityVersion
+}
+
+func (r *CCIPSpecResolver) P2PV2Bootstrappers() *[]string {
+	if len(r.spec.P2PV2Bootstrappers) == 0 {
+		return nil
+	}
+
+	peers := []string(r.spec.P2PV2Bootstrappers)
+
+	return &peers
+}
+
+func (r *CCIPSpecResolver) OCRKeyBundleIDs() gqlscalar.Map {
+	return gqlscalar.Map(r.spec.OCRKeyBundleIDs)
+}
+
+func (r *CCIPSpecResolver) RelayConfigs() gqlscalar.Map {
+	return gqlscalar.Map(r.spec.RelayConfigs)
+}
+
+func (r *CCIPSpecResolver) PluginConfig() gqlscalar.Map {
+	return gqlscalar.Map(r.spec.PluginConfig)
+}
+
+func (r *CCIPSpecResolver) P2PKeyID() string {
+	return r.spec.P2PKeyID
+}
+
+type CRESettingsSpecResolver struct {
+	spec job.CRESettingsSpec
+}
+
+func (r *CRESettingsSpecResolver) CreatedAt() graphql.Time {
+	return graphql.Time{Time: r.spec.CreatedAt}
+}
+
+func (r *CRESettingsSpecResolver) UpdatedAt() graphql.Time {
+	return graphql.Time{Time: r.spec.UpdatedAt}
+}
+
+func (r *CRESettingsSpecResolver) ID() graphql.ID {
+	return graphql.ID(stringutils.FromInt32(r.spec.ID))
+}
+
+func (r *CRESettingsSpecResolver) Settings() string {
+	return r.spec.Settings
+}
+
+func (r *CRESettingsSpecResolver) Hash() string {
+	return r.spec.Hash
 }

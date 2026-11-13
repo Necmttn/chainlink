@@ -2,7 +2,9 @@ package pipeline
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -10,12 +12,11 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"go.uber.org/multierr"
 
-	evmclient "github.com/smartcontractkit/chainlink/v2/core/chains/evm/client"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
+	evmclient "github.com/smartcontractkit/chainlink-evm/pkg/client"
+	"github.com/smartcontractkit/chainlink-evm/pkg/utils"
 )
 
 // Return types:
@@ -33,6 +34,7 @@ type ETHCallTask struct {
 	GasUnlimited        string `json:"gasUnlimited"`
 	ExtractRevertReason bool   `json:"extractRevertReason"`
 	EVMChainID          string `json:"evmChainID" mapstructure:"evmChainID"`
+	Block               string `json:"block"`
 
 	specGasLimit *uint32
 	legacyChains legacyevm.LegacyChainContainer
@@ -78,8 +80,9 @@ func (t *ETHCallTask) Run(ctx context.Context, lggr logger.Logger, vars Vars, in
 		gasFeeCap    MaybeBigIntParam
 		gasUnlimited BoolParam
 		chainID      StringParam
+		block        StringParam
 	)
-	err = multierr.Combine(
+	err = stderrors.Join(
 		errors.Wrap(ResolveParam(&contractAddr, From(VarExpr(t.Contract, vars), NonemptyString(t.Contract))), "contract"),
 		errors.Wrap(ResolveParam(&from, From(VarExpr(t.From, vars), NonemptyString(t.From), utils.ZeroAddress)), "from"),
 		errors.Wrap(ResolveParam(&data, From(VarExpr(t.Data, vars), JSONWithVarExprs(t.Data, vars, false))), "data"),
@@ -89,6 +92,7 @@ func (t *ETHCallTask) Run(ctx context.Context, lggr logger.Logger, vars Vars, in
 		errors.Wrap(ResolveParam(&gasFeeCap, From(VarExpr(t.GasFeeCap, vars), t.GasFeeCap)), "gasFeeCap"),
 		errors.Wrap(ResolveParam(&chainID, From(VarExpr(t.getEvmChainID(), vars), NonemptyString(t.getEvmChainID()), "")), "evmChainID"),
 		errors.Wrap(ResolveParam(&gasUnlimited, From(VarExpr(t.GasUnlimited, vars), NonemptyString(t.GasUnlimited), false)), "gasUnlimited"),
+		errors.Wrap(ResolveParam(&block, From(VarExpr(t.Block, vars), t.Block)), "block"),
 	)
 	if err != nil {
 		return Result{Error: err}, runInfo
@@ -101,17 +105,21 @@ func (t *ETHCallTask) Run(ctx context.Context, lggr logger.Logger, vars Vars, in
 		err = fmt.Errorf("%w: %s: %w", ErrInvalidEVMChainID, chainID, err)
 		return Result{Error: err}, runInfo
 	}
+	legacyChain, ok := chain.(legacyevm.Chain)
+	if !ok {
+		return Result{Error: ErrUnsupportedInLOOPPMode}, runInfo
+	}
 
-	var selectedGas uint32
+	var selectedGas uint64
 	if gasUnlimited {
 		if gas > 0 {
 			return Result{Error: errors.Wrapf(ErrBadInput, "gas must be zero when gasUnlimited is true")}, runInfo
 		}
 	} else {
 		if gas > 0 {
-			selectedGas = uint32(gas)
+			selectedGas = uint64(gas)
 		} else {
-			selectedGas = SelectGasLimit(chain.Config().EVM().GasEstimator(), t.jobType, t.specGasLimit)
+			selectedGas = SelectGasLimit(legacyChain.Config().EVM().GasEstimator(), t.jobType, t.specGasLimit)
 		}
 	}
 
@@ -119,19 +127,27 @@ func (t *ETHCallTask) Run(ctx context.Context, lggr logger.Logger, vars Vars, in
 		To:        (*common.Address)(&contractAddr),
 		From:      (common.Address)(from),
 		Data:      []byte(data),
-		Gas:       uint64(selectedGas),
+		Gas:       selectedGas,
 		GasPrice:  gasPrice.BigInt(),
 		GasTipCap: gasTipCap.BigInt(),
 		GasFeeCap: gasFeeCap.BigInt(),
 	}
 
-	lggr = lggr.With("gas", call.Gas).
+	lggr = logger.Sugared(lggr).With("gas", call.Gas).
 		With("gasPrice", call.GasPrice).
 		With("gasTipCap", call.GasTipCap).
 		With("gasFeeCap", call.GasFeeCap)
 
 	start := time.Now()
-	resp, err := chain.Client().CallContract(ctx, call, nil)
+
+	var resp []byte
+	blockStr := block.String()
+	if blockStr == "" || strings.ToLower(blockStr) == "latest" {
+		resp, err = legacyChain.Client().CallContract(ctx, call, nil)
+	} else if strings.ToLower(blockStr) == "pending" {
+		resp, err = legacyChain.Client().PendingCallContract(ctx, call)
+	}
+
 	elapsed := time.Since(start)
 	if err != nil {
 		if t.ExtractRevertReason {
@@ -149,6 +165,5 @@ func (t *ETHCallTask) Run(ctx context.Context, lggr logger.Logger, vars Vars, in
 	}
 
 	promETHCallTime.WithLabelValues(t.DotID()).Set(float64(elapsed))
-
 	return Result{Value: resp}, runInfo
 }

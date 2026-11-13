@@ -8,27 +8,51 @@ import (
 	"maps"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/smartcontractkit/chainlink-common/pkg/config"
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+
 	"github.com/smartcontractkit/chainlink/v2/core/config/env"
 	"github.com/smartcontractkit/chainlink/v2/core/config/toml"
 )
+
+func TestGeneralConfig_ResourceAttributesShardIndex(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		toml     string
+		expected string
+	}{
+		{"ShardingEnabled", "[Sharding]\nShardingEnabled = true\nShardIndex = 2\n", "2"},
+		{"ShardingDisabled", "[Sharding]\nShardingEnabled = false\nShardIndex = 2\n", ""},
+		{"ExplicitAttributeWins", "[Telemetry.ResourceAttributes]\nshardIndex = '7'\n\n[Sharding]\nShardingEnabled = true\nShardIndex = 2\n", "7"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := GeneralConfigOpts{ConfigStrings: []string{tt.toml}}.New()
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, cfg.ResourceAttributes()["shardIndex"])
+		})
+	}
+}
 
 func TestTOMLGeneralConfig_Defaults(t *testing.T) {
 	config, err := GeneralConfigOpts{}.New()
 	require.NoError(t, err)
 	assert.Equal(t, (*url.URL)(nil), config.WebServer().BridgeResponseURL())
-	assert.False(t, config.EVMRPCEnabled())
+	assert.False(t, config.EVMConfigs().RPCEnabled())
 	assert.False(t, config.EVMEnabled())
-	assert.False(t, config.CosmosEnabled())
 	assert.False(t, config.SolanaEnabled())
 	assert.False(t, config.StarkNetEnabled())
-	assert.Equal(t, false, config.JobPipeline().ExternalInitiatorsEnabled())
+	assert.False(t, config.TronEnabled())
+	assert.False(t, config.JobPipeline().ExternalInitiatorsEnabled())
 	assert.Equal(t, 15*time.Minute, config.WebServer().SessionTimeout().Duration())
 }
 
@@ -52,7 +76,8 @@ func TestTOMLGeneralConfig_InsecureConfig(t *testing.T) {
 				*c.Insecure.DisableRateLimiting = true
 				*c.Insecure.InfiniteDepthQueries = true
 				*c.AuditLogger.Enabled = true
-			}}.New()
+			},
+		}.New()
 		require.NoError(t, err)
 
 		// Just asserting that override logic work on a safe config
@@ -81,6 +106,42 @@ func TestTOMLGeneralConfig_InsecureConfig(t *testing.T) {
 	})
 }
 
+func TestGeneralConfigOpts_ConcurrentOverrideAndNew(t *testing.T) {
+	t.Parallel()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for range 100 {
+			_, err := GeneralConfigOpts{
+				OverrideFn: func(c *Config, s *Secrets) {
+					*c.Insecure.DevWebServer = true
+					*c.AuditLogger.Enabled = true
+				},
+			}.New()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for range 100 {
+			opts := GeneralConfigOpts{}
+			if _, err := opts.New(); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+}
+
 func TestValidateDB(t *testing.T) {
 	t.Setenv(string(env.Config), "")
 
@@ -92,7 +153,7 @@ func TestValidateDB(t *testing.T) {
 
 		err = config.ValidateDB()
 		require.Error(t, err)
-		require.ErrorIs(t, err, ErrInvalidSecrets)
+		require.ErrorIs(t, err, InvalidSecretsError{})
 	})
 
 	t.Run("dev url", func(t *testing.T) {
@@ -112,9 +173,8 @@ func TestValidateDB(t *testing.T) {
 		require.NoError(t, err)
 		err = config.ValidateDB()
 		require.Error(t, err)
-		require.ErrorIs(t, err, ErrInvalidSecrets)
+		require.ErrorIs(t, err, InvalidSecretsError{})
 	})
-
 }
 
 func TestConfig_LogSQL(t *testing.T) {
@@ -122,10 +182,10 @@ func TestConfig_LogSQL(t *testing.T) {
 	require.NoError(t, err)
 
 	config.SetLogSQL(true)
-	assert.Equal(t, config.Database().LogSQL(), true)
+	assert.True(t, config.Database().LogSQL())
 
 	config.SetLogSQL(false)
-	assert.Equal(t, config.Database().LogSQL(), false)
+	assert.False(t, config.Database().LogSQL())
 }
 
 //go:embed testdata/mergingsecretsdata/secrets-database.toml
@@ -152,6 +212,9 @@ var thresholdSecretsTOML string
 //go:embed testdata/mergingsecretsdata/secrets-webserver-ldap.toml
 var WebServerLDAPSecretsTOML string
 
+//go:embed testdata/mergingsecretsdata/secrets-webserver-oidc.toml
+var WebServerOIDCSecretsTOML string
+
 func TestConfig_SecretsMerging(t *testing.T) {
 	t.Run("verify secrets merging in GeneralConfigOpts.New()", func(t *testing.T) {
 		databaseSecrets, err := parseSecrets(databaseSecretsTOML)
@@ -170,6 +233,8 @@ func TestConfig_SecretsMerging(t *testing.T) {
 		require.NoErrorf(t, err7, "error: %s", err7)
 		webserverLDAPSecrets, err8 := parseSecrets(WebServerLDAPSecretsTOML)
 		require.NoErrorf(t, err8, "error: %s", err8)
+		webserverOIDCSecrets, err8 := parseSecrets(WebServerOIDCSecretsTOML)
+		require.NoErrorf(t, err8, "error: %s", err8)
 
 		opts := new(GeneralConfigOpts)
 		configFiles := []string{
@@ -184,6 +249,7 @@ func TestConfig_SecretsMerging(t *testing.T) {
 			"testdata/mergingsecretsdata/secrets-mercury-split-two.toml",
 			"testdata/mergingsecretsdata/secrets-threshold.toml",
 			"testdata/mergingsecretsdata/secrets-webserver-ldap.toml",
+			"testdata/mergingsecretsdata/secrets-webserver-oidc.toml",
 		}
 		err = opts.Setup(configFiles, secretsFiles)
 		require.NoErrorf(t, err, "error: %s", err)
@@ -194,15 +260,17 @@ func TestConfig_SecretsMerging(t *testing.T) {
 		assert.Equal(t, databaseSecrets.Database.URL.URL().String(), opts.Secrets.Database.URL.URL().String())
 		assert.Equal(t, databaseSecrets.Database.BackupURL.URL().String(), opts.Secrets.Database.BackupURL.URL().String())
 
-		assert.Equal(t, (string)(*passwordSecrets.Password.Keystore), (string)(*opts.Secrets.Password.Keystore))
-		assert.Equal(t, (string)(*passwordSecrets.Password.VRF), (string)(*opts.Secrets.Password.VRF))
-		assert.Equal(t, (string)(*pyroscopeSecrets.Pyroscope.AuthToken), (string)(*opts.Secrets.Pyroscope.AuthToken))
-		assert.Equal(t, (string)(*prometheusSecrets.Prometheus.AuthToken), (string)(*opts.Secrets.Prometheus.AuthToken))
-		assert.Equal(t, (string)(*thresholdSecrets.Threshold.ThresholdKeyShare), (string)(*opts.Secrets.Threshold.ThresholdKeyShare))
+		assert.Equal(t, string(*passwordSecrets.Password.Keystore), string(*opts.Password.Keystore))
+		assert.Equal(t, string(*passwordSecrets.Password.VRF), string(*opts.Password.VRF))
+		assert.Equal(t, string(*pyroscopeSecrets.Pyroscope.AuthToken), string(*opts.Secrets.Pyroscope.AuthToken))
+		assert.Equal(t, string(*prometheusSecrets.Prometheus.AuthToken), string(*opts.Prometheus.AuthToken))
+		assert.Equal(t, string(*thresholdSecrets.Threshold.ThresholdKeyShare), string(*opts.Threshold.ThresholdKeyShare))
 
 		assert.Equal(t, webserverLDAPSecrets.WebServer.LDAP.ServerAddress.URL().String(), opts.Secrets.WebServer.LDAP.ServerAddress.URL().String())
 		assert.Equal(t, webserverLDAPSecrets.WebServer.LDAP.ReadOnlyUserLogin, opts.Secrets.WebServer.LDAP.ReadOnlyUserLogin)
 		assert.Equal(t, webserverLDAPSecrets.WebServer.LDAP.ReadOnlyUserPass, opts.Secrets.WebServer.LDAP.ReadOnlyUserPass)
+
+		assert.Equal(t, webserverOIDCSecrets.WebServer.OIDC.ClientSecret, opts.Secrets.WebServer.OIDC.ClientSecret)
 
 		err = assertDeepEqualityMercurySecrets(*merge(mercurySecrets_a.Mercury, mercurySecrets_b.Mercury), opts.Secrets.Mercury)
 		require.NoErrorf(t, err, "merged mercury secrets unequal")
@@ -211,14 +279,14 @@ func TestConfig_SecretsMerging(t *testing.T) {
 
 func parseSecrets(secrets string) (*Secrets, error) {
 	var s Secrets
-	if err := config.DecodeTOML(strings.NewReader(secrets), &s); err != nil {
+	if err := commonconfig.DecodeTOML(strings.NewReader(secrets), &s); err != nil {
 		return nil, fmt.Errorf("failed to decode secrets TOML: %w", err)
 	}
 
 	return &s, nil
 }
 
-func assertDeepEqualityMercurySecrets(expected toml.MercurySecrets, actual toml.MercurySecrets) error {
+func assertDeepEqualityMercurySecrets(expected, actual toml.MercurySecrets) error {
 	if len(expected.Credentials) != len(actual.Credentials) {
 		return fmt.Errorf("maps are not equal in length: len(expected): %d, len(actual): %d", len(expected.Credentials), len(actual.Credentials))
 	}
@@ -226,10 +294,10 @@ func assertDeepEqualityMercurySecrets(expected toml.MercurySecrets, actual toml.
 	for key, value := range expected.Credentials {
 		equal := true
 		actualValue := actual.Credentials[key]
-		if (string)(*value.Username) != (string)(*actualValue.Username) {
+		if string(*value.Username) != string(*actualValue.Username) {
 			equal = false
 		}
-		if (string)(*value.Password) != (string)(*actualValue.Password) {
+		if string(*value.Password) != string(*actualValue.Password) {
 			equal = false
 		}
 		if value.URL.URL().String() != actualValue.URL.URL().String() {
@@ -237,14 +305,14 @@ func assertDeepEqualityMercurySecrets(expected toml.MercurySecrets, actual toml.
 		}
 		if !equal {
 			return fmt.Errorf("maps are not equal: expected[%s] = {%s, %s, %s}, actual[%s] = {%s, %s, %s}",
-				key, (string)(*value.Username), (string)(*value.Password), value.URL.URL().String(),
-				key, (string)(*actualValue.Username), (string)(*actualValue.Password), actualValue.URL.URL().String())
+				key, string(*value.Username), string(*value.Password), value.URL.URL().String(),
+				key, string(*actualValue.Username), string(*actualValue.Password), actualValue.URL.URL().String())
 		}
 	}
 	return nil
 }
 
-func merge(map1 toml.MercurySecrets, map2 toml.MercurySecrets) *toml.MercurySecrets {
+func merge(map1, map2 toml.MercurySecrets) *toml.MercurySecrets {
 	combinedMap := make(map[string]toml.MercuryCredentials)
 	maps.Copy(combinedMap, map1.Credentials)
 	maps.Copy(combinedMap, map2.Credentials)

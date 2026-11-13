@@ -1,6 +1,5 @@
 # EVM defaults depend on ChainID:
 #
-# **EXTENDED**
 [[EVM]]
 # ChainID is the EVM chain ID. Mandatory.
 ChainID = '1' # Example
@@ -14,14 +13,32 @@ BlockBackfillDepth = 10 # Default
 # BlockBackfillSkip enables skipping of very long backfills.
 BlockBackfillSkip = false # Default
 # ChainType is automatically detected from chain ID. Set this to force a certain chain type regardless of chain ID.
-# Available types: arbitrum, metis, optimismBedrock, xdai, celo, kroma, wemix, zksync, scroll
+# Available types: `arbitrum`, `celo`, `gnosis`, `hedera`, `kroma`, `metis`, `optimismBedrock`, `scroll`, `wemix`, `xlayer`, `zksync`
 ChainType = 'arbitrum' # Example
-# FinalityDepth is the number of blocks after which an ethereum transaction is considered "final". Note that the default is automatically set based on chain ID so it should not be necessary to change this under normal operation.
+# SafeDepth is the number of blocks after which an ethereum transaction is considered "safe."
+# Note that this setting is only used for chains with FinalityTags = false
+# This number represents a number of blocks we consider large enough that reorgs are generally not likely to happen.
+# Note that this number is different from FinalityDepth, which is the number of blocks after which a transaction is considered final.
+# It is used in cases where we don't want to wait for finality.
+#
+# Special cases:
+# `SafeDepth`=0 would imply that its value will fall back to the `FinalityDepth` value, if FinalityTagEnabled is false.
+#
+# Examples:
+#
+# Transaction sending:
+# A transaction is sent at block height 42
+#
+# `SafeDepth` is set to 5, FinalityTagEnabled = false, and FinalityDepth = 10
+# At block height 47, the transaction is considered safe, but not final.
+# At block height 52, the transaction is considered final.
+SafeDepth = 0 # Default
+# FinalityDepth is the number of blocks after which an ethereum transaction is considered "final". Note that the default is automatically set based on chain ID, so it should not be necessary to change this under normal operation.
 # BlocksConsideredFinal determines how deeply we look back to ensure that transactions are confirmed onto the longest chain
 # There is not a large performance penalty to setting this relatively high (on the order of hundreds)
 # It is practically limited by the number of heads we store in the database and should be less than this with a comfortable margin.
 # If a transaction is mined in a block more than this many blocks ago, and is reorged out, we will NOT retransmit this transaction and undefined behaviour can occur including gaps in the nonce sequence that require manual intervention to fix.
-# Therefore this number represents a number of blocks we consider large enough that no re-org this deep will ever feasibly happen.
+# Therefore, this number represents a number of blocks we consider large enough that no re-org this deep will ever feasibly happen.
 #
 # Special cases:
 # `FinalityDepth`=0 would imply that transactions can be final even before they were mined into a block. This is not supported.
@@ -40,6 +57,11 @@ FinalityDepth = 50 # Default
 # FinalityTagEnabled means that the chain supports the finalized block tag when querying for a block. If FinalityTagEnabled is set to true for a chain, then FinalityDepth field is ignored.
 # Finality for a block is solely defined by the finality related tags provided by the chain's RPC API. This is a placeholder and hasn't been implemented yet.
 FinalityTagEnabled = false # Default
+# SafeTagSupported means that the chain supports the safe block tag when querying for a block. 
+# When FinalityTagEnabled is true and SafeTagSupported is false, LatestSafeBlock will return the finalized block instead of safe block.
+# When SafeTagSupported is true, LatestSafeBlock will return the safe block from the chain.
+# When FinalityTagEnabled is false, SafeTagSupported is ignored and LatestSafeBlock uses SafeDepth.
+SafeTagSupported = true # Default
 # **ADVANCED**
 # FlagsContractAddress can optionally point to a [Flags contract](../contracts/src/v0.8/Flags.sol). If set, the node will lookup that contract for each job that supports flags contracts (currently OCR and FM jobs are supported). If the job's contractAddress is set as hibernating in the FlagsContractAddress address, it overrides the standard update parameters (such as heartbeat/threshold).
 FlagsContractAddress = '0xae4E781a6218A8031764928E88d457937A954fC3' # Example
@@ -54,6 +76,16 @@ LogPollInterval = '15s' # Default
 # **ADVANCED**
 # LogKeepBlocksDepth works in conjunction with Feature.LogPoller. Controls how many blocks the poller will keep, must be greater than FinalityDepth+1.
 LogKeepBlocksDepth = 100000 # Default
+# **ADVANCED**
+# LogPollerSkipEmptyBlocks defines if LogPoller should persist or skip blocks that do not contain logs matching any of registered filters. Setting this to true can reduce the load on the database and improve performance for fast chains.
+LogPollerSkipEmptyBlocks = false # Default
+# **ADVANCED**
+# LogPrunePageSize defines size of the page for pruning logs. Controls how many logs/blocks (at most) are deleted in a single prune tick. Default value 0 means no paging, delete everything at once.
+LogPrunePageSize = 0 # Default
+# **ADVANCED**
+# BackupLogPollerBlockDelay works in conjunction with Feature.LogPoller. Controls the block delay of Backup LogPoller, affecting how far behind the latest finalized block it starts and how often it runs.
+# BackupLogPollerDelay=0 will disable Backup LogPoller (_not recommended for production environment_).
+BackupLogPollerBlockDelay = 100 # Default
 # MinContractPayment is the minimum payment in LINK required to execute a direct request job. This can be overridden on a per-job basis.
 MinContractPayment = '10000000000000 juels' # Default
 # MinIncomingConfirmations is the minimum required confirmations before a log event will be consumed.
@@ -78,8 +110,31 @@ RPCDefaultBatchSize = 250 # Default
 # available from the connected node via RPC, due to race conditions in the code of the remote ETH node. In this case you will get false
 # "zero" blocks that are missing transactions.
 RPCBlockQueryDelay = 1 # Default
+# FinalizedBlockOffset defines the number of blocks by which the latest finalized block will be shifted/delayed.
+# For example, suppose RPC returns block 100 as the latest finalized. In that case, the CL Node will treat block `100 - FinalizedBlockOffset` as the latest finalized block and `latest - FinalityDepth - FinalizedBlockOffset` in case of `FinalityTagEnabled = false.`
+# With `EnforceRepeatableRead = true,` RPC is considered healthy only if its most recent finalized block is larger or equal to the highest finalized block observed by the CL Node minus `FinalizedBlockOffset.`
+# Higher values of `FinalizedBlockOffset` with `EnforceRepeatableRead = true` reduce the number of false `FinalizedBlockOutOfSync` declarations on healthy RPCs that are slightly lagging behind due to network delays.
+# This may increase the number of healthy RPCs and reduce the probability that the CL Node will not have any healthy alternatives to the active RPC.
+# CAUTION: Setting this to values higher than 0 may delay transaction creation in products (e.g., CCIP, Automation) that base their decision on finalized on-chain events.
+# PoS chains with `FinalityTagEnabled=true` and batched (epochs) blocks finalization (e.g., Ethereum Mainnet) must be treated with special care as a minor increase in the `FinalizedBlockOffset` may lead to significant delays.
+# For example, let's say that `FinalizedBlockOffset = 1` and blocks are finalized in batches of 32.
+# The latest finalized block on chain is 64, so block 63 is the latest finalized for CL Node.
+# Block 64 will be treated as finalized by CL Node only when chain's latest finalized block is 65. As chain finalizes blocks in batches of 32,
+# CL Node has to wait for a whole new batch to be finalized to treat block 64 as finalized.
+FinalizedBlockOffset = 0 # Default
+# LogBroadcasterEnabled is a feature flag for LogBroadcaster, by default it's true.
+LogBroadcasterEnabled = true # Default
+# NoNewFinalizedHeadsThreshold controls how long to wait for new finalized block before `NodePool` marks rpc endpoints as
+# out-of-sync. Only applicable if `FinalityTagEnabled=true`
+#
+# Set to zero to disable.
+NoNewFinalizedHeadsThreshold = '0' # Default
 
 [EVM.Transactions]
+# ConfirmationTimeout time to wait for a TX to get into a block in the blockchain. This is used for the EVMService.SubmitTransaction operation.
+ConfirmationTimeout = '60s' # Default
+# Enabled is a feature flag for the Transaction Manager. This flag also enables or disables the gas estimator since it is dependent on the TXM to start it.
+Enabled = true # Default
 # ForwardersEnabled enables or disables sending transactions through forwarder contracts.
 ForwardersEnabled = false # Default
 # MaxInFlight controls how many transactions are allowed to be "in-flight" i.e. broadcast but unconfirmed at any one time. You can consider this a form of transaction throttling.
@@ -102,10 +157,51 @@ ReaperInterval = '1h' # Default
 ReaperThreshold = '168h' # Default
 # ResendAfterThreshold controls how long to wait before re-broadcasting a transaction that has not yet been confirmed.
 ResendAfterThreshold = '1m' # Default
+# UnknownErrorRetryTimeout is how long broadcaster keeps retrying a transaction that fails with unknown (unclassified) RPC errors, measured from the first such error, before marking it as fatally errored.
+UnknownErrorRetryTimeout = '0s' # Default
+
+[EVM.Transactions.AutoPurge]
+# Enabled enables or disables automatically purging transactions that have been identified as terminally stuck (will never be included on-chain). This feature is only expected to be used by ZK chains.
+Enabled = false # Default
+# DetectionApiUrl configures the base url of a custom endpoint used to identify terminally stuck transactions.
+DetectionApiUrl = 'https://example.api.io' # Example
+# Threshold configures the number of blocks a transaction has to remain unconfirmed before it is evaluated for being terminally stuck. This threshold is only applied if there is no custom API to identify stuck transactions provided by the chain.
+Threshold = 5 # Example
+# MinAttempts configures the minimum number of broadcasted attempts a transaction has to have before it is evaluated further for being terminally stuck. This threshold is only applied if there is no custom API to identify stuck transactions provided by the chain. Ensure the gas estimator configs take more bump attempts before reaching the configured max gas price.
+MinAttempts = 3 # Example
+
+[EVM.Transactions.TransactionManagerV2]
+# Enabled enables TransactionManagerV2.
+Enabled = false # Default
+# BlockTime controls the frequency of the backfill loop of TransactionManagerV2. 
+BlockTime = '10s' # Example
+# CustomURL configures the base url of a custom endpoint used by the dual broadcast functionality (legacy single endpoint). Deprecated: use CustomURLs instead. Cannot be used together with CustomURLs in the same configuration.
+CustomURL = 'https://example.api.io' # Example
+# CustomURLs configures an ordered list of Order Flow Auction (OFA) endpoint URLs: the first entry is primary (determines broadcast outcome); additional entries are multiplexed as secondaries (fire-and-forget). Cannot be used together with CustomURL in the same configuration.
+CustomURLs = ['https://relay.example/api', 'https://ofa-secondary.example/api'] # Example
+# DualBroadcast enables DualBroadcast functionality.
+DualBroadcast = false # Example
+# ReadRequestsToMultipleNodes controls whether txm chain client reads use multiplexed calls.
+ReadRequestsToMultipleNodes = false # Example
+# Bundles enables Bundles functionality for SVR.
+Bundles = false # Example
+# FastlaneAuctionRequestTimeout configures the timeout for fastlane auction requests.
+FastlaneAuctionRequestTimeout = '5s' # Example
+# FeeBoost enables node to immediately boost txs to the max gas price configured 
+FeeBoost = false # Default
+# FeeMultiplier multiplies freshly estimated TxM v2 priority fees and legacy gas prices.
+# For EIP-1559, the priority fee increase is added to the fee cap, preserving its existing base-fee buffer.
+# Values must be at least 1. Results are rounded down to whole wei and capped by the sender's maximum gas price.
+# With FeeBoost enabled, GasEstimator.PriceDefault is a floor for the multiplied priority fee or legacy gas price.
+# Applies with or without FeeBoost. Replacement bumps use the multiplied fee without applying the multiplier again.
+FeeMultiplier = '1' # Example
 
 [EVM.BalanceMonitor]
 # Enabled balance monitoring for all keys.
 Enabled = true # Default
+# ERC20TokenAddress is the address of an ERC-20 type token that a chain supports as a fee token.
+ERC20TokenAddress = "0x20C0000000000000000000000000000000000000" # Example
+
 
 [EVM.GasEstimator]
 # Mode controls what type of gas estimator is used.
@@ -159,9 +255,20 @@ LimitMax = 500_000 # Default
 LimitMultiplier = '1.0' # Default
 # LimitTransfer is the gas limit used for an ordinary ETH transfer.
 LimitTransfer = 21_000 # Default
+# EstimateLimit enables estimating gas limits for transactions. This feature respects the gas limit provided during transaction creation as an upper bound.
+EstimateLimit = false # Default
+# SenderAddress is optional and can be set to a specific sender address for gas limit estimation (i.e. `EstimateLimit = true`). If gas limit estimation is not enabled, this parameter is ignored.
+# 
+# If you are using gas limit estimation:
+# - Setting SenderAddress is optional for most products. If it is set, the from address for the transaction for gas estimation will be set to the inputted SenderAddress. If it is not set, the actual address the transaction is sent from is used if available.
+# - Setting SenderAddress is necessary for gas limit estimation to function correctly for CCIP. Gas limit estimation works only in CCIP 1.6 and above if SenderAddress is set to the given example value (0x00c11c11c11C11c11C11c11c11C11C11c11C11c1). This value is hardcoded in the CCIP 1.6 contracts and is not needed for other products.
+#
+SenderAddress = '0x00c11c11c11C11c11C11c11c11C11C11c11C11c1' # Example
 # BumpMin is the minimum fixed amount of wei by which gas is bumped on each transaction attempt.
 BumpMin = '5 gwei' # Default
-# BumpPercent is the percentage by which to bump gas on a transaction that has exceeded `BumpThreshold`. The larger of `GasBumpPercent` and `GasBumpWei` is taken for gas bumps.
+# BumpPercent is the percentage by which to bump gas on a transaction that has exceeded `BumpThreshold`. The larger of `BumpPercent` and `BumpMin` is taken for gas bumps.
+#
+# The `SuggestedPriceEstimator` adds the larger of `BumpPercent` and `BumpMin` on top of the price provided by the RPC when bumping a transaction's gas.
 BumpPercent = 20 # Default
 # BumpThreshold is the number of blocks to wait for a transaction stuck in the mempool before automatically bumping the gas price. Set to 0 to disable gas bumping completely.
 BumpThreshold = 3 # Default
@@ -193,8 +300,8 @@ BumpTxDepth = 16 # Example
 #
 # Bumping works as follows:
 #
-# - Increase tipcap by `max(tipcap * (1 + GasBumpPercent), tipcap + GasBumpWei)`
-# - Increase feecap by `max(feecap * (1 + GasBumpPercent), feecap + GasBumpWei)`
+# - Increase tipcap by `max(tipcap * (1 + BumpPercent), tipcap + BumpMin)`
+# - Increase feecap by `max(feecap * (1 + BumpPercent), feecap + BumpMin)`
 #
 # A quick note on terminology - Chainlink nodes use the same terms used internally by go-ethereum source code to describe various prices. This is not the same as the externally used terms. For reference:
 #
@@ -207,7 +314,7 @@ BumpTxDepth = 16 # Example
 # - All new transactions will be sent as type 0x2 transactions specifying a TipCap and FeeCap. Be aware that existing pending legacy transactions will continue to be gas bumped in legacy mode.
 # - `BlockHistoryEstimator` will apply its calculations (gas percentile etc) to the TipCap and this value will be used for new transactions (GasPrice will be ignored)
 # - `FixedPriceEstimator` will use `GasTipCapDefault` instead of `GasPriceDefault` for the tip cap
-# - `FixedPriceEstimator` will use `GasFeeCapDefault` instaed of `GasPriceDefault` for the fee cap
+# - `FixedPriceEstimator` will use `GasFeeCapDefault` instead of `GasPriceDefault` for the fee cap
 # - `PriceMin` is ignored for new transactions and `GasTipCapMinimum` is used instead (default 0)
 # - `PriceMax` still represents that absolute upper limit that Chainlink will ever spend (total) on a single tx
 # - `Keeper.GasTipCapBufferPercent` is ignored in EIP-1559 mode and `Keeper.GasTipCapBufferPercent` is used instead
@@ -220,8 +327,16 @@ FeeCapDefault = '100 gwei' # Default
 TipCapDefault = '1 wei' # Default
 # TipCapMinimum is the minimum gas tip to use when submitting transactions to the blockchain.
 #
-# Only applies to EIP-1559 transactions)
+# (Only applies to EIP-1559 transactions)
 TipCapMin = '1 wei' # Default
+
+[EVM.GasEstimator.DAOracle]
+# OracleType refers to the oracle family this config belongs to. Currently the available oracle types are: 'opstack', 'arbitrum', 'zksync', and 'custom_calldata'.
+OracleType = 'opstack' # Example
+# OracleAddress is the address of the oracle contract.
+OracleAddress = '0x420000000000000000000000000000000000000F' # Example
+# CustomGasPriceCalldata is optional and can be set to call a custom gas price function at the given OracleAddress.
+CustomGasPriceCalldata = '' # Default
 
 [EVM.GasEstimator.LimitJobType]
 # OCR overrides LimitDefault for OCR jobs.
@@ -234,8 +349,6 @@ DR = 100_000 # Example
 VRF = 100_000 # Example
 # FM overrides LimitDefault for Flux Monitor jobs.
 FM = 100_000 # Example
-# Keeper overrides LimitDefault for Keeper jobs.
-Keeper = 100_000 # Example
 
 
 # These settings allow you to configure how your node calculates gas prices when using the block history estimator.
@@ -258,7 +371,7 @@ CheckInclusionPercentile = 90 # Default
 # **ADVANCED**
 # EIP1559FeeCapBufferBlocks controls the buffer blocks to add to the current base fee when sending a transaction. By default, the gas bumping threshold + 1 block is used.
 #
-# Only applies to EIP-1559 transactions)
+# (Only applies to EIP-1559 transactions)
 EIP1559FeeCapBufferBlocks = 13 # Example
 # TransactionPercentile specifies gas price to choose. E.g. if the block history contains four transactions with gas prices `[100, 200, 300, 400]` then picking 25 for this number will give a value of 200. If the calculated gas price is higher than `GasPriceDefault` then the higher price will be used as the base price for new transactions.
 #
@@ -273,14 +386,23 @@ EIP1559FeeCapBufferBlocks = 13 # Example
 # Setting it lower will tend to set lower gas prices.
 TransactionPercentile = 60 # Default
 
+[EVM.GasEstimator.FeeHistory]
+# CacheTimeout is the time to wait in order to refresh the cached values stored in the FeeHistory estimator. A small jitter is applied so the timeout won't be exactly the same each time.
+#
+# You want this value to be close to the block time. For slower chains, like Ethereum, you can set it to 12s, the same as the block time. For faster chains you can skip a block or two
+# and set it to two times the block time i.e. on Optimism you can set it to 4s. Ideally, you don't want to go lower than 1s since the RTT times of the RPC requests will be comparable to
+# the timeout. The estimator is already adding a buffer to account for a potential increase in prices within one or two blocks. On the other hand, slower frequency will fail to refresh
+# the prices and end up in stale values.
+CacheTimeout = '10s' # Default
+
 # The head tracker continually listens for new heads from the chain.
 #
 # In addition to these settings, it log warnings if `EVM.NoNewHeadsThreshold` is exceeded without any new blocks being emitted.
 [EVM.HeadTracker]
-# HistoryDepth tracks the top N block numbers to keep in the `heads` database table.
-# Note that this can easily result in MORE than N records since in the case of re-orgs we keep multiple heads for a particular block height.
-# This number should be at least as large as `FinalityDepth`.
-# There may be a small performance penalty to setting this to something very large (10,000+)
+# HistoryDepth tracks the top N blocks on top of the latest finalized block to keep in the `heads` database table.
+# Note that this can easily result in MORE than `N + finality depth`  records since in the case of re-orgs we keep multiple heads for a particular block height.
+# Higher values help reduce number of RPC requests performed by TXM's Finalizer and improve TXM's Confirmer reorg protection on restarts.
+# At the same time, setting the value too high could lead to higher CPU consumption. The following formula could be used to calculate the optimal value: `expected_downtime_on_restart/block_time`.
 HistoryDepth = 100 # Default
 # MaxBufferSize is the maximum number of heads that may be
 # buffered in front of the head tracker before older heads start to be
@@ -290,6 +412,25 @@ MaxBufferSize = 3 # Default
 # **ADVANCED**
 # SamplingInterval means that head tracker callbacks will at maximum be made once in every window of this duration. This is a performance optimisation for fast chains. Set to 0 to disable sampling entirely.
 SamplingInterval = '1s' # Default
+# FinalityTagBypass disables FinalityTag support in HeadTracker and makes it track blocks up to FinalityDepth from the most recent head.
+# It should only be used on chains with an extremely large actual finality depth (the number of blocks between the most recent head and the latest finalized block).
+# Has no effect if `FinalityTagsEnabled` = false
+FinalityTagBypass = false # Default
+# MaxAllowedFinalityDepth - defines maximum number of blocks between the most recent head and the latest finalized block.
+# If actual finality depth exceeds this number, HeadTracker aborts backfill and returns an error.
+# Has no effect if `FinalityTagsEnabled` = false
+MaxAllowedFinalityDepth = 10000 # Default
+# PersistenceEnabled defines whether HeadTracker needs to store heads in the database.
+# Persistence is helpful on chains with large finality depth, where fetching blocks from the latest to the latest finalized takes a lot of time.
+# On chains with fast finality, the persistence layer does not improve the chain's load time and only consumes database resources (mainly IO).
+# NOTE: persistence should not be disabled for products that use LogBroadcaster, as it might lead to missed on-chain events.
+PersistenceEnabled = true # Default
+# PersistenceBatchSize is used to batch head tracker db transactions (inserts and deletes).
+# If set to 100, the head tracker will insert and delete to the db every 100 heads.
+# If the head tracker crashes before the batch size is reached (i.e it fails to write the current batch to the db).
+# Then it will have to load that batch of heads from the rpc on startup (check PersistenceEnabled above).
+# To limit that initial fetch while also improving db usage, 100 is the default for now.
+PersistenceBatchSize = 100 # Default
 
 [[EVM.KeySpecific]]
 # Key is the account to apply these settings to
@@ -301,10 +442,14 @@ GasEstimator.PriceMax = '79 gwei' # Example
 #
 # In addition to these settings, `EVM.NoNewHeadsThreshold` controls how long to wait after receiving no new heads before marking the node as out-of-sync.
 [EVM.NodePool]
-# PollFailureThreshold indicates how many consecutive polls must fail in order to mark a node as unreachable.
+# PollFailureThreshold indicates how many polls must fail beyond those that succeed in order to mark a node as unreachable.
 #
 # Set to zero to disable poll checking.
 PollFailureThreshold = 5 # Default
+# PollSuccessThreshold indicates how many consecutive polls must succeed in order to mark a node as alive once it has been marked as unreachable.
+#
+# Set to zero to require no successful polls (previous behavior).
+PollSuccessThreshold = 0 # Default
 # PollInterval controls how often to poll the node to check for liveness.
 #
 # Set to zero to disable poll checking.
@@ -327,6 +472,93 @@ SyncThreshold = 5 # Default
 #
 # Set to '0s' to disable
 LeaseDuration = '0s' # Default
+# NodeIsSyncingEnabled is a flag that enables `syncing` health check on each reconnection to an RPC.
+# Node transitions and remains in `Syncing` state while RPC signals this state (In case of Ethereum `eth_syncing` returns anything other than false).
+# All of the requests to node in state `Syncing` are rejected.
+#
+# Set true to enable this check
+NodeIsSyncingEnabled = false # Default
+# FinalizedBlockPollInterval controls how often to poll RPC for new finalized blocks.
+# The finalized block is only used to report to the `pool_rpc_node_highest_finalized_block` metric. We plan to use it
+# in RPCs health assessment in the future.
+# If `FinalityTagEnabled = false`, poll is not performed and `pool_rpc_node_highest_finalized_block` is
+# reported based on latest block and finality depth.
+#
+# Set to 0 to disable.
+FinalizedBlockPollInterval = '5s' # Default
+# HistoricalBalanceCheckAddress is the probe account for the finalized-state availability check.
+# The check executes `eth_getBalance` for this address at the latest finalized block.
+# If omitted, defaults to the zero address (`0x0000000000000000000000000000000000000000`).
+# Finalized block selection follows chain finality settings:
+# - `FinalityTagEnabled = true`: use `finalized` tag
+# - `FinalityTagEnabled = false`: use `latest - FinalityDepth`
+# The check is only active when `FinalizedStateCheckFailureThreshold > 0`.
+HistoricalBalanceCheckAddress = '0x2a3e23c6f242F5345320814aC8a1b4E58707D292' # Example
+# FinalizedStateCheckFailureThreshold is the number of consecutive failures of the finalized state availability check
+# before the node is marked as FinalizedStateNotAvailable.
+# Set to 0 to disable the check.
+FinalizedStateCheckFailureThreshold = 0 # Default
+# EnforceRepeatableRead defines if Core should only use RPCs whose most recently finalized block is greater or equal to
+# `highest finalized block - FinalizedBlockOffset`. In other words, exclude RPCs lagging on latest finalized
+# block.
+#
+# Set false to disable
+EnforceRepeatableRead = true # Default
+# DeathDeclarationDelay defines the minimum duration an RPC must be in unhealthy state before producing an error log message.
+# Larger values might be helpful to reduce the noisiness of health checks like `EnforceRepeatableRead = true', which might be falsely
+# trigger declaration of `FinalizedBlockOutOfSync` due to insignificant network delays in broadcasting of the finalized state among RPCs.
+# Should be greater than `FinalizedBlockPollInterval`.
+# Unhealthy RPC will not be picked to handle a request even if this option is set to a nonzero value.
+DeathDeclarationDelay = '1m' # Default
+# NewHeadsPollInterval define an interval for polling new block periodically using http client rather than subscribe to ws feed
+#
+# Set to 0 to disable.
+NewHeadsPollInterval = '0s' # Default
+# VerifyChainID enforces RPC Client ChainIDs to match configured ChainID
+VerifyChainID = true # Default
+# ExternalRequestMaxResponseSize sets the maximum allowed size (in bytes) for responses to external requests.
+# Responses larger than this value will be rejected to prevent the node from being overloaded.
+# Only CRE workflow requests are considered external requests.
+# Only applies for RPCs configured with HTTP urls. There is no limit for WS only RPCs.
+# Set to 0 to disable the size check and allow responses of any size.
+ExternalRequestMaxResponseSize = 1000000 # Default
+# **ADVANCED**
+# Errors enable the node to provide custom regex patterns to match against error messages from RPCs.
+[EVM.NodePool.Errors]
+# NonceTooLow is a regex pattern to match against nonce too low errors.
+NonceTooLow = '(: |^)nonce too low' # Example
+# NonceTooHigh is a regex pattern to match against nonce too high errors.
+NonceTooHigh = '(: |^)nonce too high' # Example
+# ReplacementTransactionUnderpriced is a regex pattern to match against replacement transaction underpriced errors.
+ReplacementTransactionUnderpriced = '(: |^)replacement transaction underpriced' # Example
+# LimitReached is a regex pattern to match against limit reached errors.
+LimitReached = '(: |^)limit reached' # Example
+# TransactionAlreadyInMempool is a regex pattern to match against transaction already in mempool errors.
+TransactionAlreadyInMempool = '(: |^)transaction already in mempool' # Example
+# TerminallyUnderpriced is a regex pattern to match against terminally underpriced errors.
+TerminallyUnderpriced = '(: |^)terminally underpriced' # Example
+# InsufficientEth is a regex pattern to match against insufficient eth errors.
+InsufficientEth = '(: |^)insufficient eth' # Example
+# TxFeeExceedsCap is a regex pattern to match against tx fee exceeds cap errors.
+TxFeeExceedsCap = '(: |^)tx fee exceeds cap' # Example
+# L2FeeTooLow is a regex pattern to match against l2 fee too low errors.
+L2FeeTooLow = '(: |^)l2 fee too low' # Example
+# L2FeeTooHigh is a regex pattern to match against l2 fee too high errors.
+L2FeeTooHigh = '(: |^)l2 fee too high' # Example
+# L2Full is a regex pattern to match against l2 full errors.
+L2Full = '(: |^)l2 full' # Example
+# TransactionAlreadyMined is a regex pattern to match against transaction already mined errors.
+TransactionAlreadyMined = '(: |^)transaction already mined' # Example
+# Fatal is a regex pattern to match against fatal errors.
+Fatal = '(: |^)fatal' # Example
+# ServiceUnavailable is a regex pattern to match against service unavailable errors.
+ServiceUnavailable = '(: |^)service unavailable' # Example
+# TooManyResults is a regex pattern to match an eth_getLogs error indicating the result set is too large to return
+TooManyResults = '(: |^)too many results' # Example
+# MissingBlocks is a regex pattern to match an eth_getLogs error indicating the rpc server is permanently missing some blocks in the requested block range
+MissingBlocks = '(: |^)missing blocks' # Example
+# FinalizedStateUnavailable is a regex pattern to match errors indicating the RPC cannot serve historical state at the finalized block (e.g., pruned/non-archive node)
+FinalizedStateUnavailable = '(: |^)(missing trie node|state not available|historical state unavailable)' # Default
 
 [EVM.OCR]
 # ContractConfirmations sets `OCR.ContractConfirmations` for this EVM chain.
@@ -349,15 +581,31 @@ ObservationGracePeriod = '1s' # Default
 [[EVM.Nodes]]
 # Name is a unique (per-chain) identifier for this node.
 Name = 'foo' # Example
-# WSURL is the WS(S) endpoint for this node. Required for primary nodes.
+# WSURL is the WS(S) endpoint for this node. Required for primary nodes when `LogBroadcasterEnabled` is `true`
 WSURL = 'wss://web.socket/test' # Example
 # HTTPURL is the HTTP(S) endpoint for this node. Required for all nodes.
 HTTPURL = 'https://foo.web' # Example
+# HTTPURLExtraWrite is the HTTP(S) endpoint used for chains that require a separate endpoint for writing on-chain.
+HTTPURLExtraWrite = 'https://foo.web/extra' # Example
 # SendOnly limits usage to sending transaction broadcasts only. With this enabled, only HTTPURL is required, and WSURL is not used.
 SendOnly = false # Default
 # Order of the node in the pool, will takes effect if `SelectionMode` is `PriorityLevel` or will be used as a tie-breaker for `HighestHead` and `TotalDifficulty`
 Order = 100 # Default
+# IsLoadBalancedRPC indicates whether the http/ws url above has multiple rpc's behind it.
+# If true, we should try reconnecting to the node even when its the only node in the Nodes list.
+# If false and its the only node in the nodes list, we will mark it alive even when its out of sync, because it might still be able to send txs.
+IsLoadBalancedRPC = false # Default
 
-[EVM.OCR2.Automation]
-# GasLimit controls the gas limit for transmit transactions from ocr2automation job.
-GasLimit = 5300000 # Default
+[EVM.Workflow]
+# FromAddress is Address of the transmitter key to use for workflow writes.
+FromAddress = '0x2a3e23c6f242F5345320814aC8a1b4E58707D292' # Example
+# ForwarderAddress is the keystone forwarder contract address on chain.
+ForwarderAddress = '0x2a3e23c6f242F5345320814aC8a1b4E58707D292' # Example
+# GasLimitDefault is the default gas limit for workflow transactions.
+GasLimitDefault = 400_000 # Default
+# TxAcceptanceState is the default acceptance state for writer DON transmissions.
+TxAcceptanceState = 2 # Default
+# PollPeriod is the default poll period for checking transmission state
+PollPeriod = '2s' # Default
+# AcceptanceTimeout is the default timeout for a transmission to be accepted on chain
+AcceptanceTimeout = '30s' # Default

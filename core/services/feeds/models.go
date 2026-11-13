@@ -11,6 +11,7 @@ import (
 	"github.com/pkg/errors"
 	"gopkg.in/guregu/null.v4"
 
+	proto "github.com/smartcontractkit/chainlink-protos/orchestrator/feedsmanager"
 	"github.com/smartcontractkit/chainlink/v2/core/utils/crypto"
 )
 
@@ -23,11 +24,12 @@ const (
 type PluginType string
 
 const (
-	PluginTypeCommit  PluginType = "COMMIT"
-	PluginTypeExecute PluginType = "EXECUTE"
-	PluginTypeMedian  PluginType = "MEDIAN"
-	PluginTypeMercury PluginType = "MERCURY"
-	PluginTypeUnknown PluginType = "UNKNOWN"
+	PluginTypeCommit     PluginType = "COMMIT"
+	PluginTypeExecute    PluginType = "EXECUTE"
+	PluginTypeMedian     PluginType = "MEDIAN"
+	PluginTypeMercury    PluginType = "MERCURY"
+	PluginTypeRebalancer PluginType = "REBALANCER"
+	PluginTypeUnknown    PluginType = "UNKNOWN"
 )
 
 func FromPluginTypeInput(pt PluginType) string {
@@ -44,23 +46,26 @@ func ToPluginType(s string) (PluginType, error) {
 		return PluginTypeMedian, nil
 	case "mercury":
 		return PluginTypeMercury, nil
+	case "rebalancer":
+		return PluginTypeRebalancer, nil
 	default:
 		return PluginTypeUnknown, errors.New("unknown plugin type")
 	}
 }
 
 type Plugins struct {
-	Commit  bool `json:"commit"`
-	Execute bool `json:"execute"`
-	Median  bool `json:"median"`
-	Mercury bool `json:"mercury"`
+	Commit     bool `json:"commit"`
+	Execute    bool `json:"execute"`
+	Median     bool `json:"median"`
+	Mercury    bool `json:"mercury"`
+	Rebalancer bool `json:"rebalancer"`
 }
 
 func (p Plugins) Value() (driver.Value, error) {
 	return json.Marshal(p)
 }
 
-func (p *Plugins) Scan(value interface{}) error {
+func (p *Plugins) Scan(value any) error {
 	b, ok := value.(string)
 	if !ok {
 		return errors.New("type assertion to []byte failed")
@@ -72,22 +77,52 @@ func (p *Plugins) Scan(value interface{}) error {
 type ChainType string
 
 const (
-	ChainTypeUnknown ChainType = "UNKNOWN"
-	ChainTypeEVM     ChainType = "EVM"
+	ChainTypeUnknown  ChainType = "UNKNOWN"
+	ChainTypeAptos    ChainType = "APTOS"
+	ChainTypeEVM      ChainType = "EVM"
+	ChainTypeSolana   ChainType = "SOLANA"
+	ChainTypeStarknet ChainType = "STARKNET"
+	ChainTypeTron     ChainType = "TRON"
+	ChainTypeTON      ChainType = "TON"
+	ChainTypeSui      ChainType = "SUI"
+	ChainTypeStellar  ChainType = "STELLAR"
 )
 
 func NewChainType(s string) (ChainType, error) {
 	switch s {
 	case "EVM":
 		return ChainTypeEVM, nil
+	case "STARKNET":
+		return ChainTypeStarknet, nil
+	case "SOLANA":
+		return ChainTypeSolana, nil
+	case "APTOS":
+		return ChainTypeAptos, nil
+	case "TRON":
+		return ChainTypeTron, nil
+	case "TON":
+		return ChainTypeTON, nil
+	case "SUI":
+		return ChainTypeSui, nil
+	case "STELLAR":
+		return ChainTypeStellar, nil
 	default:
 		return ChainTypeUnknown, errors.New("invalid chain type")
 	}
 }
 
+// ChainTypeToProtoChainType converts a ChainType to a proto.ChainType.
+func ChainTypeToProtoChainType(chainType ChainType) proto.ChainType {
+	prefixed := "CHAIN_TYPE_" + string(chainType)
+	if chainType, exists := proto.ChainType_value[prefixed]; exists {
+		return proto.ChainType(chainType)
+	}
+	return proto.ChainType_CHAIN_TYPE_UNSPECIFIED
+}
+
 // FeedsManager defines a registered Feeds Manager Service and the connection
 // information.
-type FeedsManager struct {
+type FeedsManager struct { //nolint:revive // stutter is part of public API
 	ID                 int64
 	Name               string
 	URI                string
@@ -95,21 +130,25 @@ type FeedsManager struct {
 	IsConnectionActive bool
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
+	DisabledAt         *time.Time
 }
+
+type Manager = FeedsManager
 
 // ChainConfig defines the chain configuration for a Feeds Manager.
 type ChainConfig struct {
-	ID                int64
-	FeedsManagerID    int64
-	ChainID           string
-	ChainType         ChainType
-	AccountAddress    string
-	AdminAddress      string
-	FluxMonitorConfig FluxMonitorConfig
-	OCR1Config        OCR1Config
-	OCR2Config        OCR2ConfigModel
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	ID                      int64
+	FeedsManagerID          int64
+	ChainID                 string
+	ChainType               ChainType
+	AccountAddress          string
+	AccountAddressPublicKey null.String
+	AdminAddress            string
+	FluxMonitorConfig       FluxMonitorConfig
+	OCR1Config              OCR1Config
+	OCR2Config              OCR2ConfigModel
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
 }
 
 // FluxMonitorConfig defines configuration for FluxMonitorJobs.
@@ -121,7 +160,7 @@ func (c FluxMonitorConfig) Value() (driver.Value, error) {
 	return json.Marshal(c)
 }
 
-func (c *FluxMonitorConfig) Scan(value interface{}) error {
+func (c *FluxMonitorConfig) Scan(value any) error {
 	b, ok := value.([]byte)
 	if !ok {
 		return errors.New("type assertion to []byte failed")
@@ -143,7 +182,7 @@ func (c OCR1Config) Value() (driver.Value, error) {
 	return json.Marshal(c)
 }
 
-func (c *OCR1Config) Scan(value interface{}) error {
+func (c *OCR1Config) Scan(value any) error {
 	b, ok := value.([]byte)
 	if !ok {
 		return errors.New("type assertion to []byte failed")
@@ -167,7 +206,7 @@ func (c OCR2ConfigModel) Value() (driver.Value, error) {
 	return json.Marshal(c)
 }
 
-func (c *OCR2ConfigModel) Scan(value interface{}) error {
+func (c *OCR2ConfigModel) Scan(value any) error {
 	b, ok := value.([]byte)
 	if !ok {
 		return errors.New("type assertion to []byte failed")

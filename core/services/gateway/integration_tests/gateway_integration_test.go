@@ -4,32 +4,39 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/jonboulle/clockwork"
 	"github.com/onsi/gomega"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/stretchr/testify/require"
 
+	jsonrpc "github.com/smartcontractkit/chainlink-common/pkg/jsonrpc2"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink-common/pkg/services/servicetest"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/limits"
+	"github.com/smartcontractkit/chainlink-common/pkg/types/core"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/api"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/common"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/config"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/connector"
-	"github.com/smartcontractkit/chainlink/v2/core/utils"
+	hc "github.com/smartcontractkit/chainlink/v2/core/services/gateway/handlers/common"
+	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/network"
 )
 
 const gatewayConfigTemplate = `
 [ConnectionManagerConfig]
 AuthChallengeLen = 32
-AuthGatewayId = "test_gateway"
+AuthGatewayID = "test_gateway"
 AuthTimestampToleranceSec = 30
 
 [NodeServerConfig]
@@ -49,14 +56,24 @@ MaxRequestBytes = 20_000
 ReadTimeoutMillis = 1000
 RequestTimeoutMillis = 1000
 WriteTimeoutMillis = 1000
+CORSEnabled = true
+CORSAllowedOrigins = ["https://remix.ethereum.org"]
 
-[[Dons]]
-DonId = "test_don"
-HandlerName = "dummy"
+[[shardedDONs]]
+DonName = "test_don"
+F = 0
 
-[[Dons.Members]]
+[[shardedDONs.Shards]]
+[[shardedDONs.Shards.Nodes]]
 Address = "%s"
 Name = "test_node_1"
+
+[[services]]
+ServiceName = "test"
+DONs = ["test_don"]
+
+[[services.Handlers]]
+Name = "dummy"
 `
 
 const nodeConfigTemplate = `
@@ -74,8 +91,8 @@ URL = "%s"
 `
 
 const (
-	messageId1 = "123"
-	messageId2 = "456"
+	messageID1 = "123"
+	messageID2 = "456"
 
 	nodeResponsePayload = `{"response":"correct response"}`
 )
@@ -87,40 +104,63 @@ func parseGatewayConfig(t *testing.T, tomlConfig string) *config.GatewayConfig {
 	return &cfg
 }
 
-func parseConnectorConfig(t *testing.T, tomlConfig string, nodeAddress string, nodeURL string) *connector.ConnectorConfig {
+func parseConnectorConfig(t *testing.T, tomlConfig, nodeAddress, nodeURL string) *connector.Config {
 	nodeConfig := fmt.Sprintf(tomlConfig, nodeAddress, nodeURL)
-	var cfg connector.ConnectorConfig
+	var cfg connector.Config
 	require.NoError(t, toml.Unmarshal([]byte(nodeConfig), &cfg))
 	return &cfg
 }
 
 type client struct {
 	privateKey *ecdsa.PrivateKey
-	connector  connector.GatewayConnector
+	connector  core.GatewayConnector
 	done       atomic.Bool
 }
 
-func (c *client) HandleGatewayMessage(ctx context.Context, gatewayId string, msg *api.Message) {
-	c.done.Store(true)
-	// send back user's message without re-signing - should be ignored by the Gateway
-	_ = c.connector.SendToGateway(ctx, gatewayId, msg)
-	// send back a correct response
-	responseMsg := &api.Message{Body: api.MessageBody{
-		MessageId: msg.Body.MessageId,
-		Method:    "test",
-		DonId:     "test_don",
-		Receiver:  msg.Body.Sender,
-		Payload:   []byte(nodeResponsePayload),
-	}}
-	err := responseMsg.Sign(c.privateKey)
+func (c *client) HandleGatewayMessage(ctx context.Context, gatewayID string, req *jsonrpc.Request[json.RawMessage]) error {
+	msg, err := hc.ValidatedMessageFromReq(req)
 	if err != nil {
 		panic(err)
 	}
-	_ = c.connector.SendToGateway(ctx, gatewayId, responseMsg)
+	c.done.Store(true)
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		panic(err)
+	}
+	rawPayload := json.RawMessage(payload)
+	resp := &jsonrpc.Response[json.RawMessage]{
+		Version: "2.0",
+		ID:      msg.Body.MessageID,
+		Result:  &rawPayload,
+		Method:  req.Method,
+	}
+	// send back user's message without re-signing - should be ignored by the Gateway
+	_ = c.connector.SendToGateway(ctx, gatewayID, resp)
+	// send back a correct response
+	responseMsg := &api.Message{Body: api.MessageBody{
+		MessageID: msg.Body.MessageID,
+		Method:    "test",
+		DonID:     "test_don",
+		Receiver:  msg.Body.Sender,
+		Payload:   []byte(nodeResponsePayload),
+	}}
+	err = responseMsg.Sign(c.privateKey)
+	if err != nil {
+		panic(err)
+	}
+	resp, err = hc.ValidatedResponseFromMessage(responseMsg) // ensure the message is valid
+	if err != nil {
+		panic(err)
+	}
+	return c.connector.SendToGateway(ctx, gatewayID, resp)
 }
 
-func (c *client) Sign(data ...[]byte) ([]byte, error) {
+func (c *client) Sign(ctx context.Context, data ...[]byte) ([]byte, error) {
 	return common.SignData(c.privateKey, data...)
+}
+
+func (c *client) ID(ctx context.Context) (string, error) {
+	return "test_client", nil
 }
 
 func (*client) Start(ctx context.Context) error {
@@ -141,55 +181,90 @@ func TestIntegration_Gateway_NoFullNodes_BasicConnectionAndMessage(t *testing.T)
 	nodeKeys.Address = strings.ToUpper(nodeKeys.Address)
 
 	// Launch Gateway
-	lggr := logger.TestLogger(t)
+	lggr := logger.Test(t)
 	gatewayConfig := fmt.Sprintf(gatewayConfigTemplate, nodeKeys.Address)
-	gateway, err := gateway.NewGatewayFromConfig(parseGatewayConfig(t, gatewayConfig), gateway.NewHandlerFactory(nil, nil, nil, lggr), lggr)
+	c, err := network.NewHTTPClient(network.HTTPClientConfig{
+		DefaultTimeout:   5 * time.Second,
+		MaxResponseBytes: 1000,
+	}, lggr)
+	require.NoError(t, err)
+	lf := limits.Factory{Logger: lggr}
+	gateway, err := gateway.NewGatewayFromConfig(parseGatewayConfig(t, gatewayConfig), gateway.NewHandlerFactory(nil, nil, c, nil, nil, lggr, lf, nil, nil), lggr, lf)
 	require.NoError(t, err)
 	servicetest.Run(t, gateway)
 	userPort, nodePort := gateway.GetUserPort(), gateway.GetNodePort()
-	userUrl := fmt.Sprintf("http://localhost:%d/user", userPort)
-	nodeUrl := fmt.Sprintf("ws://localhost:%d/node", nodePort)
+	userURL := fmt.Sprintf("http://localhost:%d/user", userPort)
+	nodeURL := fmt.Sprintf("ws://localhost:%d/node", nodePort)
+	require.Equal(t, http.StatusServiceUnavailable, getHTTPStatus(t, fmt.Sprintf("http://localhost:%d/health", userPort)))
+	require.Equal(t, http.StatusOK, getHTTPStatus(t, fmt.Sprintf("http://localhost:%d/health", nodePort)))
 
 	// Launch Connector
 	client := &client{privateKey: nodeKeys.PrivateKey}
-	connector, err := connector.NewGatewayConnector(parseConnectorConfig(t, nodeConfigTemplate, nodeKeys.Address, nodeUrl), client, client, utils.NewRealClock(), lggr)
+	// client acts as a signer here
+	connector, err := connector.NewGatewayConnector(parseConnectorConfig(t, nodeConfigTemplate, nodeKeys.Address, nodeURL), client, clockwork.NewRealClock(), lggr, "")
 	require.NoError(t, err)
+	require.NoError(t, connector.AddHandler(t.Context(), []string{"test"}, client))
 	client.connector = connector
 	servicetest.Run(t, connector)
+	require.Eventually(t, func() bool {
+		return getHTTPStatus(t, fmt.Sprintf("http://localhost:%d/health", userPort)) == http.StatusOK
+	}, testutils.WaitTimeout(t), testutils.TestInterval)
 
 	// Send requests until one of them reaches Connector (i.e. the node)
 	gomega.NewGomegaWithT(t).Eventually(func() bool {
-		req := newHttpRequestObject(t, messageId1, userUrl, userKeys.PrivateKey)
+		req := newJSONRPCHTTPRequestObject(t, messageID1, userURL, userKeys.PrivateKey)
 		httpClient := &http.Client{}
-		_, _ = httpClient.Do(req) // could initially return error if Gateway is not fully initialized yet
+		resp, doErr := httpClient.Do(req) // could initially return error if Gateway is not fully initialized yet
+		if doErr == nil {
+			resp.Body.Close()
+		}
 		return client.done.Load()
-	}, testutils.WaitTimeout(t), testutils.TestInterval).Should(gomega.Equal(true))
+	}, testutils.WaitTimeout(t), testutils.TestInterval).Should(gomega.BeTrue())
 
 	// Send another request and validate that response has correct content and sender
-	req := newHttpRequestObject(t, messageId2, userUrl, userKeys.PrivateKey)
+	req := newJSONRPCHTTPRequestObject(t, messageID2, userURL, userKeys.PrivateKey)
 	httpClient := &http.Client{}
 	resp, err := httpClient.Do(req)
 	require.NoError(t, err)
+	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	rawResp, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	codec := api.JsonRPCCodec{}
-	respMsg, err := codec.DecodeResponse(rawResp)
+	codec := api.JSONRPCCodec{}
+	respMsg, err := codec.DecodeLegacyResponse(rawResp)
 	require.NoError(t, err)
 	require.NoError(t, respMsg.Validate())
 	require.Equal(t, strings.ToLower(nodeKeys.Address), respMsg.Body.Sender)
-	require.Equal(t, messageId2, respMsg.Body.MessageId)
-	require.Equal(t, nodeResponsePayload, string(respMsg.Body.Payload))
+	require.Equal(t, messageID2, respMsg.Body.MessageID)
+	require.JSONEq(t, nodeResponsePayload, string(respMsg.Body.Payload))
 }
 
-func newHttpRequestObject(t *testing.T, messageId string, userUrl string, signerKey *ecdsa.PrivateKey) *http.Request {
-	msg := &api.Message{Body: api.MessageBody{MessageId: messageId, Method: "test", DonId: "test_don"}}
-	require.NoError(t, msg.Sign(signerKey))
-	codec := api.JsonRPCCodec{}
-	rawMsg, err := codec.EncodeRequest(msg)
+func getHTTPStatus(t *testing.T, url string) int {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
 	require.NoError(t, err)
-	req, err := http.NewRequestWithContext(testutils.Context(t), "POST", userUrl, bytes.NewBuffer(rawMsg))
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	return resp.StatusCode
+}
+
+func newJSONRPCHTTPRequestObject(t *testing.T, messageID, userURL string, signerKey *ecdsa.PrivateKey) *http.Request {
+	msg := &api.Message{Body: api.MessageBody{MessageID: messageID, Method: "test"}}
+	require.NoError(t, msg.Sign(signerKey))
+	msgBytes, err := json.Marshal(msg)
+	require.NoError(t, err)
+	rawParams := json.RawMessage(msgBytes)
+	request := jsonrpc.Request[json.RawMessage]{
+		Version: jsonrpc.JsonRpcVersion,
+		ID:      messageID,
+		Method:  "test.test",
+		Params:  &rawParams,
+	}
+	rawMsg, err := json.Marshal(&request)
+	require.NoError(t, err)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, userURL, bytes.NewBuffer(rawMsg))
 	require.NoError(t, err)
 	return req
 }

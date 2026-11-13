@@ -9,10 +9,10 @@ import (
 	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	clsessions "github.com/smartcontractkit/chainlink/v2/core/sessions"
 	"github.com/smartcontractkit/chainlink/v2/core/sessions/mocks"
 	"github.com/smartcontractkit/chainlink/v2/core/web/auth"
@@ -26,7 +26,7 @@ func Test_AuthenticateGQL_Unauthenticated(t *testing.T) {
 
 	r := gin.Default()
 	r.Use(sessions.Sessions(auth.SessionName, sessionStore))
-	r.Use(auth.AuthenticateGQL(sessionORM, logger.TestLogger(t)))
+	r.Use(auth.AuthenticateGQL(sessionORM, logger.Test(t)))
 
 	r.GET("/", func(c *gin.Context) {
 		session, ok := auth.GetGQLAuthenticatedSession(c)
@@ -50,7 +50,7 @@ func Test_AuthenticateGQL_Authenticated(t *testing.T) {
 
 	r := gin.Default()
 	r.Use(sessions.Sessions(auth.SessionName, sessionStore))
-	r.Use(auth.AuthenticateGQL(sessionORM, logger.TestLogger(t)))
+	r.Use(auth.AuthenticateGQL(sessionORM, logger.Test(t)))
 
 	r.GET("/", func(c *gin.Context) {
 		session, ok := auth.GetGQLAuthenticatedSession(c.Request.Context())
@@ -60,7 +60,7 @@ func Test_AuthenticateGQL_Authenticated(t *testing.T) {
 		c.String(http.StatusOK, "")
 	})
 
-	sessionORM.On("AuthorizedUserWithSession", sessionID).Return(clsessions.User{Email: cltest.APIEmailAdmin, Role: clsessions.UserRoleAdmin}, nil)
+	sessionORM.On("AuthorizedUserWithSession", mock.Anything, sessionID).Return(clsessions.User{Email: cltest.APIEmailAdmin, Role: clsessions.UserRoleAdmin}, nil)
 
 	w := httptest.NewRecorder()
 	req := mustRequest(t, "GET", "/", nil)
@@ -73,10 +73,10 @@ func Test_AuthenticateGQL_Authenticated(t *testing.T) {
 func Test_GetAndSetGQLAuthenticatedSession(t *testing.T) {
 	t.Parallel()
 
-	ctx := testutils.Context(t)
+	ctx := t.Context()
 	user := clsessions.User{Email: cltest.APIEmailAdmin, Role: clsessions.UserRoleAdmin}
 
-	ctx = auth.SetGQLAuthenticatedSession(ctx, user, "sessionID")
+	ctx = auth.WithGQLAuthenticatedSession(ctx, user, "sessionID")
 
 	actual, ok := auth.GetGQLAuthenticatedSession(ctx)
 	assert.True(t, ok)

@@ -5,10 +5,10 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/gin-gonic/gin"
+
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
-
-	"github.com/gin-gonic/gin"
 )
 
 // ConfigController manages config variables
@@ -27,7 +27,7 @@ func (cc *ConfigController) Show(c *gin.Context) {
 		var err error
 		userOnly, err = strconv.ParseBool(s)
 		if err != nil {
-			jsonAPIError(c, http.StatusBadRequest, fmt.Errorf("invalid bool for userOnly: %v", err))
+			jsonAPIError(c, http.StatusBadRequest, fmt.Errorf("invalid bool for userOnly: %w", err))
 			return
 		}
 	}
@@ -38,14 +38,14 @@ func (cc *ConfigController) Show(c *gin.Context) {
 	} else {
 		toml = effective
 	}
-	jsonAPIResponse(c, ConfigV2Resource{toml}, "config")
+	jsonAPIResponse(c, &ConfigV2Resource{toml}, "config")
 }
 
 type ConfigV2Resource struct {
 	Config string `json:"config"`
 }
 
-func (c ConfigV2Resource) GetID() string {
+func (c *ConfigV2Resource) GetID() string {
 	return utils.NewBytes32ID()
 }
 

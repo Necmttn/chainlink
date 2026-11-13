@@ -3,15 +3,17 @@ package logger
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/smartcontractkit/chainlink/v2/core/utils"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/smartcontractkit/chainlink/v2/core/utils"
 )
 
 func newTestLogger(t *testing.T, cfg Config) Logger {
@@ -27,12 +29,12 @@ func TestZapLogger_OutOfDiskSpace(t *testing.T) {
 
 	logsDir := t.TempDir()
 	tmpFile, err := os.CreateTemp(logsDir, "*")
-	assert.NoError(t, err)
-	defer func() { assert.NoError(t, tmpFile.Close()) }()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, tmpFile.Close()) })
 
 	var logFileSize utils.FileSize
 	err = logFileSize.UnmarshalText([]byte("100mb"))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	pollCfg := newDiskPollConfig(1 * time.Second)
 
@@ -60,7 +62,7 @@ func TestZapLogger_OutOfDiskSpace(t *testing.T) {
 			stop:     stop,
 			pollChan: pollChan,
 		}
-		local.FileMaxSizeMB = int(maxSize/utils.MB) * 2
+		local.FileMaxSizeMB = int(maxSize/utils.MB) * 2 //nolint:gosec // G115
 
 		lggr := newTestLogger(t, local)
 
@@ -90,7 +92,7 @@ func TestZapLogger_OutOfDiskSpace(t *testing.T) {
 			stop:     stop,
 			pollChan: pollChan,
 		}
-		local.FileMaxSizeMB = int(maxSize/utils.MB) * 2
+		local.FileMaxSizeMB = int(maxSize/utils.MB) * 2 //nolint:gosec // G115
 
 		lggr := newTestLogger(t, local)
 
@@ -121,7 +123,7 @@ func TestZapLogger_OutOfDiskSpace(t *testing.T) {
 			stop:     stop,
 			pollChan: pollChan,
 		}
-		local.FileMaxSizeMB = int(maxSize/utils.MB) * 2
+		local.FileMaxSizeMB = int(maxSize/utils.MB) * 2 //nolint:gosec // G115
 
 		lggr := newTestLogger(t, local)
 
@@ -138,7 +140,7 @@ func TestZapLogger_OutOfDiskSpace(t *testing.T) {
 
 		logFile := local.LogsFile()
 		b, err := os.ReadFile(logFile)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
 		logs := string(b)
 		lines := strings.Split(logs, "\n")
@@ -169,7 +171,7 @@ func TestZapLogger_OutOfDiskSpace(t *testing.T) {
 			stop:     stop,
 			pollChan: pollChan,
 		}
-		local.FileMaxSizeMB = int(maxSize/utils.MB) * 2
+		local.FileMaxSizeMB = int(maxSize/utils.MB) * 2 //nolint:gosec // G115
 
 		lggr := newTestLogger(t, local)
 
@@ -189,7 +191,7 @@ func TestZapLogger_OutOfDiskSpace(t *testing.T) {
 
 		logFile := local.LogsFile()
 		b, err := os.ReadFile(logFile)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
 		logs := string(b)
 		lines := strings.Split(logs, "\n")
@@ -211,12 +213,12 @@ func TestZapLogger_LogCaller(t *testing.T) {
 
 	logsDir := t.TempDir()
 	tmpFile, err := os.CreateTemp(logsDir, "*")
-	assert.NoError(t, err)
-	defer func() { assert.NoError(t, tmpFile.Close()) }()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, tmpFile.Close()) })
 
 	var logFileSize utils.FileSize
 	err = logFileSize.UnmarshalText([]byte("100mb"))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	pollChan := make(chan time.Time)
 	stop := func() {
@@ -244,26 +246,76 @@ func TestZapLogger_LogCaller(t *testing.T) {
 	lggr := newTestLogger(t, local)
 
 	lggr.Debug("test message with caller")
+	_, _, lineCall, ok := runtime.Caller(0)
+	require.True(t, ok)
 
 	pollChan <- time.Now()
 	<-local.testDiskLogLvlChan
 
 	logFile := local.LogsFile()
 	b, err := os.ReadFile(logFile)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	logs := string(b)
 	lines := strings.Split(logs, "\n")
 
-	require.Contains(t, lines[0], "logger/zap_test.go:246")
+	require.Contains(t, lines[0], fmt.Sprintf("logger/zap_test.go:%d\ttest message with caller", lineCall-1))
 }
 
 func TestZapLogger_Name(t *testing.T) {
 	cfg := Config{}
 	lggr := newTestLogger(t, cfg)
-	require.Equal(t, "", lggr.Name())
+	require.Empty(t, lggr.Name())
 	lggr1 := lggr.Named("Lggr1")
 	require.Equal(t, "Lggr1", lggr1.Name())
 	lggr2 := lggr1.Named("Lggr2")
 	require.Equal(t, "Lggr1.Lggr2", lggr2.Name())
+}
+
+func TestLogger_Leak(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	ac := NewUpdatableCore()
+	t.Cleanup(func() { ac.Close() })
+	startObjectsNum := heapObjects()
+	aLggr := ac.root.With([]zapcore.Field{})
+	bLggr := aLggr.With([]zapcore.Field{})
+	var l uint64 = 1000_000
+	for range l {
+		bLggr.With([]zapcore.Field{})
+	}
+	aLggr = nil
+	runtime.GC()
+	ac.registry.cleanup()
+	runtime.GC()
+	endObjectsNum := heapObjects()
+	// Require that endObjectsNum does not grow (with l/10 "delta" left for garbage collection jitter)
+	assert.Less(t, endObjectsNum, startObjectsNum+l/10)
+	require.NoError(t, bLggr.Sync())
+}
+
+func TestLogger_Output(t *testing.T) {
+	core, logs := observer.New(zapcore.InfoLevel)
+	ac := NewUpdatableCore()
+	lggrCfg := Config{}
+	l, closeL := lggrCfg.NewWithCores(ac.Root())
+	l2 := l.With("a", "a")
+	l3 := l2.With("b", "b")
+	ac.Update(core)
+	l3.Info("test")
+	require.Equal(t, 1, logs.Len())
+	require.Equal(t, "test", logs.All()[0].Message)
+	require.Len(t, logs.All()[0].Context, 3)
+	require.Equal(t, zapcore.Field{Key: "a", String: "a", Type: zapcore.StringType}, logs.All()[0].Context[1])
+	require.Equal(t, zapcore.Field{Key: "b", String: "b", Type: zapcore.StringType}, logs.All()[0].Context[2])
+	ac.Close()
+	require.NoError(t, closeL())
+}
+
+func heapObjects() uint64 {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.HeapObjects
 }

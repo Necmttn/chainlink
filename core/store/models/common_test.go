@@ -5,15 +5,13 @@ import (
 	"net/url"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/v2/core/store/models"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestJSON_Merge(t *testing.T) {
@@ -34,7 +32,7 @@ func TestJSON_Merge(t *testing.T) {
 			false,
 		},
 		{
-			"overwritting fields",
+			"overwriting fields",
 			`{"value":"OLD","other":1}`,
 			`{"value":["new","new"],"extra":2}`,
 			`{"value":["new","new"],"other":1,"extra":2}`,
@@ -79,6 +77,7 @@ func TestJSON_Merge(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			j1 := cltest.JSONFromString(t, test.original)
 			j2 := cltest.JSONFromString(t, test.input)
 
@@ -95,6 +94,7 @@ func TestJSON_Merge(t *testing.T) {
 }
 
 func TestJSON_MergeNull(t *testing.T) {
+	t.Parallel()
 	merged, err := models.Merge(models.JSON{}, models.JSON{})
 	require.NoError(t, err)
 	assert.Equal(t, `{}`, merged.String())
@@ -114,6 +114,7 @@ func TestJSON_UnmarshalJSON(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			var j models.JSON
 			err := json.Unmarshal([]byte(test.json), &j)
 			assert.Equal(t, test.wantErrored, (err != nil))
@@ -137,6 +138,7 @@ func TestJSON_ParseJSON(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			json, err := models.ParseJSON([]byte(test.in))
 			assert.Equal(t, test.want, json)
 			assert.Equal(t, test.wantErrored, (err != nil))
@@ -165,10 +167,10 @@ func TestWebURL_MarshalJSON(t *testing.T) {
 
 	str := "http://www.duckduckgo.com"
 	parsed, err := url.ParseRequestURI(str)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	wurl := models.WebURL(*parsed)
 	b, err := json.Marshal(wurl)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, `"`+str+`"`, string(b))
 }
 
@@ -186,7 +188,7 @@ func TestWebURL_String_HasNilURL(t *testing.T) {
 
 	w := models.WebURL{}
 
-	assert.Equal(t, "", w.String())
+	assert.Empty(t, w.String())
 }
 
 func TestCron_UnmarshalJSON_Success(t *testing.T) {
@@ -201,6 +203,7 @@ func TestCron_UnmarshalJSON_Success(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			var actual models.Cron
 			err := json.Unmarshal([]byte(test.input), &actual)
 			assert.NoError(t, err)
@@ -220,69 +223,12 @@ func TestCron_UnmarshalJSON_Invalid(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			var actual models.Cron
 			err := json.Unmarshal([]byte(test.input), &actual)
 			assert.EqualError(t, err, test.wantError)
 		})
 	}
-}
-
-func TestNewInterval(t *testing.T) {
-	t.Parallel()
-
-	duration := 33 * time.Second
-	interval := models.NewInterval(duration)
-
-	require.Equal(t, duration, interval.Duration())
-}
-
-func TestSha256Hash_MarshalJSON_UnmarshalJSON(t *testing.T) {
-	t.Parallel()
-
-	hash := models.MustSha256HashFromHex("f5bf259689b26f1374efb3c9a9868796953a0f814bb2d39b968d0e61b58620a5")
-	json, err := hash.MarshalJSON()
-	require.NoError(t, err)
-	require.NotEmpty(t, json)
-
-	var newHash models.Sha256Hash
-	err = newHash.UnmarshalJSON(json)
-	require.NoError(t, err)
-
-	require.Equal(t, hash, newHash)
-}
-
-func TestSha256Hash_Sha256HashFromHex(t *testing.T) {
-	t.Parallel()
-
-	_, err := models.Sha256HashFromHex("abczzz")
-	require.Error(t, err)
-
-	_, err = models.Sha256HashFromHex("f5bf259689b26f1374efb3c9a9868796953a0f814bb2d39b968d0e61b58620a5")
-	require.NoError(t, err)
-
-	_, err = models.Sha256HashFromHex("f5bf259689b26f1374e6")
-	require.NoError(t, err)
-}
-
-func TestSha256Hash_String(t *testing.T) {
-	t.Parallel()
-
-	hash := models.MustSha256HashFromHex("f5bf259689b26f1374efb3c9a9868796953a0f814bb2d39b968d0e61b58620a5")
-	assert.Equal(t, "f5bf259689b26f1374efb3c9a9868796953a0f814bb2d39b968d0e61b58620a5", hash.String())
-}
-
-func TestSha256Hash_Scan_Value(t *testing.T) {
-	t.Parallel()
-
-	hash := models.MustSha256HashFromHex("f5bf259689b26f1374efb3c9a9868796953a0f814bb2d39b968d0e61b58620a5")
-	val, err := hash.Value()
-	require.NoError(t, err)
-
-	var newHash models.Sha256Hash
-	err = newHash.Scan(val)
-	require.NoError(t, err)
-
-	require.Equal(t, hash, newHash)
 }
 
 func TestAddressCollection_Scan_Value(t *testing.T) {
@@ -318,50 +264,6 @@ func TestAddressCollection_ToStrings(t *testing.T) {
 	require.Len(t, acStrings, 2)
 	require.Equal(t, hex1, acStrings[0])
 	require.Equal(t, hex2, acStrings[1])
-}
-
-func TestInterval_IsZero(t *testing.T) {
-	t.Parallel()
-
-	i := models.NewInterval(0)
-	require.NotNil(t, i)
-	require.True(t, i.IsZero())
-
-	i = models.NewInterval(1)
-	require.NotNil(t, i)
-	require.False(t, i.IsZero())
-}
-
-func TestInterval_Scan_Value(t *testing.T) {
-	t.Parallel()
-
-	i := models.NewInterval(100)
-	require.NotNil(t, i)
-
-	val, err := i.Value()
-	require.NoError(t, err)
-
-	iNew := models.NewInterval(0)
-	err = iNew.Scan(val)
-	require.NoError(t, err)
-
-	require.Equal(t, i, iNew)
-}
-
-func TestInterval_MarshalText_UnmarshalText(t *testing.T) {
-	t.Parallel()
-
-	i := models.NewInterval(100)
-	require.NotNil(t, i)
-
-	txt, err := i.MarshalText()
-	require.NoError(t, err)
-
-	iNew := models.NewInterval(0)
-	err = iNew.UnmarshalText(txt)
-	require.NoError(t, err)
-
-	require.Equal(t, i, iNew)
 }
 
 func TestWebURL_Scan_Value(t *testing.T) {

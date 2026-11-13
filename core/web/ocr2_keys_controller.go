@@ -7,9 +7,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
 
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys"
 	"github.com/smartcontractkit/chainlink/v2/core/logger/audit"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/chaintype"
 	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 )
 
@@ -34,9 +34,10 @@ func (ocr2kc *OCR2KeysController) Index(c *gin.Context) {
 // Example:
 // "POST <application>/keys/ocr"
 func (ocr2kc *OCR2KeysController) Create(c *gin.Context) {
-	chainType := chaintype.ChainType(c.Param("chainType"))
-	key, err := ocr2kc.App.GetKeyStore().OCR2().Create(chainType)
-	if errors.Is(errors.Cause(err), chaintype.ErrInvalidChainType) {
+	ctx := c.Request.Context()
+	chainType := corekeys.ChainType(c.Param("chainType"))
+	key, err := ocr2kc.App.GetKeyStore().OCR2().Create(ctx, chainType)
+	if errors.Is(errors.Cause(err), corekeys.ErrInvalidChainType) {
 		jsonAPIError(c, http.StatusBadRequest, err)
 		return
 	}
@@ -45,7 +46,7 @@ func (ocr2kc *OCR2KeysController) Create(c *gin.Context) {
 		return
 	}
 
-	ocr2kc.App.GetAuditLogger().Audit(audit.OCR2KeyBundleCreated, map[string]interface{}{
+	ocr2kc.App.GetAuditLogger().Audit(audit.OCR2KeyBundleCreated, map[string]any{
 		"ocr2KeyID":                        key.ID(),
 		"ocr2KeyChainType":                 key.ChainType(),
 		"ocr2KeyConfigEncryptionPublicKey": key.ConfigEncryptionPublicKey(),
@@ -60,19 +61,20 @@ func (ocr2kc *OCR2KeysController) Create(c *gin.Context) {
 // Example:
 // "DELETE <application>/keys/ocr/:keyID"
 func (ocr2kc *OCR2KeysController) Delete(c *gin.Context) {
+	ctx := c.Request.Context()
 	id := c.Param("keyID")
 	key, err := ocr2kc.App.GetKeyStore().OCR2().Get(id)
 	if err != nil {
 		jsonAPIError(c, http.StatusNotFound, err)
 		return
 	}
-	err = ocr2kc.App.GetKeyStore().OCR2().Delete(id)
+	err = ocr2kc.App.GetKeyStore().OCR2().Delete(ctx, id)
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	ocr2kc.App.GetAuditLogger().Audit(audit.OCR2KeyBundleDeleted, map[string]interface{}{"id": id})
+	ocr2kc.App.GetAuditLogger().Audit(audit.OCR2KeyBundleDeleted, map[string]any{"id": id})
 	jsonAPIResponse(c, presenters.NewOCR2KeysBundleResource(key), "offChainReporting2KeyBundle")
 }
 
@@ -81,6 +83,7 @@ func (ocr2kc *OCR2KeysController) Delete(c *gin.Context) {
 // "Post <application>/keys/ocr/import"
 func (ocr2kc *OCR2KeysController) Import(c *gin.Context) {
 	defer ocr2kc.App.GetLogger().ErrorIfFn(c.Request.Body.Close, "Error closing Import request body")
+	ctx := c.Request.Context()
 
 	bytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
@@ -88,13 +91,13 @@ func (ocr2kc *OCR2KeysController) Import(c *gin.Context) {
 		return
 	}
 	oldPassword := c.Query("oldpassword")
-	keyBundle, err := ocr2kc.App.GetKeyStore().OCR2().Import(bytes, oldPassword)
+	keyBundle, err := ocr2kc.App.GetKeyStore().OCR2().Import(ctx, bytes, oldPassword)
 	if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	ocr2kc.App.GetAuditLogger().Audit(audit.OCR2KeyBundleImported, map[string]interface{}{
+	ocr2kc.App.GetAuditLogger().Audit(audit.OCR2KeyBundleImported, map[string]any{
 		"ocr2KeyID":                        keyBundle.ID(),
 		"ocr2KeyChainType":                 keyBundle.ChainType(),
 		"ocr2KeyConfigEncryptionPublicKey": keyBundle.ConfigEncryptionPublicKey(),
@@ -120,6 +123,6 @@ func (ocr2kc *OCR2KeysController) Export(c *gin.Context) {
 		return
 	}
 
-	ocr2kc.App.GetAuditLogger().Audit(audit.OCR2KeyBundleExported, map[string]interface{}{"keyID": stringID})
+	ocr2kc.App.GetAuditLogger().Audit(audit.OCR2KeyBundleExported, map[string]any{"keyID": stringID})
 	c.Data(http.StatusOK, MediaType, bytes)
 }

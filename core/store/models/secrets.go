@@ -1,58 +1,26 @@
 package models
 
 import (
-	"encoding"
-	"fmt"
-	"net/url"
-
 	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
-)
-
-const redacted = "xxxxx"
-
-var (
-	_ fmt.Stringer           = (*Secret)(nil)
-	_ encoding.TextMarshaler = (*Secret)(nil)
 )
 
 // Secret is a string that formats and encodes redacted, as "xxxxx".
 //
-// Use Value to get the actual secret.
-type Secret string
+// Deprecated: use commonconfig.SecretString instead.
+type Secret = commonconfig.SecretString
 
-func NewSecret(s string) *Secret { return (*Secret)(&s) }
-
-func (s Secret) String() string { return redacted }
-
-func (s Secret) GoString() string { return redacted }
-
-func (s Secret) MarshalText() ([]byte, error) { return []byte(redacted), nil }
-
-var (
-	_ fmt.Stringer             = (*SecretURL)(nil)
-	_ encoding.TextMarshaler   = (*SecretURL)(nil)
-	_ encoding.TextUnmarshaler = (*SecretURL)(nil)
-)
+// Deprecated: use commonconfig.NewSecretString instead.
+func NewSecret(s string) *Secret { return commonconfig.NewSecretString(s) }
 
 // SecretURL is a URL that formats and encodes redacted, as "xxxxx".
-type SecretURL commonconfig.URL
+//
+// Deprecated: use commonconfig.SecretURL instead.
+type SecretURL = commonconfig.SecretURL
 
-func NewSecretURL(u *commonconfig.URL) *SecretURL { return (*SecretURL)(u) }
+// Deprecated: use commonconfig.NewSecretURL instead.
+func NewSecretURL(u *commonconfig.URL) *commonconfig.SecretURL { return commonconfig.NewSecretURL(u) }
 
-func MustSecretURL(u string) *SecretURL { return NewSecretURL(commonconfig.MustParseURL(u)) }
-
-func (s *SecretURL) String() string { return redacted }
-
-func (s *SecretURL) GoString() string { return redacted }
-
-func (s *SecretURL) URL() *url.URL { return (*commonconfig.URL)(s).URL() }
-
-func (s *SecretURL) MarshalText() ([]byte, error) { return []byte(redacted), nil }
-
-func (s *SecretURL) UnmarshalText(text []byte) error {
-	if err := (*commonconfig.URL)(s).UnmarshalText(text); err != nil {
-		//opt: if errors.Is(url.Error), just redact the err.URL field?
-		return fmt.Errorf("failed to parse url: %s", redacted)
-	}
-	return nil
+// Deprecated: use commonconfig.MustSecretURL instead.
+func MustSecretURL(u string) *commonconfig.SecretURL {
+	return NewSecretURL(commonconfig.MustParseURL(u))
 }

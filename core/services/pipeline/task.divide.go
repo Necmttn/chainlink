@@ -2,12 +2,12 @@ package pipeline
 
 import (
 	"context"
+	stderrors "errors"
 	"math"
 
 	"github.com/pkg/errors"
-	"go.uber.org/multierr"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 )
 
 // Return types:
@@ -23,8 +23,8 @@ type DivideTask struct {
 var _ Task = (*DivideTask)(nil)
 
 var (
-	ErrDivideByZero    = errors.New("divide by zero")
-	ErrDivisionOverlow = errors.New("division overflow")
+	ErrDivideByZero     = errors.New("divide by zero")
+	ErrDivisionOverflow = errors.New("division overflow")
 )
 
 func (t *DivideTask) Type() TaskType {
@@ -42,7 +42,7 @@ func (t *DivideTask) Run(_ context.Context, _ logger.Logger, vars Vars, inputs [
 		b              DecimalParam
 		maybePrecision MaybeInt32Param
 	)
-	err = multierr.Combine(
+	err = stderrors.Join(
 		errors.Wrap(ResolveParam(&a, From(VarExpr(t.Input, vars), NonemptyString(t.Input), Input(inputs, 0))), "input"),
 		errors.Wrap(ResolveParam(&b, From(VarExpr(t.Divisor, vars), NonemptyString(t.Divisor))), "divisor"),
 		errors.Wrap(ResolveParam(&maybePrecision, From(VarExpr(t.Precision, vars), t.Precision)), "precision"),
@@ -59,7 +59,7 @@ func (t *DivideTask) Run(_ context.Context, _ logger.Logger, vars Vars, inputs [
 		scale := -precision
 		e := int64(a.Decimal().Exponent()) - int64(b.Decimal().Exponent()) - int64(scale)
 		if e > math.MaxInt32 || e < math.MinInt32 {
-			return Result{Error: ErrDivisionOverlow}, runInfo
+			return Result{Error: ErrDivisionOverflow}, runInfo
 		}
 
 		return Result{Value: a.Decimal().DivRound(b.Decimal(), precision)}, runInfo

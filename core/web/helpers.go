@@ -33,7 +33,7 @@ func paginatedResponse(
 	name string,
 	size int,
 	page int,
-	resource interface{},
+	resource any,
 	count int,
 	err error,
 ) {
@@ -42,9 +42,9 @@ func paginatedResponse(
 	}
 
 	if err != nil {
-		jsonAPIError(c, http.StatusInternalServerError, fmt.Errorf("error getting paged %s: %+v", name, err))
+		jsonAPIError(c, http.StatusInternalServerError, fmt.Errorf("error getting paged %s: %w", name, err))
 	} else if buffer, err := NewPaginatedResponse(*c.Request.URL, size, page, count, resource); err != nil {
-		jsonAPIError(c, http.StatusInternalServerError, fmt.Errorf("failed to marshal document: %+v", err))
+		jsonAPIError(c, http.StatusInternalServerError, fmt.Errorf("failed to marshal document: %w", err))
 	} else {
 		c.Data(http.StatusOK, MediaType, buffer)
 	}
@@ -61,16 +61,16 @@ func paginatedRequest(action func(*gin.Context, int, int, int)) func(*gin.Contex
 	}
 }
 
-func jsonAPIResponseWithStatus(c *gin.Context, resource interface{}, name string, status int) {
+func jsonAPIResponseWithStatus(c *gin.Context, resource any, name string, status int) {
 	json, err := jsonapi.Marshal(resource)
 	if err != nil {
-		jsonAPIError(c, http.StatusInternalServerError, fmt.Errorf("failed to marshal %s using jsonapi: %+v", name, err))
+		jsonAPIError(c, http.StatusInternalServerError, fmt.Errorf("failed to marshal %s using jsonapi: %w", name, err))
 	} else {
 		c.Data(status, MediaType, json)
 	}
 }
 
-func jsonAPIResponse(c *gin.Context, resource interface{}, name string) {
+func jsonAPIResponse(c *gin.Context, resource any, name string) {
 	jsonAPIResponseWithStatus(c, resource, name, http.StatusOK)
 }
 

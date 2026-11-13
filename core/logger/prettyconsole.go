@@ -16,7 +16,7 @@ import (
 	"go.uber.org/zap"
 )
 
-var levelColors = map[string]func(...interface{}) string{
+var levelColors = map[string]func(...any) string{
 	"default": color.New(color.FgWhite).SprintFunc(),
 	"debug":   color.New(color.FgGreen).SprintFunc(),
 	"info":    color.New(color.FgWhite).SprintFunc(),
@@ -46,7 +46,7 @@ func (pc PrettyConsole) Write(b []byte) (int, error) {
 	js := gjson.ParseBytes(b)
 	headline := generateHeadline(js)
 	details := generateDetails(js)
-	return pc.Sink.Write([]byte(fmt.Sprintln(headline, details)))
+	return pc.Sink.Write(fmt.Appendln(nil, headline, details))
 }
 
 // Close is overridden to prevent accidental closure of stderr/stdout
@@ -70,7 +70,7 @@ func generateHeadline(js gjson.Result) string {
 		// assume already formatted
 		tsStr = ts.Str
 	}
-	headline := []interface{}{
+	headline := []any{
 		tsStr,
 		" ",
 		coloredLevel(js.Get("level")),
@@ -107,7 +107,7 @@ func generateDetails(js gjson.Result) string {
 	var details strings.Builder
 
 	for _, v := range keys {
-		details.WriteString(fmt.Sprintf("%s=%v ", green(sanitized(v)), sanitized(data[v].String())))
+		fmt.Fprintf(&details, "%s=%v ", green(sanitized(v)), sanitized(data[v].String()))
 	}
 
 	return details.String()
@@ -137,7 +137,7 @@ type sanitized string
 // String replaces control characters with Go escape sequences, except for newlines and tabs.
 // See strconv.QuoteRune.
 func (s sanitized) String() string {
-	var out string
+	var out strings.Builder
 	for _, r := range s {
 		switch r {
 		case '\n', '\r', '\t':
@@ -146,11 +146,11 @@ func (s sanitized) String() string {
 			// escape others
 			if unicode.IsControl(r) {
 				q := strconv.QuoteRune(r)
-				out += q[1 : len(q)-1] // trim quotes
+				out.WriteString(q[1 : len(q)-1]) // trim quotes
 				continue
 			}
 		}
-		out += string(r)
+		out.WriteRune(r)
 	}
-	return out
+	return out.String()
 }

@@ -1,14 +1,16 @@
 package resolver
 
 import (
+	"context"
 	"encoding/json"
 	"math/big"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ocrkey"
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ocrkey"
 )
 
 func TestResolver_GetOCRKeyBundles(t *testing.T) {
@@ -27,9 +29,9 @@ func TestResolver_GetOCRKeyBundles(t *testing.T) {
 		}
 	`
 
-	fakeKeys := []ocrkey.KeyV2{}
-	expectedBundles := []map[string]string{}
-	for i := 0; i < 2; i++ {
+	fakeKeys := make([]ocrkey.KeyV2, 0, 2)
+	expectedBundles := make([]map[string]string, 0, 2)
+	for range 2 {
 		k := ocrkey.MustNewV2XXXTestingOnly(big.NewInt(1))
 		fakeKeys = append(fakeKeys, k)
 		expectedBundles = append(expectedBundles, map[string]string{
@@ -40,12 +42,12 @@ func TestResolver_GetOCRKeyBundles(t *testing.T) {
 		})
 	}
 
-	d, err := json.Marshal(map[string]interface{}{
-		"ocrKeyBundles": map[string]interface{}{
+	d, err := json.Marshal(map[string]any{
+		"ocrKeyBundles": map[string]any{
 			"results": expectedBundles,
 		},
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	expected := string(d)
 
 	testCases := []GQLTestCase{
@@ -53,7 +55,7 @@ func TestResolver_GetOCRKeyBundles(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.Mocks.ocr.On("GetAll").Return(fakeKeys, nil)
 				f.Mocks.keystore.On("OCR").Return(f.Mocks.ocr)
 				f.App.On("GetKeyStore").Return(f.Mocks.keystore)
@@ -86,9 +88,9 @@ func TestResolver_OCRCreateBundle(t *testing.T) {
 
 	fakeKey := ocrkey.MustNewV2XXXTestingOnly(big.NewInt(1))
 
-	d, err := json.Marshal(map[string]interface{}{
-		"createOCRKeyBundle": map[string]interface{}{
-			"bundle": map[string]interface{}{
+	d, err := json.Marshal(map[string]any{
+		"createOCRKeyBundle": map[string]any{
+			"bundle": map[string]any{
 				"id":                    fakeKey.ID(),
 				"configPublicKey":       ocrkey.ConfigPublicKey(fakeKey.PublicKeyConfig()).String(),
 				"offChainPublicKey":     fakeKey.OffChainSigning.PublicKey().String(),
@@ -96,7 +98,7 @@ func TestResolver_OCRCreateBundle(t *testing.T) {
 			},
 		},
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	expected := string(d)
 
 	testCases := []GQLTestCase{
@@ -104,8 +106,8 @@ func TestResolver_OCRCreateBundle(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.Mocks.ocr.On("Create").Return(fakeKey, nil)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.Mocks.ocr.On("Create", mock.Anything).Return(fakeKey, nil)
 				f.Mocks.keystore.On("OCR").Return(f.Mocks.ocr)
 				f.App.On("GetKeyStore").Return(f.Mocks.keystore)
 			},
@@ -140,13 +142,13 @@ func TestResolver_OCRDeleteBundle(t *testing.T) {
 			}
 		}
 	`
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"id": fakeKey.ID(),
 	}
 
-	d, err := json.Marshal(map[string]interface{}{
-		"deleteOCRKeyBundle": map[string]interface{}{
-			"bundle": map[string]interface{}{
+	d, err := json.Marshal(map[string]any{
+		"deleteOCRKeyBundle": map[string]any{
+			"bundle": map[string]any{
 				"id":                    fakeKey.ID(),
 				"configPublicKey":       ocrkey.ConfigPublicKey(fakeKey.PublicKeyConfig()).String(),
 				"offChainPublicKey":     fakeKey.OffChainSigning.PublicKey().String(),
@@ -154,7 +156,7 @@ func TestResolver_OCRDeleteBundle(t *testing.T) {
 			},
 		},
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	expected := string(d)
 
 	testCases := []GQLTestCase{
@@ -162,8 +164,8 @@ func TestResolver_OCRDeleteBundle(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.Mocks.ocr.On("Delete", fakeKey.ID()).Return(fakeKey, nil)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.Mocks.ocr.On("Delete", mock.Anything, fakeKey.ID()).Return(fakeKey, nil)
 				f.Mocks.keystore.On("OCR").Return(f.Mocks.ocr)
 				f.App.On("GetKeyStore").Return(f.Mocks.keystore)
 			},
@@ -174,9 +176,9 @@ func TestResolver_OCRDeleteBundle(t *testing.T) {
 		{
 			name:          "not found error",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.Mocks.ocr.
-					On("Delete", fakeKey.ID()).
+					On("Delete", mock.Anything, fakeKey.ID()).
 					Return(ocrkey.KeyV2{}, keystore.KeyNotFoundError{ID: "helloWorld", KeyType: "OCR"})
 				f.Mocks.keystore.On("OCR").Return(f.Mocks.ocr)
 				f.App.On("GetKeyStore").Return(f.Mocks.keystore)

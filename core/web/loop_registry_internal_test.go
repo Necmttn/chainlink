@@ -7,9 +7,9 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
-	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink/v2/plugins"
 )
 
@@ -35,26 +35,28 @@ func newResponseWriter() *responseWriter {
 }
 
 func TestLoopRegistryServer_CantWriteToResponse(t *testing.T) {
-	l, o := logger.TestLoggerObserved(t, zap.ErrorLevel)
+	t.Parallel()
+	l, o := logger.TestObserved(t, zapcore.ErrorLevel)
 	s := &LoopRegistryServer{
 		exposedPromPort: 1,
-		registry:        plugins.NewLoopRegistry(l, nil),
-		logger:          l.(logger.SugaredLogger),
+		registry:        plugins.NewTestLoopRegistry(l),
+		logger:          l,
 		jsonMarshalFn:   json.Marshal,
 	}
 
 	rw := newResponseWriter()
 	s.discoveryHandler(rw, &http.Request{})
-	assert.Equal(t, rw.statusCode, http.StatusInternalServerError)
+	assert.Equal(t, http.StatusInternalServerError, rw.statusCode)
 	assert.Equal(t, 1, o.FilterMessageSnippet("could not write to response").Len())
 }
 
 func TestLoopRegistryServer_CantMarshal(t *testing.T) {
-	l, o := logger.TestLoggerObserved(t, zap.ErrorLevel)
+	t.Parallel()
+	l, o := logger.TestObserved(t, zapcore.ErrorLevel)
 	s := &LoopRegistryServer{
 		exposedPromPort: 1,
-		registry:        plugins.NewLoopRegistry(l, nil),
-		logger:          l.(logger.SugaredLogger),
+		registry:        plugins.NewTestLoopRegistry(l),
+		logger:          l,
 		jsonMarshalFn: func(any) ([]byte, error) {
 			return []byte(""), errors.New("can't unmarshal")
 		},
@@ -62,6 +64,6 @@ func TestLoopRegistryServer_CantMarshal(t *testing.T) {
 
 	rw := newResponseWriter()
 	s.discoveryHandler(rw, &http.Request{})
-	assert.Equal(t, rw.statusCode, http.StatusInternalServerError)
+	assert.Equal(t, http.StatusInternalServerError, rw.statusCode)
 	assert.Equal(t, 1, o.FilterMessageSnippet("could not write to response").Len())
 }

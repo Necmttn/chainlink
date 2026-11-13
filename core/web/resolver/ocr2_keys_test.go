@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -8,13 +9,12 @@ import (
 
 	gqlerrors "github.com/graph-gophers/graphql-go/errors"
 	"github.com/pkg/errors"
-
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/keystest"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/chaintype"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ocr2key"
-
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ocr2key"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/keystest"
 )
 
 func TestResolver_GetOCR2KeyBundles(t *testing.T) {
@@ -37,17 +37,19 @@ func TestResolver_GetOCR2KeyBundles(t *testing.T) {
 	gError := errors.New("error")
 	fakeKeys := []ocr2key.KeyBundle{
 		ocr2key.MustNewInsecure(keystest.NewRandReaderFromSeed(1), "evm"),
-		ocr2key.MustNewInsecure(keystest.NewRandReaderFromSeed(1), "cosmos"),
 		ocr2key.MustNewInsecure(keystest.NewRandReaderFromSeed(1), "solana"),
 		ocr2key.MustNewInsecure(keystest.NewRandReaderFromSeed(1), "starknet"),
+		ocr2key.MustNewInsecure(keystest.NewRandReaderFromSeed(1), "aptos"),
+		ocr2key.MustNewInsecure(keystest.NewRandReaderFromSeed(1), "tron"),
+		ocr2key.MustNewInsecure(keystest.NewRandReaderFromSeed(1), "ton"),
 	}
-	expectedBundles := []map[string]interface{}{}
+	expectedBundles := make([]map[string]any, 0, len(fakeKeys))
 	for _, k := range fakeKeys {
 		configPublic := k.ConfigEncryptionPublicKey()
 		ct, err := ToOCR2ChainType(string(k.ChainType()))
 		require.NoError(t, err)
 		pubKey := k.OffchainPublicKey()
-		expectedBundles = append(expectedBundles, map[string]interface{}{
+		expectedBundles = append(expectedBundles, map[string]any{
 			"id":                k.ID(),
 			"chainType":         ct,
 			"onChainPublicKey":  fmt.Sprintf("ocr2on_%s_%s", k.ChainType(), k.OnChainPublicKey()),
@@ -56,12 +58,12 @@ func TestResolver_GetOCR2KeyBundles(t *testing.T) {
 		})
 	}
 
-	d, err := json.Marshal(map[string]interface{}{
-		"ocr2KeyBundles": map[string]interface{}{
+	d, err := json.Marshal(map[string]any{
+		"ocr2KeyBundles": map[string]any{
 			"results": expectedBundles,
 		},
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	expected := string(d)
 
 	testCases := []GQLTestCase{
@@ -69,7 +71,7 @@ func TestResolver_GetOCR2KeyBundles(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.Mocks.ocr2.On("GetAll").Return(fakeKeys, nil)
 				f.Mocks.keystore.On("OCR2").Return(f.Mocks.ocr2)
 				f.App.On("GetKeyStore").Return(f.Mocks.keystore)
@@ -80,7 +82,7 @@ func TestResolver_GetOCR2KeyBundles(t *testing.T) {
 		{
 			name:          "generic error on GetAll()",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.Mocks.ocr2.On("GetAll").Return(nil, gError)
 				f.Mocks.keystore.On("OCR2").Return(f.Mocks.ocr2)
 				f.App.On("GetKeyStore").Return(f.Mocks.keystore)
@@ -91,7 +93,7 @@ func TestResolver_GetOCR2KeyBundles(t *testing.T) {
 				{
 					Extensions:    nil,
 					ResolverError: gError,
-					Path:          []interface{}{"ocr2KeyBundles"},
+					Path:          []any{"ocr2KeyBundles"},
 					Message:       gError.Error(),
 				},
 			},
@@ -127,9 +129,9 @@ func TestResolver_CreateOCR2KeyBundle(t *testing.T) {
 
 	configPublic := fakeKey.ConfigEncryptionPublicKey()
 	pubKey := fakeKey.OffchainPublicKey()
-	d, err := json.Marshal(map[string]interface{}{
-		"createOCR2KeyBundle": map[string]interface{}{
-			"bundle": map[string]interface{}{
+	d, err := json.Marshal(map[string]any{
+		"createOCR2KeyBundle": map[string]any{
+			"bundle": map[string]any{
 				"id":                fakeKey.ID(),
 				"chainType":         ct,
 				"onChainPublicKey":  fmt.Sprintf("ocr2on_%s_%s", fakeKey.ChainType(), fakeKey.OnChainPublicKey()),
@@ -138,10 +140,10 @@ func TestResolver_CreateOCR2KeyBundle(t *testing.T) {
 			},
 		},
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	expected := string(d)
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"chainType": OCR2ChainTypeEVM,
 	}
 
@@ -150,8 +152,8 @@ func TestResolver_CreateOCR2KeyBundle(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.Mocks.ocr2.On("Create", chaintype.ChainType("evm")).Return(fakeKey, nil)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.Mocks.ocr2.On("Create", mock.Anything, corekeys.ChainType("evm")).Return(fakeKey, nil)
 				f.Mocks.keystore.On("OCR2").Return(f.Mocks.ocr2)
 				f.App.On("GetKeyStore").Return(f.Mocks.keystore)
 			},
@@ -162,8 +164,8 @@ func TestResolver_CreateOCR2KeyBundle(t *testing.T) {
 		{
 			name:          "generic error on Create()",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.Mocks.ocr2.On("Create", chaintype.ChainType("evm")).Return(nil, gError)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.Mocks.ocr2.On("Create", mock.Anything, corekeys.ChainType("evm")).Return(nil, gError)
 				f.Mocks.keystore.On("OCR2").Return(f.Mocks.ocr2)
 				f.App.On("GetKeyStore").Return(f.Mocks.keystore)
 			},
@@ -174,7 +176,7 @@ func TestResolver_CreateOCR2KeyBundle(t *testing.T) {
 				{
 					Extensions:    nil,
 					ResolverError: gError,
-					Path:          []interface{}{"createOCR2KeyBundle"},
+					Path:          []any{"createOCR2KeyBundle"},
 					Message:       gError.Error(),
 				},
 			},
@@ -208,7 +210,7 @@ func TestResolver_DeleteOCR2KeyBundle(t *testing.T) {
 			}
 		}
 	`
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"id": fakeKey.ID(),
 	}
 
@@ -217,9 +219,9 @@ func TestResolver_DeleteOCR2KeyBundle(t *testing.T) {
 
 	configPublic := fakeKey.ConfigEncryptionPublicKey()
 	pubKey := fakeKey.OffchainPublicKey()
-	d, err := json.Marshal(map[string]interface{}{
-		"deleteOCR2KeyBundle": map[string]interface{}{
-			"bundle": map[string]interface{}{
+	d, err := json.Marshal(map[string]any{
+		"deleteOCR2KeyBundle": map[string]any{
+			"bundle": map[string]any{
 				"id":                fakeKey.ID(),
 				"chainType":         ct,
 				"onChainPublicKey":  fmt.Sprintf("ocr2on_%s_%s", fakeKey.ChainType(), fakeKey.OnChainPublicKey()),
@@ -228,7 +230,7 @@ func TestResolver_DeleteOCR2KeyBundle(t *testing.T) {
 			},
 		},
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	expected := string(d)
 
 	gError := errors.New("error")
@@ -238,8 +240,8 @@ func TestResolver_DeleteOCR2KeyBundle(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.Mocks.ocr2.On("Delete", fakeKey.ID()).Return(nil)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.Mocks.ocr2.On("Delete", mock.Anything, fakeKey.ID()).Return(nil)
 				f.Mocks.ocr2.On("Get", fakeKey.ID()).Return(fakeKey, nil)
 				f.Mocks.keystore.On("OCR2").Return(f.Mocks.ocr2)
 				f.App.On("GetKeyStore").Return(f.Mocks.keystore)
@@ -251,7 +253,7 @@ func TestResolver_DeleteOCR2KeyBundle(t *testing.T) {
 		{
 			name:          "not found error",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
+			before: func(ctx context.Context, f *gqlTestFramework) {
 				f.Mocks.ocr2.On("Get", fakeKey.ID()).Return(fakeKey, gError)
 				f.Mocks.keystore.On("OCR2").Return(f.Mocks.ocr2)
 				f.App.On("GetKeyStore").Return(f.Mocks.keystore)
@@ -268,8 +270,8 @@ func TestResolver_DeleteOCR2KeyBundle(t *testing.T) {
 		{
 			name:          "generic error on Delete()",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				f.Mocks.ocr2.On("Delete", fakeKey.ID()).Return(gError)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				f.Mocks.ocr2.On("Delete", mock.Anything, fakeKey.ID()).Return(gError)
 				f.Mocks.ocr2.On("Get", fakeKey.ID()).Return(fakeKey, nil)
 				f.Mocks.keystore.On("OCR2").Return(f.Mocks.ocr2)
 				f.App.On("GetKeyStore").Return(f.Mocks.keystore)
@@ -281,7 +283,7 @@ func TestResolver_DeleteOCR2KeyBundle(t *testing.T) {
 				{
 					Extensions:    nil,
 					ResolverError: gError,
-					Path:          []interface{}{"deleteOCR2KeyBundle"},
+					Path:          []any{"deleteOCR2KeyBundle"},
 					Message:       gError.Error(),
 				},
 			},

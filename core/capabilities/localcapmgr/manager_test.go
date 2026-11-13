@@ -1,0 +1,432 @@
+package localcapmgr
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
+	ocrtypes "github.com/smartcontractkit/libocr/offchainreporting2plus/types"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities"
+	capabilitiespb "github.com/smartcontractkit/chainlink-common/pkg/capabilities/pb"
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities/registry"
+	valuespb "github.com/smartcontractkit/chainlink-protos/cre/go/values/pb"
+	corelogger "github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink/v2/core/services/job"
+)
+
+func TestConfigHash(t *testing.T) {
+	t.Run("empty config returns empty string", func(t *testing.T) {
+		assert.Empty(t, configHash(nil))
+		assert.Empty(t, configHash([]byte{}))
+	})
+
+	t.Run("same config produces same hash", func(t *testing.T) {
+		cfg := []byte(`{"key": "value"}`)
+		h1 := configHash(cfg)
+		h2 := configHash(cfg)
+		assert.Equal(t, h1, h2)
+		assert.NotEmpty(t, h1)
+	})
+
+	t.Run("different config produces different hash", func(t *testing.T) {
+		h1 := configHash([]byte(`{"key": "value1"}`))
+		h2 := configHash([]byte(`{"key": "value2"}`))
+		assert.NotEqual(t, h1, h2)
+	})
+}
+
+func TestRunningKey(t *testing.T) {
+	assert.Equal(t, "cron@1.0.0:1", runningKey("cron@1.0.0", 1))
+	assert.Equal(t, "consensus@1.0.0:42", runningKey("consensus@1.0.0", 42))
+}
+
+func testLogger(t *testing.T) corelogger.Logger {
+	return corelogger.TestLogger(t)
+}
+
+func TestBuildDesiredState(t *testing.T) {
+	lggr := testLogger(t)
+	mgr := &localCapabilityManager{
+		lggr:     lggr,
+		localCfg: &testLocalCapabilities{allowlisted: map[string]bool{"cron@1.0.0": true, "consensus@1.0.0": true}},
+	}
+
+	dons := []registry.DON{
+		{
+			DON: capabilities.DON{ID: 1},
+			CapabilityConfigurations: map[string]registry.CapabilityConfiguration{
+				"cron@1.0.0":      {Config: []byte(`{"interval": 60}`)},
+				"consensus@1.0.0": {Config: []byte(`{"key": "evm"}`)},
+				"unknown@1.0.0":   {Config: []byte(`{}`)}, // not allowlisted
+			},
+		},
+		{
+			DON: capabilities.DON{ID: 2},
+			CapabilityConfigurations: map[string]registry.CapabilityConfiguration{
+				"cron@1.0.0": {Config: []byte(`{"interval": 30}`)},
+			},
+		},
+	}
+
+	desired := mgr.buildDesiredState(dons, nil)
+
+	assert.Len(t, desired, 3)
+	assert.Contains(t, desired, "cron@1.0.0:1")
+	assert.Contains(t, desired, "consensus@1.0.0:1")
+	assert.Contains(t, desired, "cron@1.0.0:2")
+	assert.NotContains(t, desired, "unknown@1.0.0:1")
+}
+
+func TestBuildDesiredState_NilLocalConfig(t *testing.T) {
+	lggr := testLogger(t)
+	mgr := &localCapabilityManager{
+		lggr:     lggr,
+		localCfg: nil,
+	}
+
+	dons := []registry.DON{
+		{
+			DON: capabilities.DON{ID: 1},
+			CapabilityConfigurations: map[string]registry.CapabilityConfiguration{
+				"cron@1.0.0": {Config: []byte(`{}`)},
+			},
+		},
+	}
+
+	desired := mgr.buildDesiredState(dons, nil)
+	assert.Empty(t, desired, "nil config should not allow any capabilities")
+}
+
+func TestExtractDefaultOCR3Config(t *testing.T) {
+	t.Parallel()
+
+	t.Run("empty config returns nil", func(t *testing.T) {
+		t.Parallel()
+		assert.Nil(t, extractDefaultOCR3Config(registry.CapabilityConfiguration{}))
+	})
+
+	t.Run("config without OCR3 returns nil", func(t *testing.T) {
+		t.Parallel()
+		cc := registry.CapabilityConfiguration{Config: mustMarshalCapConfig(t, map[string]string{"k": "v"})}
+		assert.Nil(t, extractDefaultOCR3Config(cc))
+	})
+
+	t.Run("returns default OCR3 config", func(t *testing.T) {
+		t.Parallel()
+		raw, err := proto.Marshal(&capabilitiespb.CapabilityConfig{
+			Ocr3Configs: map[string]*capabilitiespb.OCR3Config{
+				capabilitiespb.OCR3ConfigDefaultKey: {
+					Signers:      [][]byte{{0x01, 0x02}},
+					Transmitters: [][]byte{{0xab, 0xcd}},
+					F:            1,
+				},
+			},
+		})
+		require.NoError(t, err)
+
+		got := extractDefaultOCR3Config(registry.CapabilityConfiguration{Config: raw})
+		require.NotNil(t, got)
+		require.Len(t, got.Signers, 1)
+		assert.Equal(t, ocrtypes.OnchainPublicKey{0x01, 0x02}, got.Signers[0])
+		require.Len(t, got.Transmitters, 1)
+		assert.Equal(t, ocrtypes.Account("abcd"), got.Transmitters[0])
+	})
+}
+
+func noopServiceBuilder(_ context.Context, _ string, _ uint32, _ string, _ string, _ *ocrtypes.ContractConfig) ([]job.ServiceCtx, error) {
+	return []job.ServiceCtx{&mockService{}}, nil
+}
+
+func failingServiceBuilder(_ context.Context, _ string, _ uint32, _ string, _ string, _ *ocrtypes.ContractConfig) ([]job.ServiceCtx, error) {
+	return nil, assert.AnError
+}
+
+func TestReconcile_StartsNewCapabilities(t *testing.T) {
+	ctx := context.Background()
+	lggr := testLogger(t)
+	metrics, err := newMetrics()
+	require.NoError(t, err)
+
+	mgr := &localCapabilityManager{
+		lggr: lggr,
+		localCfg: &testLocalCapabilities{
+			allowlisted: map[string]bool{"test-cap@1.0.0": true},
+		},
+		newServicesFn:       noopServiceBuilder,
+		runningCapabilities: make(map[string]*runningCapability),
+		metrics:             metrics,
+	}
+
+	onchainCfg := mustMarshalCapConfig(t, map[string]string{"test": "true"})
+	dons := []registry.DON{
+		{
+			DON: capabilities.DON{ID: 1},
+			CapabilityConfigurations: map[string]registry.CapabilityConfiguration{
+				"test-cap@1.0.0": {Config: onchainCfg},
+			},
+		},
+	}
+
+	err = mgr.Reconcile(ctx, dons, nil)
+	require.NoError(t, err)
+
+	assert.Len(t, mgr.runningCapabilities, 1)
+	assert.Contains(t, mgr.runningCapabilities, "test-cap@1.0.0:1")
+}
+
+func TestReconcile_StopsRemovedCapabilities(t *testing.T) {
+	ctx := context.Background()
+	lggr := testLogger(t)
+	metrics, err := newMetrics()
+	require.NoError(t, err)
+
+	emptyCfg := mustMarshalCapConfig(t, nil)
+	mockSvc := &mockService{}
+	mgr := &localCapabilityManager{
+		lggr: lggr,
+		localCfg: &testLocalCapabilities{
+			allowlisted: map[string]bool{"test-cap@1.0.0": true},
+		},
+		newServicesFn: noopServiceBuilder,
+		runningCapabilities: map[string]*runningCapability{
+			"test-cap@1.0.0:1": {
+				capID:      "test-cap@1.0.0",
+				donID:      1,
+				services:   []job.ServiceCtx{mockSvc},
+				configHash: configHash(emptyCfg),
+			},
+			"removed-cap@1.0.0:1": {
+				capID:    "removed-cap@1.0.0",
+				donID:    1,
+				services: []job.ServiceCtx{&mockService{}},
+			},
+		},
+		metrics: metrics,
+	}
+
+	// Only test-cap@1.0.0 is in the desired state.
+	dons := []registry.DON{
+		{
+			DON: capabilities.DON{ID: 1},
+			CapabilityConfigurations: map[string]registry.CapabilityConfiguration{
+				"test-cap@1.0.0": {Config: emptyCfg},
+			},
+		},
+	}
+
+	err = mgr.Reconcile(ctx, dons, nil)
+	require.NoError(t, err)
+
+	// removed-cap should be stopped and removed.
+	assert.Len(t, mgr.runningCapabilities, 1)
+	assert.Contains(t, mgr.runningCapabilities, "test-cap@1.0.0:1")
+	assert.NotContains(t, mgr.runningCapabilities, "removed-cap@1.0.0:1")
+}
+
+func TestReconcile_DetectsConfigChange(t *testing.T) {
+	ctx := context.Background()
+	lggr := testLogger(t)
+	metrics, err := newMetrics()
+	require.NoError(t, err)
+
+	oldCfg := mustMarshalCapConfig(t, map[string]string{"version": "1"})
+	newCfg := mustMarshalCapConfig(t, map[string]string{"version": "2"})
+
+	mockSvc := &mockService{}
+	mgr := &localCapabilityManager{
+		lggr: lggr,
+		localCfg: &testLocalCapabilities{
+			allowlisted: map[string]bool{"test-cap@1.0.0": true},
+		},
+		newServicesFn: noopServiceBuilder,
+		runningCapabilities: map[string]*runningCapability{
+			"test-cap@1.0.0:1": {
+				capID:      "test-cap@1.0.0",
+				donID:      1,
+				services:   []job.ServiceCtx{mockSvc},
+				configHash: configHash(oldCfg),
+			},
+		},
+		metrics: metrics,
+	}
+
+	dons := []registry.DON{
+		{
+			DON: capabilities.DON{ID: 1},
+			CapabilityConfigurations: map[string]registry.CapabilityConfiguration{
+				"test-cap@1.0.0": {Config: newCfg},
+			},
+		},
+	}
+
+	err = mgr.Reconcile(ctx, dons, nil)
+	require.NoError(t, err)
+
+	// Old capability closed, new one started.
+	assert.True(t, mockSvc.closed, "old capability should be closed on config change")
+	assert.Len(t, mgr.runningCapabilities, 1)
+	assert.Contains(t, mgr.runningCapabilities, "test-cap@1.0.0:1")
+
+	// Verify new hash: the effective hash covers the on-chain bytes and the merged config.
+	rc := mgr.runningCapabilities["test-cap@1.0.0:1"]
+	assert.Equal(t, effectiveConfigHash(newCfg, `{"version":"2"}`), rc.configHash)
+}
+
+func TestReconcile_ContinuesOnStartFailure(t *testing.T) {
+	ctx := context.Background()
+	lggr := testLogger(t)
+	metrics, err := newMetrics()
+	require.NoError(t, err)
+
+	emptyCfg := mustMarshalCapConfig(t, nil)
+	mgr := &localCapabilityManager{
+		lggr: lggr,
+		localCfg: &testLocalCapabilities{
+			allowlisted: map[string]bool{"failing-cap@1.0.0": true, "good-cap@1.0.0": true},
+		},
+		newServicesFn:       failingServiceBuilder,
+		runningCapabilities: make(map[string]*runningCapability),
+		metrics:             metrics,
+	}
+
+	dons := []registry.DON{
+		{
+			DON: capabilities.DON{ID: 1},
+			CapabilityConfigurations: map[string]registry.CapabilityConfiguration{
+				"failing-cap@1.0.0": {Config: emptyCfg},
+				"good-cap@1.0.0":    {Config: emptyCfg},
+			},
+		},
+	}
+
+	err = mgr.Reconcile(ctx, dons, nil)
+	require.NoError(t, err) // Reconcile is best-effort, doesn't return errors for individual caps.
+
+	// Both failed since we use failingServiceBuilder.
+	assert.Empty(t, mgr.runningCapabilities)
+}
+
+func TestClose_StopsAllRunningCapabilities(t *testing.T) {
+	lggr := testLogger(t)
+	metrics, err := newMetrics()
+	require.NoError(t, err)
+
+	svc1 := &mockService{}
+	svc2 := &mockService{}
+	mgr := &localCapabilityManager{
+		lggr: lggr,
+		runningCapabilities: map[string]*runningCapability{
+			"cap1@1.0.0:1": {capID: "cap1@1.0.0", donID: 1, services: []job.ServiceCtx{svc1}},
+			"cap2@1.0.0:2": {capID: "cap2@1.0.0", donID: 2, services: []job.ServiceCtx{svc2}},
+		},
+		metrics: metrics,
+	}
+
+	// Start it first so Close works.
+	require.NoError(t, mgr.Start(context.Background()))
+	require.NoError(t, mgr.Close())
+
+	assert.True(t, svc1.closed)
+	assert.True(t, svc2.closed)
+	assert.Empty(t, mgr.runningCapabilities)
+}
+
+// --- Test helpers ---
+
+type mockService struct {
+	started bool
+	closed  bool
+}
+
+func (m *mockService) Start(context.Context) error { m.started = true; return nil }
+func (m *mockService) Close() error                { m.closed = true; return nil }
+
+// testLocalCapabilities implements config.LocalCapabilities for testing.
+type testLocalCapabilities struct {
+	allowlisted map[string]bool
+	useOffchain bool
+}
+
+func (t *testLocalCapabilities) UseOffchainRegistry() bool { return t.useOffchain }
+
+func (t *testLocalCapabilities) RegistryBasedLaunchAllowlist() []string {
+	result := make([]string, 0, len(t.allowlisted))
+	for k := range t.allowlisted {
+		result = append(result, k)
+	}
+	return result
+}
+
+func (t *testLocalCapabilities) IsAllowlisted(capabilityID string) bool {
+	return t.allowlisted[capabilityID]
+}
+
+// mustMarshalCapConfig creates proto-encoded CapabilityConfig bytes with a DefaultConfig map.
+func mustMarshalCapConfig(t *testing.T, kv map[string]string) []byte {
+	t.Helper()
+	fields := make(map[string]*valuespb.Value, len(kv))
+	for k, v := range kv {
+		fields[k] = valuespb.NewStringValue(v)
+	}
+	cfg := &capabilitiespb.CapabilityConfig{
+		SpecConfig: &valuespb.Map{Fields: fields},
+	}
+	b, err := proto.Marshal(cfg)
+	require.NoError(t, err)
+	return b
+}
+
+func TestBuildConfigJSON(t *testing.T) {
+	t.Parallel()
+	lggr := testLogger(t)
+
+	t.Run("onchain config only", func(t *testing.T) {
+		t.Parallel()
+		mgr := &localCapabilityManager{
+			lggr:     lggr,
+			localCfg: &testLocalCapabilities{allowlisted: map[string]bool{"cap@1.0.0": true}},
+		}
+		onchainBytes := mustMarshalCapConfig(t, map[string]string{"chainId": "42"})
+		info := &capabilityInfo{
+			capID:  "cap@1.0.0",
+			config: registry.CapabilityConfiguration{Config: onchainBytes},
+		}
+		result, err := mgr.buildConfigJSON(info)
+		require.NoError(t, err)
+
+		var got map[string]any
+		require.NoError(t, json.Unmarshal([]byte(result), &got))
+		assert.Equal(t, "42", got["chainId"])
+	})
+
+	t.Run("empty config returns empty JSON object", func(t *testing.T) {
+		t.Parallel()
+		mgr := &localCapabilityManager{
+			lggr:     lggr,
+			localCfg: &testLocalCapabilities{allowlisted: map[string]bool{"cap@1.0.0": true}},
+		}
+		info := &capabilityInfo{capID: "cap@1.0.0", config: registry.CapabilityConfiguration{}}
+		result, err := mgr.buildConfigJSON(info)
+		require.NoError(t, err)
+		assert.Equal(t, "{}", result)
+	})
+
+	t.Run("invalid onchain proto fails hard", func(t *testing.T) {
+		t.Parallel()
+		mgr := &localCapabilityManager{
+			lggr:     lggr,
+			localCfg: &testLocalCapabilities{allowlisted: map[string]bool{"cap@1.0.0": true}},
+		}
+		info := &capabilityInfo{
+			capID:  "cap@1.0.0",
+			config: registry.CapabilityConfiguration{Config: []byte("not-valid-proto")},
+		}
+		_, err := mgr.buildConfigJSON(info)
+		require.ErrorContains(t, err, "failed to unmarshal cap registry config")
+	})
+}

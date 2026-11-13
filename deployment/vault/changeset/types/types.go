@@ -1,0 +1,405 @@
+package types
+
+import (
+	"encoding/json"
+	"fmt"
+	"math/big"
+	"strings"
+
+	"github.com/ethereum/go-ethereum/common"
+
+	cldfproposalutils "github.com/smartcontractkit/chainlink-deployments-framework/engine/cld/mcms/proposalutils"
+)
+
+type NativeTransfer struct {
+	To     string   `json:"to"`     // Destination address
+	Amount *big.Int `json:"amount"` // Amount in wei
+}
+
+// BatchNativeTransferConfig configures batch native token transfers across multiple chains
+type BatchNativeTransferConfig struct {
+	// TransfersByChain maps chain selector to list of transfers for that chain
+	TransfersByChain map[uint64][]NativeTransfer `json:"transfers_by_chain"`
+
+	// MCMSConfig contains timelock and MCMS configuration
+	MCMSConfig *cldfproposalutils.TimelockConfig `json:"mcms_config"`
+
+	// Description for the MCMS proposal
+	Description string `json:"description"`
+}
+
+// FundTimelockConfig configures funding timelock contracts with native tokens
+type FundTimelockConfig struct {
+	// FundingByChain maps chain selector to amount to fund the timelock
+	FundingByChain map[uint64]*big.Int `json:"funding_by_chain"`
+}
+
+// WhitelistAddress represents an address entry in the whitelist
+type WhitelistAddress struct {
+	Address     string   `json:"address"`
+	Description string   `json:"description"`
+	Labels      []string `json:"labels"`
+}
+
+// SetWhitelistConfig configures address whitelist state
+type SetWhitelistConfig struct {
+	// WhitelistByChain maps chain selector to the list of whitelisted addresses for that chain
+	WhitelistByChain map[uint64][]WhitelistAddress `json:"whitelist_by_chain"`
+}
+
+// WhitelistMetadata represents the whitelist state for a single chain stored in chain metadata
+type WhitelistMetadata struct {
+	Addresses []WhitelistAddress `json:"addresses"`
+}
+
+// TimelockNativeBalanceInfo represents native token balance information for Timelock
+type TimelockNativeBalanceInfo struct {
+	TimelockAddr string   `json:"timelock_address"`
+	Balance      *big.Int `json:"balance"`
+}
+
+// TransferValidationError represents validation errors for transfers
+type TransferValidationError struct {
+	ChainSelector uint64 `json:"chain_selector"`
+	Address       string `json:"address"`
+	Error         string `json:"error"`
+}
+
+// BatchNativeTransferState represents the current state of Vault
+type BatchNativeTransferState struct {
+	// TimelockBalances maps chain selector to timelock balance info
+	TimelockBalances map[uint64]*TimelockNativeBalanceInfo `json:"timelock_balances"`
+
+	// WhitelistedAddresses maps chain selector to list of whitelisted addresses
+	WhitelistedAddresses map[uint64][]string `json:"whitelisted_addresses"`
+
+	// ValidationErrors contains any validation errors found
+	ValidationErrors []TransferValidationError `json:"validation_errors"`
+}
+
+// ERC20Transfer is a single ERC20 transfer (payee, token, amount in token units)
+type ERC20Transfer struct {
+	Payee  string   `json:"payee"`  // Destination address
+	Token  string   `json:"token"`  // ERC20 token contract address
+	Amount *big.Int `json:"amount"` // Amount in token units (not wei)
+}
+
+// TransferERC20Config configures batch ERC20 transfers from timelocks across multiple chains
+type TransferERC20Config struct {
+	// TransfersByChain maps chain selector to ERC20 transfers for that chain
+	TransfersByChain map[uint64][]ERC20Transfer `json:"transfers_by_chain"`
+
+	// MCMSConfig contains timelock and MCMS configuration for building the proposal
+	MCMSConfig *cldfproposalutils.TimelockConfig `json:"mcms_config"`
+
+	// Description for the MCMS proposal
+	Description string `json:"description"`
+}
+
+// DeployEthBalMonChainConfig is deployment-time configuration for EthBalMon on one chain.
+type DeployEthBalMonChainConfig struct {
+	// KeeperRegistryAddress is the address authorized to call performUpkeep on EthBalMon.
+	// In the CRE flow this is the address of a deployed AutomationReceiver.
+	KeeperRegistryAddress string `json:"keeperRegistryAddress"`
+	// SetMinWaitPeriodSeconds is the minimum seconds between balance checks for this deployment.
+	// Optional: nil or 0 means the deploy changeset uses a default (currently 60 seconds).
+	SetMinWaitPeriodSeconds *uint64 `json:"setMinWaitPeriodSeconds,omitempty"`
+}
+
+// DeployEthBalMonInput is the input to the EthBalMon deploy changeset.
+// Keys are chain selectors; each value configures keeper/registry wiring and min wait for that chain.
+type DeployEthBalMonInput struct {
+	Chains map[uint64]DeployEthBalMonChainConfig `json:"chains"`
+	// MCMSConfig optionally configures the post-deploy accept-ownership timelock proposal (MCMS action, delay, etc.).
+	// When nil or MCMSAction is unset, the deploy flow defaults accept-ownership to bypass (historical behavior).
+	MCMSConfig *cldfproposalutils.TimelockConfig `json:"mcms_config,omitempty"`
+}
+
+// EthBalMonContractType is the datastore / MCMS contract type label for EthBalMon deployments.
+const EthBalMonContractType = "EthBalMon"
+
+// AutomationReceiverContractType
+const AutomationReceiverContractType = "AutomationReceiver"
+
+// SetExpectedWorkflowIdentityChainConfig configures the AutomationReceiver's inbound identity
+// guard on one chain by pinning the workflow owner (author) and name. This is stable across
+// workflow redeploys (unlike the workflow id, which changes on every redeploy), so it only needs
+// to be set once. Both fields are required.
+type SetExpectedWorkflowIdentityChainConfig struct {
+	// ExpectedAuthor is the workflow owner address (hex) allowed to call the receiver.
+	ExpectedAuthor string `json:"expectedAuthor"`
+	// ExpectedWorkflowName is the raw workflow name; the receiver hashes/truncates it internally.
+	ExpectedWorkflowName string `json:"expectedWorkflowName"`
+}
+
+// SetExpectedWorkflowIdentityInput is the input to the setExpectedWorkflowIdentity changeset.
+// Keys are chain selectors; the AutomationReceiver address is resolved from the datastore.
+type SetExpectedWorkflowIdentityInput struct {
+	Chains map[uint64]SetExpectedWorkflowIdentityChainConfig `json:"chains"`
+	// MCMSConfig optionally configures the timelock proposal; when nil, schedule + proposer MCM is used.
+	MCMSConfig *cldfproposalutils.TimelockConfig `json:"mcms_config,omitempty"`
+}
+
+// SetKeeperRegistryChainConfig updates the automation executor/registry EthBalMon forwards work to.
+type SetKeeperRegistryChainConfig struct {
+	// NewKeeperRegistryAddress is the new Chainlink Automation forwarder or KMS executor address (hex).
+	NewKeeperRegistryAddress string `json:"new_keeper_registry_address"`
+}
+
+// EthBalMonSetKeeperRegistryAddressInput is the input to the setKeeperRegistryAddress changeset.
+// Keys are chain selectors with the registry address to set on each chain's EthBalMon.
+type EthBalMonSetKeeperRegistryAddressInput struct {
+	Chains map[uint64]SetKeeperRegistryChainConfig `json:"chains"`
+	// MCMSConfig optionally configures the timelock proposal; when nil, schedule + proposer MCM is used.
+	MCMSConfig *cldfproposalutils.TimelockConfig `json:"mcms_config,omitempty"`
+}
+
+// EthBalMonSetWatchListChainConfig replaces the monitored addresses and thresholds on one chain.
+// Addresses, MinBalancesWei, and TopUpAmountsWei are parallel slices: index i applies to Addresses[i].
+// MinBalancesWei and TopUpAmountsWei are represented as *big.Int values in wei.
+type EthBalMonSetWatchListChainConfig struct {
+	Addresses       []common.Address `json:"addresses"`
+	MinBalancesWei  []*big.Int       `json:"min_balance_wei"`
+	TopUpAmountsWei []*big.Int       `json:"topup_amounts_wei"`
+}
+
+// EthBalMonSetWatchListInput is the input to the setWatchList changeset.
+// Keys are chain selectors; each value is the full watch list to install on that chain's EthBalMon.
+type EthBalMonSetWatchListInput struct {
+	Chains map[uint64]EthBalMonSetWatchListChainConfig `json:"chains"`
+	// MCMSConfig optionally configures the timelock proposal; when nil, schedule + proposer MCM is used.
+	MCMSConfig *cldfproposalutils.TimelockConfig `json:"mcms_config,omitempty"`
+}
+
+// EthBalMonWithdrawChainConfig configures a native-token withdraw from EthBalMon on one chain.
+type EthBalMonWithdrawChainConfig struct {
+	// Amount is the withdrawal amount in wei. Must be positive (validated by the changeset).
+	Amount *big.Int `json:"amount"`
+	// Payee is the recipient address (hex).
+	Payee string `json:"payee"`
+}
+
+// EthBalMonWithdrawInput is the input to the EthBalMon withdraw changeset.
+// Keys are chain selectors; each value specifies amount and recipient for that chain.
+type EthBalMonWithdrawInput struct {
+	Chains map[uint64]EthBalMonWithdrawChainConfig `json:"chains"`
+	// MCMSConfig optionally configures the timelock proposal; when nil, schedule + proposer MCM is used.
+	MCMSConfig *cldfproposalutils.TimelockConfig `json:"mcms_config,omitempty"`
+}
+
+// EthBalMonTransferOwnershipChainConfig sets the new owner of EthBalMon on one chain.
+type EthBalMonTransferOwnershipChainConfig struct {
+	// NewOwner is the address (hex) that will own the EthBalMon contract after the operation.
+	NewOwner string `json:"new_owner"`
+}
+
+// EthBalMonTransferOwnershipInput is the input to the EthBalMon transferOwnership changeset.
+// Keys are chain selectors; each value is the new owner for that chain's EthBalMon instance.
+type EthBalMonTransferOwnershipInput struct {
+	Chains map[uint64]EthBalMonTransferOwnershipChainConfig `json:"chains"`
+	// MCMSConfig optionally configures the timelock proposal; when nil, schedule + proposer MCM is used.
+	MCMSConfig *cldfproposalutils.TimelockConfig `json:"mcms_config,omitempty"`
+}
+
+// AutomationReceiverChainConfig is deployment-time configuration for AutomationReceiver on one chain.
+type AutomationReceiverChainConfig struct {
+	// ForwarderAddress is the CRE forwarder address passed to the AutomationReceiver constructor.
+	ForwarderAddress string `json:"forwarderAddress"`
+	// TargetAddress is the contract AR is allowed to call via setCallAllowed (e.g. an EthBalMon address).
+	TargetAddress string `json:"targetAddress"`
+	// Selector is the 4-byte function selector as a hex string (e.g. "0x4b9f5c20").
+	// Defaults to performUpkeep(bytes) if empty.
+	Selector string `json:"selector,omitempty"`
+	// ExpectedAuthor / ExpectedWorkflowName lock the AutomationReceiver's inbound identity
+	// guard at deploy time. The receiver reverts with WorkflowIdentityNotConfigured until an
+	// identity is set, so configuring it here makes the receiver usable right after deploy.
+	// Optional: set BOTH (recommended, stable across workflow redeploys) or leave both empty
+	// to skip identity setup at deploy time.
+	ExpectedAuthor       string `json:"expectedAuthor,omitempty"`
+	ExpectedWorkflowName string `json:"expectedWorkflowName,omitempty"`
+}
+
+// DeployAutomationReceiverInput is the input to the standalone AutomationReceiver deploy changeset.
+type DeployAutomationReceiverInput struct {
+	Chains map[uint64]AutomationReceiverChainConfig `json:"chains"`
+}
+
+// DeployEthBalMonWithReceiverChainConfig configures the combined EthBalMon + AutomationReceiver deploy on one chain.
+type DeployEthBalMonWithReceiverChainConfig struct {
+	// ForwarderAddress is passed to the AutomationReceiver constructor.
+	ForwarderAddress string `json:"forwarderAddress"`
+	// SetMinWaitPeriodSeconds configures the EthBalMon min wait period.
+	// Optional: nil or 0 defaults to 60 seconds.
+	SetMinWaitPeriodSeconds *uint64 `json:"setMinWaitPeriodSeconds,omitempty"`
+	// ExpectedAuthor / ExpectedWorkflowName lock the AutomationReceiver's inbound identity
+	// guard at deploy time (both required together to be effective). Optional: leave both empty
+	// to skip identity setup at deploy time.
+	ExpectedAuthor       string `json:"expectedAuthor,omitempty"`
+	ExpectedWorkflowName string `json:"expectedWorkflowName,omitempty"`
+}
+
+// DeployEthBalMonWithReceiverInput is the input to the combined EthBalMon + AutomationReceiver deploy changeset.
+type DeployEthBalMonWithReceiverInput struct {
+	Chains     map[uint64]DeployEthBalMonWithReceiverChainConfig `json:"chains"`
+	MCMSConfig *cldfproposalutils.TimelockConfig                 `json:"mcms_config,omitempty"`
+}
+
+// SetCallAllowedChainConfig configures a single setCallAllowed call on one chain.
+// The AutomationReceiver contract address is resolved from the datastore.
+type SetCallAllowedChainConfig struct {
+	// TargetAddress is the contract that AutomationReceiver is allowed (or disallowed) to call (hex).
+	TargetAddress string `json:"targetAddress"`
+	// Selector is the 4-byte function selector as a hex string, e.g. "0x4b9f5c20".
+	Selector string `json:"selector"`
+	// Allowed sets whether the (target, selector) pair is permitted.
+	Allowed bool `json:"allowed"`
+}
+
+// SetCallAllowedInput is the input to the setCallAllowed changeset.
+type SetCallAllowedInput struct {
+	Chains map[uint64]SetCallAllowedChainConfig `json:"chains"`
+	// MCMSConfig optionally configures the timelock proposal; when nil, schedule + proposer MCM is used.
+	MCMSConfig *cldfproposalutils.TimelockConfig `json:"mcms_config,omitempty"`
+}
+
+// EthBalMonAcceptOwnershipInput is the input to the EthBalMon acceptOwnership changeset.
+// Chains is the list of chain selectors on which to call acceptOwnership on the EthBalMon instance.
+type EthBalMonAcceptOwnershipInput struct {
+	Chains []uint64 `json:"chains"`
+	// MCMSConfig optionally configures the timelock proposal; when nil, schedule + proposer MCM is used.
+	MCMSConfig *cldfproposalutils.TimelockConfig `json:"mcms_config,omitempty"`
+}
+
+// ---------------------------------------------- //
+//  CCIP native / wrapped-native bridge input     //
+// ---------------------------------------------- //
+
+// CCIP bridge token-type values for CCIPBridgeConfig.TokenType.
+const (
+	// TokenTypeNative: the source Timelock holds native (ETH); the changeset wraps via WETH
+	// deposit() before the CCIP send.
+	TokenTypeNative = "native"
+	// TokenTypeWrappedNative: the source Timelock already holds WETH; no wrap, approve + send only.
+	TokenTypeWrappedNative = "wrappedNative"
+)
+
+// CCIPBridgeTransfer is a single destination for a native/wrapped-native bridge from the source Timelock.
+type CCIPBridgeTransfer struct {
+	// ToChainSelector is the CCIP destination chain selector.
+	ToChainSelector uint64 `json:"to_chain_selector"`
+	// Amount is the value to bridge, in wei (WETH units).
+	Amount *big.Int `json:"amount"`
+	// DestinationAddress is the final native recipient address on the destination chain.
+	DestinationAddress string `json:"destination_address"`
+	// MaxCCIPFee optionally caps the buffered native fee actually sent for this transfer (wei).
+	MaxCCIPFee *big.Int `json:"max_ccip_fee,omitempty"`
+}
+
+// UnmarshalJSON lets Amount and MaxCCIPFee be supplied as either a JSON number or a quoted decimal
+// string. Quoting is REQUIRED for values above int64 max (~9.2e18 wei ≈ 9.2 ETH): an unquoted YAML
+// integer overflows int64 before it ever reaches here, so large transfers (e.g. 50 - 100 ETH) must be
+// written as strings, e.g. amount: "50000000000000000000". Smaller values may use either form.
+func (t *CCIPBridgeTransfer) UnmarshalJSON(data []byte) error {
+	var r struct {
+		ToChainSelector    uint64          `json:"to_chain_selector"`
+		Amount             json.RawMessage `json:"amount"`
+		DestinationAddress string          `json:"destination_address"`
+		MaxCCIPFee         json.RawMessage `json:"max_ccip_fee"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return err
+	}
+	amount, err := parseWeiBigInt(r.Amount)
+	if err != nil {
+		return fmt.Errorf("amount: %w", err)
+	}
+	maxFee, err := parseWeiBigInt(r.MaxCCIPFee)
+	if err != nil {
+		return fmt.Errorf("max_ccip_fee: %w", err)
+	}
+	t.ToChainSelector = r.ToChainSelector
+	t.DestinationAddress = r.DestinationAddress
+	t.Amount = amount
+	t.MaxCCIPFee = maxFee
+	return nil
+}
+
+// parseWeiBigInt parses a base-10 wei value from a JSON number or a quoted decimal string. It returns
+// nil for an absent, null, or empty value so an omitted optional field stays nil.
+func parseWeiBigInt(raw json.RawMessage) (*big.Int, error) {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return nil, nil
+	}
+	s = strings.Trim(s, `"`)
+	if s == "" {
+		return nil, nil
+	}
+	v, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		return nil, fmt.Errorf("invalid integer %q", s)
+	}
+	return v, nil
+}
+
+// CCIPBridgeSource is one source chain's bridge: what its Timelock holds and the destinations it
+// sends to. Each source resolves its own Timelock/MCM/WETH/Router from the datastore.
+type CCIPBridgeSource struct {
+	// FromChainSelector is the source chain whose Timelock holds the funds and executes the batch.
+	FromChainSelector uint64 `json:"from_chain_selector"`
+	// TokenType is TokenTypeNative or TokenTypeWrappedNative; it describes what this source holds.
+	TokenType string `json:"token_type"`
+	// Transfers is the list of destinations bridged from this source.
+	Transfers []CCIPBridgeTransfer `json:"transfers"`
+}
+
+// CCIPBridgeConfig configures a CCIP bridge of native/wrapped-native value from one or more source
+// Timelocks to destination chains, delivering native value via an EtherSenderReceiver. Listing
+// several sources produces a single multi-chain MCMS proposal so signers sign once.
+type CCIPBridgeConfig struct {
+	// Sources lists the source chains to bridge from. Preferred form; multiple sources are bundled
+	// into one proposal. When empty, the single-source fields below are used instead.
+	Sources []CCIPBridgeSource `json:"sources,omitempty"`
+
+	// Single-source shorthand (used only when Sources is empty) - kept for backward compatibility.
+	FromChainSelector uint64               `json:"from_chain_selector,omitempty"`
+	TokenType         string               `json:"token_type,omitempty"`
+	Transfers         []CCIPBridgeTransfer `json:"transfers,omitempty"`
+
+	// TestNeeded, when true, splits every transfer into a test proposal (TestBridgeAmount) and a
+	// remainder proposal (amount - TestBridgeAmount), each spanning all sources.
+	TestNeeded bool `json:"test_needed"`
+	// GasLimit is the destination execution gas limit encoded in CCIP extraArgs (default used if 0).
+	GasLimit uint64 `json:"gas_limit,omitempty"`
+	// MCMSConfig is the timelock/MCMS configuration; injected by the pipeline.
+	MCMSConfig *cldfproposalutils.TimelockConfig `json:"mcms_config"`
+	// Description for the generated MCMS proposal(s).
+	Description string `json:"description"`
+}
+
+type CCIPUnwrapTokenChainConfig struct {
+	ExternalAddressTransfer string `json:"external_address_transfer,omitempty"`
+}
+
+type CCIPUnwrapTokenConfig struct {
+	Chains      map[uint64]CCIPUnwrapTokenChainConfig `json:"chains"`
+	TestEnabled bool                                  `json:"test_enabled"`
+
+	MCMSConfig *cldfproposalutils.TimelockConfig `json:"mcms_config"`
+}
+
+// NormalizedSources returns Sources, or a single source built from the shorthand fields when Sources
+// is empty. It returns nil when neither form is set.
+func (c CCIPBridgeConfig) NormalizedSources() []CCIPBridgeSource {
+	if len(c.Sources) > 0 {
+		return c.Sources
+	}
+	if c.FromChainSelector == 0 && len(c.Transfers) == 0 {
+		return nil
+	}
+	return []CCIPBridgeSource{{
+		FromChainSelector: c.FromChainSelector,
+		TokenType:         c.TokenType,
+		Transfers:         c.Transfers,
+	}}
+}

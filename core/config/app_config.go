@@ -4,13 +4,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 	"go.uber.org/zap/zapcore"
+
+	"github.com/smartcontractkit/chainlink-data-streams/llo/transmitter/dataengine"
 )
 
-// nolint
 var (
-	ErrEnvUnset = errors.New("env var unset")
+	ErrEnvUnset = pkgerrors.New("env var unset")
 )
 
 type LogfFn func(string, ...any)
@@ -21,10 +22,13 @@ type AppConfig interface {
 	ShutdownGracePeriod() time.Duration
 	InsecureFastScrypt() bool
 	EVMEnabled() bool
-	EVMRPCEnabled() bool
-	CosmosEnabled() bool
 	SolanaEnabled() bool
 	StarkNetEnabled() bool
+	AptosEnabled() bool
+	TronEnabled() bool
+	TONEnabled() bool
+	SuiEnabled() bool
+	StellarEnabled() bool
 
 	Validate() error
 	ValidateDB() error
@@ -35,14 +39,15 @@ type AppConfig interface {
 
 	AuditLogger() AuditLogger
 	AutoPprof() AutoPprof
+	Capabilities() Capabilities
+	Workflows() Workflows
 	Database() Database
 	Feature() Feature
-	FluxMonitor() FluxMonitor
 	Insecure() Insecure
+	JobDistributor() JobDistributor
 	JobPipeline() JobPipeline
-	Keeper() Keeper
 	Log() Log
-	Mercury() Mercury
+	Mercury() dataengine.Mercury
 	OCR() OCR
 	OCR2() OCR2
 	P2P() P2P
@@ -54,6 +59,16 @@ type AppConfig interface {
 	Threshold() Threshold
 	WebServer() WebServer
 	Tracing() Tracing
+	Telemetry() Telemetry
+	Metering() Metering
+	CRE() CRE
+	CCV() CCV
+	Billing() Billing
+	BridgeStatusReporter() BridgeStatusReporter
+	JobSpecReporter() JobSpecReporter
+	Sharding() Sharding
+	ResourceAttributes() map[string]string
+	LOOPP() LOOPP
 }
 
 type DatabaseBackupMode string

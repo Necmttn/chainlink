@@ -4,41 +4,100 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/jmoiron/sqlx"
+	"github.com/jonboulle/clockwork"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities/registry"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/services/orgresolver"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/limits"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/config"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/handlers"
-	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/handlers/functions"
-	"github.com/smartcontractkit/chainlink/v2/core/services/pg"
+	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/handlers/capabilities"
+	v2 "github.com/smartcontractkit/chainlink/v2/core/services/gateway/handlers/capabilities/v2"
+	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/handlers/confidentialrelay"
+	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/handlers/vault"
+	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/network"
+	workflowsyncerv2 "github.com/smartcontractkit/chainlink/v2/core/services/workflows/syncer/v2"
 )
 
 const (
-	FunctionsHandlerType HandlerType = "functions"
-	DummyHandlerType     HandlerType = "dummy"
+	DummyHandlerType             HandlerType = "dummy"
+	WebAPICapabilitiesType       HandlerType = "web-api-capabilities" //  Handler for v0.1 HTTP capabilities for DAG workflows
+	HTTPCapabilityType           HandlerType = "http-capabilities"    // Handler for v1.0 HTTP capabilities for NoDAG workflows
+	VaultHandlerType             HandlerType = "vault"
+	ConfidentialRelayHandlerType HandlerType = "confidential-compute-relay"
 )
 
 type handlerFactory struct {
-	legacyChains legacyevm.LegacyChainContainer
-	db           *sqlx.DB
-	cfg          pg.QConfig
-	lggr         logger.Logger
+	legacyChains           legacyevm.LegacyChainContainer
+	ds                     sqlutil.DataSource
+	lggr                   logger.Logger
+	httpClient             network.HTTPClient
+	capabilitiesRegistry   registry.CapabilitiesRegistry
+	workflowRegistrySyncer workflowsyncerv2.WorkflowRegistrySyncer
+	lf                     limits.Factory
+	httpClientFactory      network.HTTPClientFactory
+	orgResolver            orgresolver.OrgResolver // optional; nil if the node isn't configured to resolve orgs (e.g. no Linking Service)
 }
 
 var _ HandlerFactory = (*handlerFactory)(nil)
 
-func NewHandlerFactory(legacyChains legacyevm.LegacyChainContainer, db *sqlx.DB, cfg pg.QConfig, lggr logger.Logger) HandlerFactory {
-	return &handlerFactory{legacyChains, db, cfg, lggr}
+func NewHandlerFactory(legacyChains legacyevm.LegacyChainContainer, ds sqlutil.DataSource, httpClient network.HTTPClient, capabilitiesRegistry registry.CapabilitiesRegistry, workflowRegistrySyncer workflowsyncerv2.WorkflowRegistrySyncer, lggr logger.Logger, lf limits.Factory, httpClientFactory network.HTTPClientFactory, orgResolver orgresolver.OrgResolver) HandlerFactory {
+	return &handlerFactory{
+		legacyChains,
+		ds,
+		lggr,
+		httpClient,
+		capabilitiesRegistry,
+		workflowRegistrySyncer,
+		lf,
+		httpClientFactory,
+		orgResolver,
+	}
 }
 
-func (hf *handlerFactory) NewHandler(handlerType HandlerType, handlerConfig json.RawMessage, donConfig *config.DONConfig, don handlers.DON) (handlers.Handler, error) {
+func (hf *handlerFactory) NewHandler(
+	handlerType HandlerType,
+	handlerConfig json.RawMessage,
+	shardedDONs []config.ShardedDONConfig,
+	shardsConnMgrs [][]handlers.DON,
+) (handlers.Handler, error) {
+	dons, err := handlers.NewShardedDONs(shardedDONs, shardsConnMgrs)
+	if err != nil {
+		return nil, err
+	}
+
 	switch handlerType {
-	case FunctionsHandlerType:
-		return functions.NewFunctionsHandlerFromConfig(handlerConfig, donConfig, don, hf.legacyChains, hf.db, hf.cfg, hf.lggr)
 	case DummyHandlerType:
-		return handlers.NewDummyHandler(donConfig, don, hf.lggr)
+		return handlers.NewDummyHandler(dons, hf.lggr)
+	case WebAPICapabilitiesType:
+		return capabilities.NewHandler(handlerConfig, dons, hf.httpClient, hf.lggr)
+	case HTTPCapabilityType:
+		return v2.NewGatewayHandler(handlerConfig, dons, hf.httpClient, hf.lggr, hf.lf, hf.httpClientFactory, hf.orgResolver)
+	case VaultHandlerType:
+		return vault.NewHandler(handlerConfig, dons, hf.capabilitiesRegistry, hf.workflowRegistrySyncer, hf.lggr, clockwork.NewRealClock(), hf.lf)
+	case ConfidentialRelayHandlerType:
+		// For backward compatibility, convert sharded config to legacy DONConfig
+		// using the first DON's first shard. TODO(CRE-1640): migrate to full
+		// shardedDONs/shardsConnMgrs support.
+		donConfig := shardedDONsToLegacy(dons.DONs[0])
+		don := dons.ConnMgrs[0][0]
+		return confidentialrelay.NewHandler(handlerConfig, donConfig, don, hf.lggr, clockwork.NewRealClock(), hf.lf)
 	default:
 		return nil, fmt.Errorf("unsupported handler type %s", handlerType)
+	}
+}
+
+func shardedDONsToLegacy(shardedDON config.ShardedDONConfig) *config.DONConfig {
+	var members []config.NodeConfig
+	if len(shardedDON.Shards) > 0 {
+		members = shardedDON.Shards[0].Nodes
+	}
+	return &config.DONConfig{
+		DonID:   shardedDON.DonName,
+		F:       shardedDON.F,
+		Members: members,
 	}
 }

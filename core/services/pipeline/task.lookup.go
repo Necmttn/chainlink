@@ -5,7 +5,7 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 )
 
 // Look up a field on a map
@@ -24,7 +24,7 @@ func (t *LookupTask) Type() TaskType {
 	return TaskTypeLookup
 }
 
-func (t *LookupTask) Run(ctx context.Context, lggr logger.Logger, vars Vars, inputs []Result) (result Result, runInfo RunInfo) {
+func (t *LookupTask) Run(_ context.Context, _ logger.Logger, _ Vars, inputs []Result) (result Result, runInfo RunInfo) {
 	_, err := CheckInputs(inputs, 1, 1, 0)
 	if err != nil {
 		return Result{Error: errors.Wrap(err, "task inputs")}, runInfo
@@ -36,9 +36,9 @@ func (t *LookupTask) Run(ctx context.Context, lggr logger.Logger, vars Vars, inp
 		return Result{Error: err}, runInfo
 	}
 
-	var val interface{}
+	var val any
 	switch m := inputs[0].Value.(type) {
-	case map[string]interface{}:
+	case map[string]any:
 		val = m[(string)(key)]
 	default:
 		return Result{Error: errors.Errorf("unexpected input type: %T", inputs[0].Value)}, runInfo

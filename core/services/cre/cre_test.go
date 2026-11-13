@@ -1,0 +1,107 @@
+package cre
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	commontypes "github.com/smartcontractkit/chainlink-common/pkg/types"
+	"github.com/smartcontractkit/chainlink/v2/core/config"
+	syncerV2Mocks "github.com/smartcontractkit/chainlink/v2/core/services/workflows/syncer/v2/mocks"
+	"github.com/smartcontractkit/chainlink/v2/core/utils"
+)
+
+// wfRegTestStub implements config.CapabilitiesWorkflowRegistry for tests.
+type wfRegTestStub struct {
+	addr           string
+	additionalURLs []string
+	fetchMode      string
+}
+
+type wfRegAddSrcStub struct{ u string }
+
+func (a wfRegAddSrcStub) GetURL() string      { return a.u }
+func (a wfRegAddSrcStub) GetTLSEnabled() bool { return false }
+func (a wfRegAddSrcStub) GetName() string     { return "" }
+
+type wfRegStorageStub struct{}
+
+func (wfRegStorageStub) ArtifactStorageHost() string { return "" }
+func (wfRegStorageStub) URL() string                 { return "" }
+func (wfRegStorageStub) TLSEnabled() bool            { return false }
+
+type wfRegModuleCacheStub struct{}
+
+func (wfRegModuleCacheStub) Enabled() bool              { return false }
+func (wfRegModuleCacheStub) DiskMonitorEnabled() bool   { return false }
+func (wfRegModuleCacheStub) IdleEviction() bool         { return true }
+func (wfRegModuleCacheStub) IdleTimeout() time.Duration { return 10 * time.Minute }
+func (wfRegModuleCacheStub) MaxLoaded() int             { return 200 }
+func (wfRegModuleCacheStub) CacheDir() string           { return "" }
+
+func (w wfRegTestStub) Address() string                         { return w.addr }
+func (w wfRegTestStub) NetworkID() string                       { return "" }
+func (w wfRegTestStub) ChainID() string                         { return "" }
+func (w wfRegTestStub) ContractVersion() string                 { return "" }
+func (w wfRegTestStub) MaxBinarySize() utils.FileSize           { return 0 }
+func (w wfRegTestStub) MaxConfigSize() utils.FileSize           { return 0 }
+func (w wfRegTestStub) RelayID() commontypes.RelayID            { return commontypes.RelayID{} }
+func (w wfRegTestStub) SyncStrategy() string                    { return "" }
+func (w wfRegTestStub) MaxConcurrency() int                     { return 0 }
+func (w wfRegTestStub) MaxActivationRetries() int               { return 0 }
+func (w wfRegTestStub) FetchMode() string                       { return w.fetchMode }
+func (w wfRegTestStub) FetchAllowedHosts() []string             { return nil }
+func (w wfRegTestStub) WorkflowStorage() config.WorkflowStorage { return wfRegStorageStub{} }
+func (w wfRegTestStub) ModuleCache() config.ModuleCache         { return wfRegModuleCacheStub{} }
+func (w wfRegTestStub) AdditionalSources() []config.AdditionalWorkflowSource {
+	out := make([]config.AdditionalWorkflowSource, len(w.additionalURLs))
+	for i, u := range w.additionalURLs {
+		out[i] = wfRegAddSrcStub{u: u}
+	}
+	return out
+}
+
+func testWorkflowRegistry(addr string, urls ...string) config.CapabilitiesWorkflowRegistry {
+	return wfRegTestStub{addr: addr, additionalURLs: urls}
+}
+
+func TestWorkflowRegistryConfigured(t *testing.T) {
+	t.Parallel()
+
+	require.False(t, workflowRegistryConfigured(testWorkflowRegistry("")))
+	require.True(t, workflowRegistryConfigured(testWorkflowRegistry("0xabc")))
+	require.True(t, workflowRegistryConfigured(testWorkflowRegistry("", "https://example")))
+	require.True(t, workflowRegistryConfigured(testWorkflowRegistry("", "", "grpc://x")))
+}
+
+type capabilitiesStub struct {
+	config.Capabilities
+	wfReg config.CapabilitiesWorkflowRegistry
+}
+
+func (c capabilitiesStub) WorkflowRegistry() config.CapabilitiesWorkflowRegistry { return c.wfReg }
+
+func TestNewFetcherServiceV2_FetchMode(t *testing.T) {
+	t.Parallel()
+	lggr := logger.Test(t)
+	opts := Opts{StorageClient: syncerV2Mocks.NewWorkflowClient(t)}
+
+	t.Run("gateway mode requires gateway connector", func(t *testing.T) {
+		t.Parallel()
+		capCfg := capabilitiesStub{wfReg: wfRegTestStub{fetchMode: config.WorkflowFetchModeGateway}}
+		_, _, _, err := newFetcherServiceV2(opts, capCfg, lggr, nil)
+		require.ErrorContains(t, err, "without gateway connector")
+	})
+
+	t.Run("direct mode does not need gateway connector", func(t *testing.T) {
+		t.Parallel()
+		capCfg := capabilitiesStub{wfReg: wfRegTestStub{fetchMode: config.WorkflowFetchModeDirect}}
+		fetch, retrieve, srvs, err := newFetcherServiceV2(opts, capCfg, lggr, nil)
+		require.NoError(t, err)
+		require.NotNil(t, fetch)
+		require.NotNil(t, retrieve)
+		require.Empty(t, srvs)
+	})
+}

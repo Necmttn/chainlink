@@ -6,7 +6,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 )
@@ -16,7 +15,7 @@ func TestConditionalTask(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		input     interface{}
+		input     any
 		expectErr bool
 	}{
 		{"true string", "true", false},
@@ -34,36 +33,36 @@ func TestConditionalTask(t *testing.T) {
 				task := pipeline.ConditionalTask{
 					BaseTask: pipeline.NewBaseTask(0, "task", nil, nil, 0),
 					Data:     test.input.(string)}
-				result, runInfo := task.Run(testutils.Context(t), logger.TestLogger(t), vars, []pipeline.Result{{Value: test.input}})
+				result, runInfo := task.Run(t.Context(), logger.TestLogger(t), vars, []pipeline.Result{{Value: test.input}})
 
 				assert.False(t, runInfo.IsPending)
 				assert.False(t, runInfo.IsRetryable)
 				if test.expectErr {
 					require.Error(t, result.Error)
-					require.Equal(t, nil, result.Value)
+					require.Nil(t, result.Value)
 				} else {
 					require.NoError(t, result.Error)
-					require.Equal(t, true, result.Value.(bool))
+					require.True(t, result.Value.(bool))
 				}
 			})
 			t.Run("with vars", func(t *testing.T) {
-				vars := pipeline.NewVarsFrom(map[string]interface{}{
-					"foo": map[string]interface{}{"bar": test.input},
+				vars := pipeline.NewVarsFrom(map[string]any{
+					"foo": map[string]any{"bar": test.input},
 				})
 				task := pipeline.ConditionalTask{
 					BaseTask: pipeline.NewBaseTask(0, "task", nil, nil, 0),
 					Data:     "$(foo.bar)",
 				}
-				result, runInfo := task.Run(testutils.Context(t), logger.TestLogger(t), vars, []pipeline.Result{})
+				result, runInfo := task.Run(t.Context(), logger.TestLogger(t), vars, []pipeline.Result{})
 
 				assert.False(t, runInfo.IsPending)
 				assert.False(t, runInfo.IsRetryable)
 				if test.expectErr {
 					require.Error(t, result.Error)
-					require.Equal(t, nil, result.Value)
+					require.Nil(t, result.Value)
 				} else {
 					require.NoError(t, result.Error)
-					require.Equal(t, true, result.Value.(bool))
+					require.True(t, result.Value.(bool))
 				}
 			})
 		})

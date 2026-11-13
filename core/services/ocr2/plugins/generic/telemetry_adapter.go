@@ -6,13 +6,12 @@ import (
 
 	"github.com/smartcontractkit/libocr/commontypes"
 
+	"github.com/smartcontractkit/chainlink-common/pkg/types/core"
 	"github.com/smartcontractkit/chainlink/v2/core/services/synchronization"
 	"github.com/smartcontractkit/chainlink/v2/core/services/telemetry"
-
-	"github.com/smartcontractkit/chainlink-common/pkg/types"
 )
 
-var _ types.TelemetryService = (*TelemetryAdapter)(nil)
+var _ core.TelemetryService = (*TelemetryAdapter)(nil)
 
 type TelemetryAdapter struct {
 	endpointGenerator telemetry.MonitoringEndpointGenerator

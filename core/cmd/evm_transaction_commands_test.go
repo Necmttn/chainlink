@@ -13,14 +13,13 @@ import (
 	"github.com/urfave/cli"
 
 	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/assets"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/txmgr"
-	evmtypes "github.com/smartcontractkit/chainlink/v2/core/chains/evm/types"
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr/txmgrtest"
 	"github.com/smartcontractkit/chainlink/v2/core/cmd"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/evmtest"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
 )
@@ -33,8 +32,8 @@ func TestShell_IndexTransactions(t *testing.T) {
 
 	_, from := cltest.MustInsertRandomKey(t, app.KeyStore.Eth())
 
-	txStore := cltest.NewTestTxStore(t, app.GetSqlxDB(), app.GetConfig().Database())
-	tx := cltest.MustInsertConfirmedEthTxWithLegacyAttempt(t, txStore, 0, 1, from)
+	txStore := txmgrtest.NewTestTxStore(t, app.GetDB())
+	tx := txmgrtest.MustInsertConfirmedEthTxWithLegacyAttempt(t, txStore, 0, 1, from)
 	attempt := tx.TxAttempts[0]
 
 	// page 1
@@ -45,10 +44,10 @@ func TestShell_IndexTransactions(t *testing.T) {
 
 	c := cli.NewContext(nil, set, nil)
 	require.Equal(t, 1, c.Int("page"))
-	assert.NoError(t, client.IndexTransactions(c))
+	require.NoError(t, client.IndexTransactions(c))
 
 	renderedTxs := *r.Renders[0].(*cmd.EthTxPresenters)
-	assert.Equal(t, 1, len(renderedTxs))
+	assert.Len(t, renderedTxs, 1)
 	assert.Equal(t, attempt.Hash.String(), renderedTxs[0].Hash.Hex())
 
 	// page 2 which doesn't exist
@@ -59,10 +58,10 @@ func TestShell_IndexTransactions(t *testing.T) {
 
 	c = cli.NewContext(nil, set, nil)
 	require.Equal(t, 2, c.Int("page"))
-	assert.NoError(t, client.IndexTransactions(c))
+	require.NoError(t, client.IndexTransactions(c))
 
 	renderedTxs = *r.Renders[1].(*cmd.EthTxPresenters)
-	assert.Equal(t, 0, len(renderedTxs))
+	assert.Empty(t, renderedTxs)
 }
 
 func TestShell_ShowTransaction(t *testing.T) {
@@ -71,11 +70,11 @@ func TestShell_ShowTransaction(t *testing.T) {
 	app := startNewApplicationV2(t, nil)
 	client, r := app.NewShellAndRenderer()
 
-	db := app.GetSqlxDB()
+	db := app.GetDB()
 	_, from := cltest.MustInsertRandomKey(t, app.KeyStore.Eth())
 
-	txStore := cltest.NewTestTxStore(t, db, app.GetConfig().Database())
-	tx := cltest.MustInsertConfirmedEthTxWithLegacyAttempt(t, txStore, 0, 1, from)
+	txStore := txmgrtest.NewTestTxStore(t, db)
+	tx := txmgrtest.MustInsertConfirmedEthTxWithLegacyAttempt(t, txStore, 0, 1, from)
 	attempt := tx.TxAttempts[0]
 
 	set := flag.NewFlagSet("test get tx", 0)
@@ -98,8 +97,8 @@ func TestShell_IndexTxAttempts(t *testing.T) {
 
 	_, from := cltest.MustInsertRandomKey(t, app.KeyStore.Eth())
 
-	txStore := cltest.NewTestTxStore(t, app.GetSqlxDB(), app.GetConfig().Database())
-	tx := cltest.MustInsertConfirmedEthTxWithLegacyAttempt(t, txStore, 0, 1, from)
+	txStore := txmgrtest.NewTestTxStore(t, app.GetDB())
+	tx := txmgrtest.MustInsertConfirmedEthTxWithLegacyAttempt(t, txStore, 0, 1, from)
 
 	// page 1
 	set := flag.NewFlagSet("test txattempts", 0)
@@ -123,10 +122,10 @@ func TestShell_IndexTxAttempts(t *testing.T) {
 
 	c = cli.NewContext(nil, set, nil)
 	require.Equal(t, 2, c.Int("page"))
-	assert.NoError(t, client.IndexTxAttempts(c))
+	require.NoError(t, client.IndexTxAttempts(c))
 
 	renderedAttempts = *r.Renders[1].(*cmd.EthTxPresenters)
-	assert.Equal(t, 0, len(renderedAttempts))
+	assert.Empty(t, renderedAttempts)
 }
 
 func TestShell_SendEther_From_Txm(t *testing.T) {
@@ -141,13 +140,12 @@ func TestShell_SendEther_From_Txm(t *testing.T) {
 	ethMock := newEthMockWithTransactionsOnBlocksAssertions(t)
 
 	ethMock.On("BalanceAt", mock.Anything, key.Address, (*big.Int)(nil)).Return(balance.ToInt(), nil)
-	ethMock.On("SequenceAt", mock.Anything, mock.Anything, mock.Anything).Return(evmtypes.Nonce(0), nil).Maybe()
-	ethMock.On("PendingNonceAt", mock.Anything, fromAddress).Return(uint64(0), nil).Once()
+	ethMock.On("NonceAt", mock.Anything, mock.Anything, mock.Anything).Return(uint64(0), nil)
 
 	app := startNewApplicationV2(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-		c.EVM[0].Enabled = ptr(true)
-		c.EVM[0].NonceAutoSync = ptr(false)
-		c.EVM[0].BalanceMonitor.Enabled = ptr(false)
+		c.EVM[0].Enabled = new(true)
+		c.EVM[0].NonceAutoSync = new(false)
+		c.EVM[0].BalanceMonitor.Enabled = new(false)
 
 		// NOTE: FallbackPollInterval is used in this test to quickly create TxAttempts
 		// Testing triggers requires committing transactions and does not work with transactional tests
@@ -157,9 +155,8 @@ func TestShell_SendEther_From_Txm(t *testing.T) {
 		withMocks(ethMock, key),
 	)
 	client, r := app.NewShellAndRenderer()
-	db := app.GetSqlxDB()
-	cfg := pgtest.NewQConfig(false)
-	txStore := txmgr.NewTxStore(db, logger.TestLogger(t), cfg)
+	db := app.GetDB()
+	txStore := txmgr.NewTxStore(db, logger.TestLogger(t))
 	set := flag.NewFlagSet("sendether", 0)
 	flagSetApplyFromAction(client.SendEther, set, "")
 
@@ -171,9 +168,9 @@ func TestShell_SendEther_From_Txm(t *testing.T) {
 	cliapp := cli.NewApp()
 	c := cli.NewContext(cliapp, set, nil)
 
-	assert.NoError(t, client.SendEther(c))
+	require.NoError(t, client.SendEther(c))
 
-	evmTxes, err := txStore.GetAllTxes(testutils.Context(t))
+	evmTxes, err := txStore.GetAllTxes(t.Context())
 	require.NoError(t, err)
 	require.Len(t, evmTxes, 1)
 	evmTx := evmTxes[0]
@@ -188,11 +185,10 @@ func TestShell_SendEther_From_Txm(t *testing.T) {
 	assert.Equal(t, value.String(), output.Value)
 	assert.Equal(t, fmt.Sprintf("%d", *evmTx.Sequence), output.Nonce)
 
-	attempts, err := txStore.GetAllTxAttempts(testutils.Context(t))
+	attempts, err := txStore.GetAllTxAttempts(t.Context())
 	require.NoError(t, err)
 	require.Len(t, attempts, 1)
 	assert.Equal(t, attempts[0].Hash, output.Hash)
-
 }
 
 func TestShell_SendEther_From_Txm_WEI(t *testing.T) {
@@ -207,13 +203,12 @@ func TestShell_SendEther_From_Txm_WEI(t *testing.T) {
 	ethMock := newEthMockWithTransactionsOnBlocksAssertions(t)
 
 	ethMock.On("BalanceAt", mock.Anything, key.Address, (*big.Int)(nil)).Return(balance.ToInt(), nil)
-	ethMock.On("SequenceAt", mock.Anything, mock.Anything, mock.Anything).Return(evmtypes.Nonce(0), nil).Maybe()
-	ethMock.On("PendingNonceAt", mock.Anything, fromAddress).Return(uint64(0), nil).Once()
+	ethMock.On("NonceAt", mock.Anything, mock.Anything, mock.Anything).Return(uint64(0), nil)
 
 	app := startNewApplicationV2(t, func(c *chainlink.Config, s *chainlink.Secrets) {
-		c.EVM[0].Enabled = ptr(true)
-		c.EVM[0].NonceAutoSync = ptr(false)
-		c.EVM[0].BalanceMonitor.Enabled = ptr(false)
+		c.EVM[0].Enabled = new(true)
+		c.EVM[0].NonceAutoSync = new(false)
+		c.EVM[0].BalanceMonitor.Enabled = new(false)
 
 		// NOTE: FallbackPollInterval is used in this test to quickly create TxAttempts
 		// Testing triggers requires committing transactions and does not work with transactional tests
@@ -223,9 +218,8 @@ func TestShell_SendEther_From_Txm_WEI(t *testing.T) {
 		withMocks(ethMock, key),
 	)
 	client, r := app.NewShellAndRenderer()
-	db := app.GetSqlxDB()
-	cfg := pgtest.NewQConfig(false)
-	txStore := txmgr.NewTxStore(db, logger.TestLogger(t), cfg)
+	db := app.GetDB()
+	txStore := txmgr.NewTxStore(db, logger.TestLogger(t))
 
 	set := flag.NewFlagSet("sendether", 0)
 	flagSetApplyFromAction(client.SendEther, set, "")
@@ -244,9 +238,9 @@ func TestShell_SendEther_From_Txm_WEI(t *testing.T) {
 	cliapp := cli.NewApp()
 	c := cli.NewContext(cliapp, set, nil)
 
-	assert.NoError(t, client.SendEther(c))
+	require.NoError(t, client.SendEther(c))
 
-	evmTxes, err := txStore.GetAllTxes(testutils.Context(t))
+	evmTxes, err := txStore.GetAllTxes(t.Context())
 	require.NoError(t, err)
 	require.Len(t, evmTxes, 1)
 	evmTx := evmTxes[0]
@@ -261,7 +255,7 @@ func TestShell_SendEther_From_Txm_WEI(t *testing.T) {
 	assert.Equal(t, value.String(), output.Value)
 	assert.Equal(t, fmt.Sprintf("%d", *evmTx.Sequence), output.Nonce)
 
-	attempts, err := txStore.GetAllTxAttempts(testutils.Context(t))
+	attempts, err := txStore.GetAllTxAttempts(t.Context())
 	require.NoError(t, err)
 	require.Len(t, attempts, 1)
 	assert.Equal(t, attempts[0].Hash, output.Hash)

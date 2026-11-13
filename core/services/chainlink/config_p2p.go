@@ -1,12 +1,12 @@
 package chainlink
 
 import (
-	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
-	"github.com/smartcontractkit/chainlink/v2/core/config"
-	"github.com/smartcontractkit/chainlink/v2/core/config/toml"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/p2pkey"
-
 	"github.com/smartcontractkit/libocr/commontypes"
+
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/p2pkey"
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	coreconfig "github.com/smartcontractkit/chainlink/v2/core/config"
+	"github.com/smartcontractkit/chainlink/v2/core/config/toml"
 )
 
 type p2p struct {
@@ -25,6 +25,10 @@ func (p *p2p) TraceLogging() bool {
 	return *p.c.TraceLogging
 }
 
+func (p *p2p) EnableExperimentalRageP2P() bool {
+	return *p.c.EnableExperimentalRageP2P
+}
+
 func (p *p2p) IncomingMessageBufferSize() int {
 	return int(*p.c.IncomingMessageBufferSize)
 }
@@ -33,7 +37,7 @@ func (p *p2p) OutgoingMessageBufferSize() int {
 	return int(*p.c.OutgoingMessageBufferSize)
 }
 
-func (p *p2p) V2() config.V2 {
+func (p *p2p) V2() coreconfig.V2 {
 	return &p2pv2{p.c.V2}
 }
 
@@ -69,7 +73,6 @@ func (v *p2pv2) DeltaDial() commonconfig.Duration {
 func (v *p2pv2) DeltaReconcile() commonconfig.Duration {
 	if d := v.c.DeltaReconcile; d != nil {
 		return *d
-
 	}
 	return commonconfig.Duration{}
 }

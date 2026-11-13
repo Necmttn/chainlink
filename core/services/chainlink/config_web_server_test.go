@@ -4,10 +4,10 @@ import (
 	"testing"
 	"time"
 
-	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
 )
 
 func TestWebServerConfig(t *testing.T) {
@@ -45,5 +45,4 @@ func TestWebServerConfig(t *testing.T) {
 	mf := ws.MFA()
 	assert.Equal(t, "test-rpid", mf.RPID())
 	assert.Equal(t, "test-rp-origin", mf.RPOrigin())
-
 }

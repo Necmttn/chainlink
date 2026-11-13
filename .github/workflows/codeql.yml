@@ -1,0 +1,127 @@
+name: "CodeQL Advanced"
+
+on:
+  push:
+    branches:
+      - develop
+      - release/*
+  merge_group:
+  pull_request:
+  schedule:
+    - cron: "22 22 * * 2"
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    needs: [runner-config]
+    runs-on: ${{ matrix.runs-on || 'ubuntu-latest' }}
+    permissions:
+      # required for all workflows
+      security-events: write
+      # required to fetch internal or private CodeQL packs
+      packages: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            build-mode: none
+
+          - language: go
+            build-mode: manual
+            runs-on: ${{ needs.runner-config.outputs.go-runner }}
+
+          - language: javascript-typescript
+            build-mode: none
+            codeql-config: |
+              paths-ignore:
+                - 'core/web/assets'
+                - '**/node_modules/**'
+
+          - language: python
+            build-mode: none
+    steps:
+      - name: Enable S3 Cache for Self-Hosted Runners
+        uses: runs-on/action@4e5f72399b6b17f2e79c511c1b38a315a64d22dc # v2.2.0
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # Note: CodeQL writes the build cache on push to default branch (develop).
+      # On release/* branches and PRs, build-cache-write resolves to never (restore-only).
+      - name: Set up Go
+        if: matrix.language == 'go'
+        uses: ./.github/actions/setup-go
+        with:
+          build-cache-write: default-branch-only
+          build-cache-version: "codeql"
+
+      - name: Touching core/web/assets/index.html
+        if: matrix.language == 'go'
+        run: mkdir -p core/web/assets && touch core/web/assets/index.html
+
+      # Initializes the CodeQL tools for scanning.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config: ${{ matrix.codeql-config || '' }}
+          # If you wish to specify custom queries, you can do so here or in a config file.
+          # By default, queries listed here will override any specified in a config file.
+          # Prefix the list here with "+" to use these queries and those in the config file.
+
+          # For more details on CodeQL's query packs, refer to: https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning#using-queries-in-ql-packs
+          # queries: security-extended,security-and-quality
+
+      - name: Build go code manually
+        if: matrix.language == 'go'
+        run: |
+          echo "::group::Building all go code (go build ./...)"
+          go build ./...
+          echo "::endgroup::"
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{matrix.language}}"
+
+  runner-config:
+    name: Runner Config
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      contents: read
+    outputs:
+      go-runner: ${{ steps.go-codeql.outputs.go-runner }}
+      spot_flag: ${{ steps.spot.outputs.spot_flag }}
+      spot_param: ${{ steps.spot.outputs.spot_param }}
+    steps:
+      - name: Resolve Spot Setting
+        id: spot
+        uses: $/.github/actions/setup-runner-spot
+
+      - name: Get PR Labels
+        id: pr-labels
+        uses: smartcontractkit/.github/actions/get-pr-labels@get-pr-labels/v1
+        with:
+          check-label: "runs-on-opt-out"
+
+      - name: Select runners for go codeql
+        id: go-codeql
+        shell: bash
+        env:
+          OPT_OUT: ${{ steps.pr-labels.outputs.check-label-found || 'false' }}
+          GH_GO_RUNNER: ubuntu24.04-8cores-32GB
+          SH_GO_RUNNER: runs-on=${{ github.run_id }}/cpu=32/ram=64/family=c7i+c8i/${{ steps.spot.outputs.spot_flag }}/extras=s3-cache+tmpfs
+        run: |
+          if [[ "$OPT_OUT" == "true" ]]; then
+            echo "Opt-out is true for current run. Using gh-hosted runner for Go codeql."
+            echo "go-runner=${GH_GO_RUNNER}" | tee -a "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "Opt-out is false for current run. Using self-hosted runner for Go codeql."
+          echo "go-is-self-hosted=true" | tee -a "${GITHUB_OUTPUT}"
+          echo "go-runner=${SH_GO_RUNNER}" | tee -a "${GITHUB_OUTPUT}"

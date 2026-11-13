@@ -1,38 +1,49 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 
 	"github.com/google/uuid"
-	"github.com/jmoiron/sqlx"
 	"github.com/pelletier/go-toml"
 	"github.com/pkg/errors"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities/registry"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/services/orgresolver"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/limits"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/config"
+	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/network"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
-	"github.com/smartcontractkit/chainlink/v2/core/services/pg"
+	workflowsyncerv2 "github.com/smartcontractkit/chainlink/v2/core/services/workflows/syncer/v2"
 )
 
 type Delegate struct {
-	legacyChains legacyevm.LegacyChainContainer
-	ks           keystore.Eth
-	db           *sqlx.DB
-	cfg          pg.QConfig
-	lggr         logger.Logger
+	legacyChains           legacyevm.LegacyChainContainer
+	ks                     keystore.Eth
+	ds                     sqlutil.DataSource
+	lggr                   logger.Logger
+	capabilitiesRegistry   registry.CapabilitiesRegistry
+	workflowRegistrySyncer workflowsyncerv2.WorkflowRegistrySyncer
+	lf                     limits.Factory
+	orgResolver            orgresolver.OrgResolver // optional; nil if the node isn't configured to resolve orgs (e.g. no Linking Service)
 }
 
 var _ job.Delegate = (*Delegate)(nil)
 
-func NewDelegate(legacyChains legacyevm.LegacyChainContainer, ks keystore.Eth, db *sqlx.DB, cfg pg.QConfig, lggr logger.Logger) *Delegate {
+func NewDelegate(legacyChains legacyevm.LegacyChainContainer, ks keystore.Eth, ds sqlutil.DataSource, capabilitiesRegistry registry.CapabilitiesRegistry, workflowRegistrySyncer workflowsyncerv2.WorkflowRegistrySyncer, lggr logger.Logger, lf limits.Factory, orgResolver orgresolver.OrgResolver) *Delegate {
 	return &Delegate{
-		legacyChains: legacyChains,
-		ks:           ks,
-		db:           db,
-		cfg:          cfg,
-		lggr:         lggr,
+		legacyChains:           legacyChains,
+		ks:                     ks,
+		ds:                     ds,
+		capabilitiesRegistry:   capabilitiesRegistry,
+		lggr:                   lggr,
+		workflowRegistrySyncer: workflowRegistrySyncer,
+		lf:                     lf,
+		orgResolver:            orgResolver,
 	}
 }
 
@@ -40,13 +51,13 @@ func (d *Delegate) JobType() job.Type {
 	return job.Gateway
 }
 
-func (d *Delegate) BeforeJobCreated(spec job.Job)                {}
-func (d *Delegate) AfterJobCreated(spec job.Job)                 {}
-func (d *Delegate) BeforeJobDeleted(spec job.Job)                {}
-func (d *Delegate) OnDeleteJob(spec job.Job, q pg.Queryer) error { return nil }
+func (d *Delegate) BeforeJobCreated(spec job.Job)              {}
+func (d *Delegate) AfterJobCreated(spec job.Job)               {}
+func (d *Delegate) BeforeJobDeleted(spec job.Job)              {}
+func (d *Delegate) OnDeleteJob(context.Context, job.Job) error { return nil }
 
 // ServicesForSpec returns the scheduler to be used for running observer jobs
-func (d *Delegate) ServicesForSpec(spec job.Job) (services []job.ServiceCtx, err error) {
+func (d *Delegate) ServicesForSpec(ctx context.Context, spec job.Job) (services []job.ServiceCtx, err error) {
 	if spec.GatewaySpec == nil {
 		return nil, errors.Errorf("services.Delegate expects a *jobSpec.GatewaySpec to be present, got %v", spec)
 	}
@@ -56,8 +67,12 @@ func (d *Delegate) ServicesForSpec(spec job.Job) (services []job.ServiceCtx, err
 	if err2 != nil {
 		return nil, errors.Wrap(err2, "unmarshal gateway config")
 	}
-	handlerFactory := NewHandlerFactory(d.legacyChains, d.db, d.cfg, d.lggr)
-	gateway, err := NewGatewayFromConfig(&gatewayConfig, handlerFactory, d.lggr)
+	httpClient, err := network.NewHTTPClient(gatewayConfig.HTTPClientConfig, d.lggr)
+	if err != nil {
+		return nil, err
+	}
+	handlerFactory := NewHandlerFactory(d.legacyChains, d.ds, httpClient, d.capabilitiesRegistry, d.workflowRegistrySyncer, d.lggr, d.lf, network.NewHTTPClientFactory(gatewayConfig.HTTPClientConfig, d.lggr), d.orgResolver)
+	gateway, err := NewGatewayFromConfig(&gatewayConfig, handlerFactory, d.lggr, d.lf)
 	if err != nil {
 		return nil, err
 	}

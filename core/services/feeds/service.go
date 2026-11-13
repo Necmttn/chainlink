@@ -5,7 +5,12 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"slices"
+	"strings"
+	"sync"
+	"time"
 
+	"github.com/avast/retry-go/v4"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
@@ -13,51 +18,104 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"gopkg.in/guregu/null.v4"
 
-	"github.com/jmoiron/sqlx"
-
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ocr2key"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ocrkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/p2pkey"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink-common/pkg/services"
-
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
-	pb "github.com/smartcontractkit/chainlink/v2/core/services/feeds/proto"
-	"github.com/smartcontractkit/chainlink/v2/core/services/fluxmonitorv2"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-common/pkg/types/core"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
+	"github.com/smartcontractkit/chainlink-evm/pkg/types"
+	pb "github.com/smartcontractkit/chainlink-protos/orchestrator/feedsmanager"
+	ccip "github.com/smartcontractkit/chainlink/v2/core/capabilities/ccip/validate"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ccv/ccvcommitteeverifier"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ccv/ccvexecutor"
+	"github.com/smartcontractkit/chainlink/v2/core/services/cresettings"
+	"github.com/smartcontractkit/chainlink/v2/core/services/gateway"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ocrkey"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/p2pkey"
 	"github.com/smartcontractkit/chainlink/v2/core/services/ocr"
 	ocr2 "github.com/smartcontractkit/chainlink/v2/core/services/ocr2/validate"
 	"github.com/smartcontractkit/chainlink/v2/core/services/ocrbootstrap"
-	"github.com/smartcontractkit/chainlink/v2/core/services/pg"
-	"github.com/smartcontractkit/chainlink/v2/core/utils/crypto"
+	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
+	"github.com/smartcontractkit/chainlink/v2/core/services/standardcapabilities"
+	"github.com/smartcontractkit/chainlink/v2/core/services/streams"
+	cryptoutils "github.com/smartcontractkit/chainlink/v2/core/utils/crypto"
+	"github.com/smartcontractkit/chainlink/v2/plugins"
 )
 
-//go:generate mockery --quiet --name Service --output ./mocks/ --case=underscore
-//go:generate mockery --quiet --dir ./proto --name FeedsManagerClient --output ./mocks/ --case=underscore
-
 var (
-	ErrOCR2Disabled         = errors.New("ocr2 is disabled")
-	ErrOCRDisabled          = errors.New("ocr is disabled")
-	ErrSingleFeedsManager   = errors.New("only a single feeds manager is supported")
-	ErrJobAlreadyExists     = errors.New("a job for this contract address already exists - please use the 'force' option to replace it")
-	ErrFeedsManagerDisabled = errors.New("feeds manager is disabled")
+	ErrOCR2Disabled = errors.New("ocr2 is disabled")
+	ErrOCRDisabled  = errors.New("ocr is disabled")
+	// TODO: delete once multiple feeds managers support is released
+	ErrSingleFeedsManager    = errors.New("only a single feeds manager is supported")
+	ErrDuplicateFeedsManager = errors.New("manager was previously registered using the same public key")
+	ErrJobAlreadyExists      = errors.New("a job for this contract address already exists - please use the 'force' option to replace it")
+	ErrFeedsManagerDisabled  = errors.New("feeds manager is disabled")
+
+	promFeedsJobProposalRequest = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "feeds_job_proposal_requests",
+		Help: "Deprecated. Use job_proposal_requests",
+	})
+
+	promFeedsWorkflowRequests = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "feeds_workflow_requests",
+		Help: "Deprecated. Use feeds_workflow_requests",
+	})
+
+	promFeedsWorkflowApprovals = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "feeds_workflow_approvals",
+		Help: "Deprecated. Use feeds_workflow_approvals",
+	})
+
+	promFeedsWorkflowFailures = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "feeds_workflow_rejections",
+		Help: "Deprecated. Use feeds_workflow_rejections",
+	})
+
+	promFeedsJobProposalCounts = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "feeds_job_proposal_count",
+		Help: "Deprecated. Use job_proposal_count",
+	}, []string{
+		// Job Proposal status
+		"status",
+	})
 
 	promJobProposalRequest = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "feeds_job_proposal_requests",
+		Name: "job_proposal_requests",
 		Help: "Metric to track job proposal requests",
 	})
 
+	promWorkflowRequests = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "workflow_requests",
+		Help: "Metric to track workflow requests",
+	})
+
+	promWorkflowApprovals = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "workflow_approvals",
+		Help: "Metric to track workflow successful auto approvals",
+	})
+
+	promWorkflowFailures = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "workflow_rejections",
+		Help: "Metric to track workflow failed auto approvals",
+	})
+
 	promJobProposalCounts = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "feeds_job_proposal_count",
+		Name: "job_proposal_count",
 		Help: "Number of job proposals for the node partitioned by status.",
 	}, []string{
 		// Job Proposal status
 		"status",
 	})
+
+	defaultSyncMinDelay    = 10 * time.Second
+	defaultSyncMaxDelay    = 30 * time.Minute
+	defaultSyncMaxAttempts = uint(48 + 8) // 30m * 48 =~ 24h; plus the initial 8 shorter retries
 )
 
 // Service represents a behavior of the feeds service
@@ -65,17 +123,18 @@ type Service interface {
 	Start(ctx context.Context) error
 	Close() error
 
-	CountManagers() (int64, error)
-	GetManager(id int64) (*FeedsManager, error)
-	ListManagers() ([]FeedsManager, error)
-	ListManagersByIDs(ids []int64) ([]FeedsManager, error)
+	GetManager(ctx context.Context, id int64) (*Manager, error)
+	ListManagers(ctx context.Context) ([]Manager, error)
+	ListManagersByIDs(ctx context.Context, ids []int64) ([]Manager, error)
 	RegisterManager(ctx context.Context, params RegisterManagerParams) (int64, error)
-	UpdateManager(ctx context.Context, mgr FeedsManager) error
+	UpdateManager(ctx context.Context, mgr Manager) error
+	EnableManager(ctx context.Context, id int64) (*Manager, error)
+	DisableManager(ctx context.Context, id int64) (*Manager, error)
 
 	CreateChainConfig(ctx context.Context, cfg ChainConfig) (int64, error)
 	DeleteChainConfig(ctx context.Context, id int64) (int64, error)
-	GetChainConfig(id int64) (*ChainConfig, error)
-	ListChainConfigsByManagerIDs(mgrIDs []int64) ([]ChainConfig, error)
+	GetChainConfig(ctx context.Context, id int64) (*ChainConfig, error)
+	ListChainConfigsByManagerIDs(ctx context.Context, mgrIDs []int64) ([]ChainConfig, error)
 	UpdateChainConfig(ctx context.Context, cfg ChainConfig) (int64, error)
 
 	DeleteJob(ctx context.Context, args *DeleteJobArgs) (int64, error)
@@ -83,77 +142,105 @@ type Service interface {
 	ProposeJob(ctx context.Context, args *ProposeJobArgs) (int64, error)
 	RevokeJob(ctx context.Context, args *RevokeJobArgs) (int64, error)
 	SyncNodeInfo(ctx context.Context, id int64) error
+	GetJobRuns(ctx context.Context, args *GetJobRunsArgs) ([]*pb.JobRunSummary, error)
 
-	CountJobProposalsByStatus() (*JobProposalCounts, error)
-	GetJobProposal(id int64) (*JobProposal, error)
-	ListJobProposals() ([]JobProposal, error)
-	ListJobProposalsByManagersIDs(ids []int64) ([]JobProposal, error)
+	CountJobProposalsByStatus(ctx context.Context) (*JobProposalCounts, error)
+	GetJobProposal(ctx context.Context, id int64) (*JobProposal, error)
+	ListJobProposalsByManagersIDs(ctx context.Context, ids []int64) ([]JobProposal, error)
 
 	ApproveSpec(ctx context.Context, id int64, force bool) error
 	CancelSpec(ctx context.Context, id int64) error
-	GetSpec(id int64) (*JobProposalSpec, error)
-	ListSpecsByJobProposalIDs(ids []int64) ([]JobProposalSpec, error)
+	GetSpec(ctx context.Context, id int64) (*JobProposalSpec, error)
+	ListSpecsByJobProposalIDs(ctx context.Context, ids []int64) ([]JobProposalSpec, error)
 	RejectSpec(ctx context.Context, id int64) error
 	UpdateSpecDefinition(ctx context.Context, id int64, spec string) error
 
+	// Unsafe_SetConnectionsManager Only for testing
 	Unsafe_SetConnectionsManager(ConnectionsManager)
 }
 
 type service struct {
 	services.StateMachine
 
-	orm          ORM
-	jobORM       job.ORM
-	q            pg.Q
-	csaKeyStore  keystore.CSA
-	p2pKeyStore  keystore.P2P
-	ocr1KeyStore keystore.OCR
-	ocr2KeyStore keystore.OCR2
-	jobSpawner   job.Spawner
-	insecureCfg  InsecureConfig
-	jobCfg       JobConfig
-	ocrCfg       OCRConfig
-	ocr2cfg      OCR2Config
-	connMgr      ConnectionsManager
-	legacyChains legacyevm.LegacyChainContainer
-	lggr         logger.Logger
-	version      string
+	orm                 ORM
+	jobORM              job.ORM
+	ds                  sqlutil.DataSource
+	csaKeyStore         keystore.CSA
+	csaSigner           *core.Ed25519Signer
+	p2pKeyStore         keystore.P2P
+	ocr1KeyStore        keystore.OCR
+	ocr2KeyStore        keystore.OCR2
+	workflowKeyStore    keystore.Workflow
+	jobSpawner          job.Spawner
+	gCfg                GeneralConfig
+	jdCfg               JobDistributorConfig
+	featCfg             FeatureConfig
+	insecureCfg         InsecureConfig
+	jobCfg              JobConfig
+	ocrCfg              OCRConfig
+	ocr2cfg             OCR2Config
+	connMgr             ConnectionsManager
+	legacyChains        legacyevm.LegacyChainContainer
+	lggr                logger.SugaredLogger
+	version             string
+	loopRegistrarConfig plugins.RegistrarConfig
+	syncNodeInfoCancel  atomicCancelFns
+	syncMinDelay        time.Duration
+	syncMaxDelay        time.Duration
+	syncMaxAttempts     uint
 }
 
 // NewService constructs a new feeds service
 func NewService(
 	orm ORM,
 	jobORM job.ORM,
-	db *sqlx.DB,
+	ds sqlutil.DataSource,
 	jobSpawner job.Spawner,
 	keyStore keystore.Master,
+	gCfg GeneralConfig,
+	jdCfg JobDistributorConfig,
+	fCfg FeatureConfig,
 	insecureCfg InsecureConfig,
 	jobCfg JobConfig,
 	ocrCfg OCRConfig,
 	ocr2Cfg OCR2Config,
-	dbCfg pg.QConfig,
 	legacyChains legacyevm.LegacyChainContainer,
 	lggr logger.Logger,
 	version string,
+	rc plugins.RegistrarConfig,
+	opts ...ServiceOption,
 ) *service {
-	lggr = lggr.Named("Feeds")
+	sugaredLggr := logger.Sugared(lggr).Named("Feeds")
 	svc := &service{
-		orm:          orm,
-		jobORM:       jobORM,
-		q:            pg.NewQ(db, lggr, dbCfg),
-		jobSpawner:   jobSpawner,
-		p2pKeyStore:  keyStore.P2P(),
-		csaKeyStore:  keyStore.CSA(),
-		ocr1KeyStore: keyStore.OCR(),
-		ocr2KeyStore: keyStore.OCR2(),
-		insecureCfg:  insecureCfg,
-		jobCfg:       jobCfg,
-		ocrCfg:       ocrCfg,
-		ocr2cfg:      ocr2Cfg,
-		connMgr:      newConnectionsManager(lggr),
-		legacyChains: legacyChains,
-		lggr:         lggr,
-		version:      version,
+		orm:                 orm,
+		jobORM:              jobORM,
+		ds:                  ds,
+		jobSpawner:          jobSpawner,
+		p2pKeyStore:         keyStore.P2P(),
+		csaKeyStore:         keyStore.CSA(),
+		ocr1KeyStore:        keyStore.OCR(),
+		ocr2KeyStore:        keyStore.OCR2(),
+		workflowKeyStore:    keyStore.Workflow(),
+		jdCfg:               jdCfg,
+		gCfg:                gCfg,
+		featCfg:             fCfg,
+		insecureCfg:         insecureCfg,
+		jobCfg:              jobCfg,
+		ocrCfg:              ocrCfg,
+		ocr2cfg:             ocr2Cfg,
+		connMgr:             newConnectionsManager(sugaredLggr),
+		legacyChains:        legacyChains,
+		lggr:                sugaredLggr,
+		version:             version,
+		loopRegistrarConfig: rc,
+		syncNodeInfoCancel:  atomicCancelFns{fns: map[int64]context.CancelFunc{}},
+		syncMinDelay:        defaultSyncMinDelay,
+		syncMaxDelay:        defaultSyncMaxDelay,
+		syncMaxAttempts:     defaultSyncMaxAttempts,
+	}
+
+	for _, opt := range opts {
+		opt(svc)
 	}
 
 	return svc
@@ -162,67 +249,108 @@ func NewService(
 type RegisterManagerParams struct {
 	Name         string
 	URI          string
-	PublicKey    crypto.PublicKey
+	PublicKey    cryptoutils.PublicKey
 	ChainConfigs []ChainConfig
 }
 
 // RegisterManager registers a new ManagerService and attempts to establish a
 // connection.
-//
-// Only a single feeds manager is currently supported.
 func (s *service) RegisterManager(ctx context.Context, params RegisterManagerParams) (int64, error) {
-	count, err := s.CountManagers()
-	if err != nil {
-		return 0, err
-	}
-	if count >= 1 {
-		return 0, ErrSingleFeedsManager
+	if s.featCfg.MultiFeedsManagers() {
+		exists, err := s.orm.ManagerExists(ctx, params.PublicKey)
+		if err != nil {
+			return 0, err
+		}
+		if exists {
+			return 0, ErrDuplicateFeedsManager
+		}
+	} else {
+		count, err := s.CountManagers(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if count >= 1 {
+			return 0, ErrSingleFeedsManager
+		}
 	}
 
-	mgr := FeedsManager{
+	mgr := Manager{
 		Name:      params.Name,
 		URI:       params.URI,
 		PublicKey: params.PublicKey,
 	}
 
 	var id int64
-	q := s.q.WithOpts(pg.WithParentCtx(ctx))
-	err = q.Transaction(func(tx pg.Queryer) error {
+
+	err := s.orm.Transact(ctx, func(tx ORM) error {
 		var txerr error
 
-		id, txerr = s.orm.CreateManager(&mgr, pg.WithQueryer(tx))
-		if err != nil {
+		id, txerr = tx.CreateManager(ctx, &mgr)
+		if txerr != nil {
 			return txerr
 		}
 
-		if _, txerr = s.orm.CreateBatchChainConfig(params.ChainConfigs, pg.WithQueryer(tx)); txerr != nil {
+		if _, txerr = tx.CreateBatchChainConfig(ctx, params.ChainConfigs); txerr != nil {
 			return txerr
 		}
 
 		return nil
 	})
-
-	privkey, err := s.getCSAPrivateKey()
 	if err != nil {
 		return 0, err
 	}
 
 	// Establish a connection
 	mgr.ID = id
-	s.connectFeedManager(ctx, mgr, privkey)
+	s.connectFeedManager(mgr)
 
 	return id, nil
 }
 
-// SyncNodeInfo syncs the node's information with FMS
+// syncNodeInfoWithRetry syncs the node's information with FMS. In case of failures,
+// it retries with an exponential backoff for up to 24h.
+func (s *service) syncNodeInfoWithRetry(id int64) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// cancel the previous context -- and, by extension, the existing goroutine --
+	// so that we can start anew
+	s.syncNodeInfoCancel.callAndSwap(id, cancel)
+
+	retryOpts := []retry.Option{
+		retry.Context(ctx),
+		retry.DelayType(retry.BackOffDelay),
+		retry.Delay(s.syncMinDelay),
+		retry.MaxDelay(s.syncMaxDelay),
+		retry.Attempts(s.syncMaxAttempts),
+		retry.LastErrorOnly(true),
+		retry.OnRetry(func(attempt uint, err error) {
+			s.lggr.Infow("failed to sync node info", "attempt", attempt, "err", err.Error())
+		}),
+	}
+
+	go func() {
+		err := retry.Do(func() error { return s.SyncNodeInfo(ctx, id) }, retryOpts...)
+		if err != nil {
+			s.lggr.Errorw("failed to sync node info; aborting", "err", err)
+		} else {
+			s.lggr.Info("successfully synced node info")
+		}
+
+		s.syncNodeInfoCancel.callAndSwap(id, nil)
+	}()
+}
+
 func (s *service) SyncNodeInfo(ctx context.Context, id int64) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
 	// Get the FMS RPC client
 	fmsClient, err := s.connMgr.GetClient(id)
 	if err != nil {
 		return errors.Wrap(err, "could not fetch client")
 	}
 
-	cfgs, err := s.orm.ListChainConfigsByManagerIDs([]int64{id})
+	cfgs, err := s.orm.ListChainConfigsByManagerIDs(ctx, []int64{id})
 	if err != nil {
 		return errors.Wrap(err, "could not fetch chain configs")
 	}
@@ -239,11 +367,39 @@ func (s *service) SyncNodeInfo(ctx context.Context, id int64) error {
 		cfgMsgs = append(cfgMsgs, cfgMsg)
 	}
 
-	if _, err = fmsClient.UpdateNode(ctx, &pb.UpdateNodeRequest{
-		Version:      s.version,
-		ChainConfigs: cfgMsgs,
-	}); err != nil {
-		return err
+	p2pKeysBundles := make([]*pb.P2PKeyBundle, 0)
+	p2pKeysV2, err := s.p2pKeyStore.GetAll()
+	if err != nil {
+		s.lggr.Errorf("p2pKeyStore.GetAll: %v", err)
+	}
+
+	if err == nil {
+		for _, key := range p2pKeysV2 {
+			bundle := s.newP2PBundle(key)
+
+			p2pKeysBundles = append(p2pKeysBundles, bundle)
+		}
+	}
+
+	workflowKey := s.getWorkflowPublicKey(ctx)
+
+	resp, err := fmsClient.UpdateNode(ctx, &pb.UpdateNodeRequest{
+		Version:         s.version,
+		ChainConfigs:    cfgMsgs,
+		WorkflowKey:     &workflowKey,
+		P2PKeyBundles:   p2pKeysBundles,
+		NopFriendlyName: s.jdCfg.DisplayName(),
+	})
+	if err != nil {
+		return errors.Wrap(err, "SyncNodeInfo.UpdateNode call failed")
+	}
+	if len(resp.ChainConfigErrors) > 0 {
+		errMsgs := make([]string, 0, len(resp.ChainConfigErrors))
+		for _, ccErr := range resp.ChainConfigErrors {
+			errMsgs = append(errMsgs, ccErr.Message)
+		}
+
+		return errors.Errorf("SyncNodeInfo.UpdateNode call partially failed: %s", strings.Join(errMsgs, "; "))
 	}
 
 	return nil
@@ -251,30 +407,52 @@ func (s *service) SyncNodeInfo(ctx context.Context, id int64) error {
 
 // UpdateManager updates the feed manager details, takes down the
 // connection and reestablishes a new connection with the updated public key.
-func (s *service) UpdateManager(ctx context.Context, mgr FeedsManager) error {
-	q := s.q.WithOpts(pg.WithParentCtx(ctx))
-	err := q.Transaction(func(tx pg.Queryer) error {
-		txerr := s.orm.UpdateManager(mgr, pg.WithQueryer(tx))
-		if txerr != nil {
-			return errors.Wrap(txerr, "could not update manager")
-		}
-
-		return nil
-	})
+func (s *service) UpdateManager(ctx context.Context, mgr Manager) error {
+	err := s.orm.UpdateManager(ctx, mgr)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "could not update manager")
 	}
 
-	if err := s.restartConnection(ctx, mgr); err != nil {
-		s.lggr.Errorf("could not restart FMS connection: %w", err)
+	if err := s.restartConnection(mgr); err != nil {
+		s.lggr.Errorf("could not restart FMS connection: %v", err)
 	}
 
 	return nil
 }
 
+func (s *service) EnableManager(ctx context.Context, id int64) (*Manager, error) {
+	mgr, err := s.orm.EnableManager(ctx, id)
+	if err != nil || mgr == nil {
+		return nil, errors.Wrap(err, "could not enable manager")
+	}
+
+	if err := s.restartConnection(*mgr); err != nil {
+		s.lggr.Errorf("could not restart FMS connection: %v", err)
+	}
+
+	mgr.IsConnectionActive = s.connMgr.IsConnected(mgr.ID)
+
+	return mgr, nil
+}
+
+func (s *service) DisableManager(ctx context.Context, id int64) (*Manager, error) {
+	mgr, err := s.orm.DisableManager(ctx, id)
+	if err != nil || mgr == nil {
+		return nil, errors.Wrap(err, "could not disable manager")
+	}
+
+	if err := s.connMgr.Disconnect(mgr.ID); err != nil {
+		s.lggr.Info("Error disconnecting manager", "err", err)
+	}
+
+	mgr.IsConnectionActive = s.connMgr.IsConnected(mgr.ID)
+
+	return mgr, nil
+}
+
 // ListManagerServices lists all the manager services.
-func (s *service) ListManagers() ([]FeedsManager, error) {
-	managers, err := s.orm.ListManagers()
+func (s *service) ListManagers(ctx context.Context) ([]Manager, error) {
+	managers, err := s.orm.ListManagers(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get a list of managers")
 	}
@@ -287,8 +465,8 @@ func (s *service) ListManagers() ([]FeedsManager, error) {
 }
 
 // GetManager gets a manager service by id.
-func (s *service) GetManager(id int64) (*FeedsManager, error) {
-	manager, err := s.orm.GetManager(id)
+func (s *service) GetManager(ctx context.Context, id int64) (*Manager, error) {
+	manager, err := s.orm.GetManager(ctx, id)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get manager by ID")
 	}
@@ -298,22 +476,23 @@ func (s *service) GetManager(id int64) (*FeedsManager, error) {
 }
 
 // ListManagersByIDs get managers services by ids.
-func (s *service) ListManagersByIDs(ids []int64) ([]FeedsManager, error) {
-	managers, err := s.orm.ListManagersByIDs(ids)
+func (s *service) ListManagersByIDs(ctx context.Context, ids []int64) ([]Manager, error) {
+	managers, err := s.orm.ListManagersByIDs(ctx, ids)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to list managers by IDs")
 	}
 
-	for _, manager := range managers {
-		manager.IsConnectionActive = s.connMgr.IsConnected(manager.ID)
+	for i, manager := range managers {
+		managers[i].IsConnectionActive = s.connMgr.IsConnected(manager.ID)
 	}
 
 	return managers, nil
 }
 
 // CountManagers gets the total number of manager services
-func (s *service) CountManagers() (int64, error) {
-	return s.orm.CountManagers()
+// TODO: delete once multiple feeds managers support is released
+func (s *service) CountManagers(ctx context.Context) (int64, error) {
+	return s.orm.CountManagers(ctx)
 }
 
 // CreateChainConfig creates a chain config.
@@ -326,49 +505,45 @@ func (s *service) CreateChainConfig(ctx context.Context, cfg ChainConfig) (int64
 		}
 	}
 
-	id, err := s.orm.CreateChainConfig(cfg)
+	id, err := s.orm.CreateChainConfig(ctx, cfg)
 	if err != nil {
 		return 0, errors.Wrap(err, "CreateChainConfig failed")
 	}
 
-	mgr, err := s.orm.GetManager(cfg.FeedsManagerID)
+	mgr, err := s.orm.GetManager(ctx, cfg.FeedsManagerID)
 	if err != nil {
 		return 0, errors.Wrap(err, "CreateChainConfig: failed to fetch manager")
 	}
 
-	if err := s.SyncNodeInfo(ctx, mgr.ID); err != nil {
-		s.lggr.Infof("FMS: Unable to sync node info: %w", err)
-	}
+	s.syncNodeInfoWithRetry(mgr.ID)
 
 	return id, nil
 }
 
 // DeleteChainConfig deletes the chain config by id.
 func (s *service) DeleteChainConfig(ctx context.Context, id int64) (int64, error) {
-	cfg, err := s.orm.GetChainConfig(id)
+	cfg, err := s.orm.GetChainConfig(ctx, id)
 	if err != nil {
 		return 0, errors.Wrap(err, "DeleteChainConfig failed: could not get chain config")
 	}
 
-	_, err = s.orm.DeleteChainConfig(id)
+	_, err = s.orm.DeleteChainConfig(ctx, id)
 	if err != nil {
 		return 0, errors.Wrap(err, "DeleteChainConfig failed")
 	}
 
-	mgr, err := s.orm.GetManager(cfg.FeedsManagerID)
+	mgr, err := s.orm.GetManager(ctx, cfg.FeedsManagerID)
 	if err != nil {
 		return 0, errors.Wrap(err, "DeleteChainConfig: failed to fetch manager")
 	}
 
-	if err := s.SyncNodeInfo(ctx, mgr.ID); err != nil {
-		s.lggr.Infof("FMS: Unable to sync node info: %w", err)
-	}
+	s.syncNodeInfoWithRetry(mgr.ID)
 
 	return id, nil
 }
 
-func (s *service) GetChainConfig(id int64) (*ChainConfig, error) {
-	cfg, err := s.orm.GetChainConfig(id)
+func (s *service) GetChainConfig(ctx context.Context, id int64) (*ChainConfig, error) {
+	cfg, err := s.orm.GetChainConfig(ctx, id)
 	if err != nil {
 		return nil, errors.Wrap(err, "GetChainConfig failed")
 	}
@@ -376,8 +551,8 @@ func (s *service) GetChainConfig(id int64) (*ChainConfig, error) {
 	return cfg, nil
 }
 
-func (s *service) ListChainConfigsByManagerIDs(mgrIDs []int64) ([]ChainConfig, error) {
-	cfgs, err := s.orm.ListChainConfigsByManagerIDs(mgrIDs)
+func (s *service) ListChainConfigsByManagerIDs(ctx context.Context, mgrIDs []int64) ([]ChainConfig, error) {
+	cfgs, err := s.orm.ListChainConfigsByManagerIDs(ctx, mgrIDs)
 
 	return cfgs, errors.Wrap(err, "ListChainConfigsByManagerIDs failed")
 }
@@ -391,34 +566,31 @@ func (s *service) UpdateChainConfig(ctx context.Context, cfg ChainConfig) (int64
 		}
 	}
 
-	id, err := s.orm.UpdateChainConfig(cfg)
+	id, err := s.orm.UpdateChainConfig(ctx, cfg)
 	if err != nil {
 		return 0, errors.Wrap(err, "UpdateChainConfig failed")
 	}
 
-	ccfg, err := s.orm.GetChainConfig(cfg.ID)
+	ccfg, err := s.orm.GetChainConfig(ctx, cfg.ID)
 	if err != nil {
 		return 0, errors.Wrap(err, "UpdateChainConfig failed: could not get chain config")
 	}
 
-	if err := s.SyncNodeInfo(ctx, ccfg.FeedsManagerID); err != nil {
-		s.lggr.Infof("FMS: Unable to sync node info: %w", err)
-	}
+	s.syncNodeInfoWithRetry(ccfg.FeedsManagerID)
 
 	return id, nil
 }
 
-// Lists all JobProposals
-//
-// When we support multiple feed managers, we will need to change this to filter
-// by feeds manager
-func (s *service) ListJobProposals() ([]JobProposal, error) {
-	return s.orm.ListJobProposals()
+// ListJobProposalsByManagersIDs gets job proposals by feeds managers IDs
+func (s *service) ListJobProposalsByManagersIDs(ctx context.Context, ids []int64) ([]JobProposal, error) {
+	return s.orm.ListJobProposalsByManagersIDs(ctx, ids)
 }
 
-// ListJobProposalsByManagersIDs gets job proposals by feeds managers IDs
-func (s *service) ListJobProposalsByManagersIDs(ids []int64) ([]JobProposal, error) {
-	return s.orm.ListJobProposalsByManagersIDs(ids)
+// GetJobRunsArgs are the arguments to provide to the GetJobRuns method.
+type GetJobRunsArgs struct {
+	FeedsManagerID int64
+	RemoteUUID     uuid.UUID
+	Limit          uint32
 }
 
 // DeleteJobArgs are the arguments to provide to the DeleteJob method.
@@ -430,14 +602,20 @@ type DeleteJobArgs struct {
 // DeleteJob deletes a job proposal if it exist. The feeds manager id check
 // ensures that only the intended feed manager can make this request.
 func (s *service) DeleteJob(ctx context.Context, args *DeleteJobArgs) (int64, error) {
-	proposal, err := s.orm.GetJobProposalByRemoteUUID(args.RemoteUUID)
+	s.lggr.Infow("Beginning to delete job", "remoteUUID", args.RemoteUUID)
+
+	proposal, err := s.orm.GetJobProposalByRemoteUUID(ctx, args.RemoteUUID)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
-			return 0, errors.Wrap(err, "GetJobProposalByRemoteUUID failed to check existence of job proposal")
+			return 0, fmt.Errorf("GetJobProposalByRemoteUUID failed to check existence of job proposal: %w", err)
 		}
 
-		return 0, errors.Wrap(err, "GetJobProposalByRemoteUUID did not find any proposals to delete")
+		return 0, fmt.Errorf("GetJobProposalByRemoteUUID did not find any proposals to delete: %w", err)
 	}
+
+	lggr := s.lggr.With(
+		"job_proposal_id", proposal.ID,
+	)
 
 	// Ensure that if the job proposal exists, that it belongs to the feeds
 	// manager which previously proposed a job using the remote UUID.
@@ -445,15 +623,14 @@ func (s *service) DeleteJob(ctx context.Context, args *DeleteJobArgs) (int64, er
 		return 0, errors.New("cannot delete a job proposal belonging to another feeds manager")
 	}
 
-	pctx := pg.WithParentCtx(ctx)
-	if err = s.orm.DeleteProposal(proposal.ID, pctx); err != nil {
-		s.lggr.Errorw("Failed to delete the proposal", "err", err)
-
-		return 0, errors.Wrap(err, "DeleteProposal failed")
+	if err = s.orm.DeleteProposal(ctx, proposal.ID); err != nil {
+		lggr.Errorw("Failed to delete the proposal", "err", err)
+		return 0, fmt.Errorf("DeleteProposal failed: %w", err)
 	}
+	lggr.Infow("Successfully deleted job proposal", "jobProposalID", proposal.ID)
 
-	if err = s.observeJobProposalCounts(); err != nil {
-		return 0, err
+	if err = s.observeJobProposalCounts(ctx); err != nil {
+		lggr.Errorw("Failed to push metrics for job proposal deletion", "err", err)
 	}
 
 	return proposal.ID, nil
@@ -468,7 +645,7 @@ type RevokeJobArgs struct {
 // RevokeJob revokes a pending job proposal if it exist. The feeds manager
 // id check ensures that only the intended feed manager can make this request.
 func (s *service) RevokeJob(ctx context.Context, args *RevokeJobArgs) (int64, error) {
-	proposal, err := s.orm.GetJobProposalByRemoteUUID(args.RemoteUUID)
+	proposal, err := s.orm.GetJobProposalByRemoteUUID(ctx, args.RemoteUUID)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return 0, errors.Wrap(err, "GetJobProposalByRemoteUUID failed to check existence of job proposal")
@@ -484,7 +661,7 @@ func (s *service) RevokeJob(ctx context.Context, args *RevokeJobArgs) (int64, er
 	}
 
 	// get the latest spec for the proposal
-	latest, err := s.orm.GetLatestSpec(proposal.ID)
+	latest, err := s.orm.GetLatestSpec(ctx, proposal.ID)
 	if err != nil {
 		return 0, errors.Wrap(err, "GetLatestSpec failed to get latest spec")
 	}
@@ -493,18 +670,80 @@ func (s *service) RevokeJob(ctx context.Context, args *RevokeJobArgs) (int64, er
 		return 0, errors.New("only pending job specs can be revoked")
 	}
 
-	pctx := pg.WithParentCtx(ctx)
-	if err = s.orm.RevokeSpec(latest.ID, pctx); err != nil {
+	if err = s.orm.RevokeSpec(ctx, latest.ID); err != nil {
 		s.lggr.Errorw("Failed to revoke the proposal", "err", err)
 
 		return 0, errors.Wrap(err, "RevokeSpec failed")
 	}
 
-	if err = s.observeJobProposalCounts(); err != nil {
-		return 0, err
+	lggr := s.lggr.With(
+		"job_proposal_id", proposal.ID,
+		"job_proposal_spec_id", latest.ID,
+	)
+
+	if err = s.observeJobProposalCounts(ctx); err != nil {
+		lggr.Errorw("Failed to push metrics for revoke job", "err", err)
 	}
 
 	return proposal.ID, nil
+}
+
+// GetJobRuns fetches recent job runs for a job by its remote UUID.
+func (s *service) GetJobRuns(ctx context.Context, args *GetJobRunsArgs) ([]*pb.JobRunSummary, error) {
+	s.lggr.Infow("FeedsService.GetJobRuns", "remoteUUID", args.RemoteUUID)
+
+	job, err := s.jobORM.FindJobByExternalJobID(ctx, args.RemoteUUID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("job not found: %w", err)
+		}
+		return nil, fmt.Errorf("failed to find job: %w", err)
+	}
+
+	isManagedByFM, err := s.orm.IsJobManagedByFeedsManager(ctx, int64(job.ID), args.FeedsManagerID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check if job is managed by feeds manager: %w", err)
+	}
+
+	if !isManagedByFM {
+		return nil, errors.New("job is not managed by the requesting feeds manager")
+	}
+
+	runs, _, err := s.jobORM.PipelineRuns(ctx, &job.ID, 0, int(args.Limit))
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch job runs: %w", err)
+	}
+
+	summaries := make([]*pb.JobRunSummary, 0, len(runs))
+	for _, run := range runs {
+		var finishedAt *timestamppb.Timestamp
+		if run.FinishedAt.Valid {
+			finishedAt = timestamppb.New(run.FinishedAt.Time)
+		}
+
+		summaries = append(summaries, &pb.JobRunSummary{
+			RunId:       run.ID,
+			State:       string(run.State),
+			CreatedAt:   timestamppb.New(run.CreatedAt),
+			FinishedAt:  finishedAt,
+			AllErrors:   ConvertPipelineRunErrors(run.AllErrors),
+			FatalErrors: ConvertPipelineRunErrors(run.FatalErrors),
+		})
+	}
+
+	s.lggr.Infow("Successfully retrieved job runs", "remoteUUID", args.RemoteUUID, "count", len(summaries))
+	return summaries, nil
+}
+
+// ConvertPipelineRunErrors converts pipeline.RunErrors to []string, filtering out zero values
+func ConvertPipelineRunErrors(errors pipeline.RunErrors) []string {
+	var result []string
+	for _, err := range errors {
+		if !err.IsZero() {
+			result = append(result, err.ValueOrZero())
+		}
+	}
+	return result
 }
 
 // ProposeJobArgs are the arguments to provide to the ProposeJob method.
@@ -525,11 +764,11 @@ type ProposeJobArgs struct {
 // belonging to another feeds manager, we do not update it.
 func (s *service) ProposeJob(ctx context.Context, args *ProposeJobArgs) (int64, error) {
 	// Validate the args
-	if err := s.validateProposeJobArgs(*args); err != nil {
+	if err := s.validateProposeJobArgs(ctx, *args); err != nil {
 		return 0, err
 	}
 
-	existing, err := s.orm.GetJobProposalByRemoteUUID(args.RemoteUUID)
+	existing, err := s.orm.GetJobProposalByRemoteUUID(ctx, args.RemoteUUID)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return 0, errors.Wrap(err, "failed to check existence of job proposal")
@@ -546,43 +785,49 @@ func (s *service) ProposeJob(ctx context.Context, args *ProposeJobArgs) (int64, 
 
 		// Check the version being proposed has not been previously proposed.
 		var exists bool
-		exists, err = s.orm.ExistsSpecByJobProposalIDAndVersion(existing.ID, args.Version)
+		exists, err = s.orm.ExistsSpecByJobProposalIDAndVersion(ctx, existing.ID, args.Version)
 		if err != nil {
 			return 0, errors.Wrap(err, "failed to check existence of spec")
 		}
 
 		if exists {
-			return 0, errors.New("proposed job spec version already exists")
+			// note: CLO auto-increments the version number on re-proposal, so this should never happen
+			return 0, fmt.Errorf("external job id %s: version conflict: version %d already exists at job proposal id %d %v", args.RemoteUUID, args.Version, existing.ID, *existing)
 		}
 	}
 
+	lggr := s.lggr.With(
+		"job_proposal_remote_uuid", args.RemoteUUID,
+	)
+
 	var id int64
-	q := s.q.WithOpts(pg.WithParentCtx(ctx))
-	err = q.Transaction(func(tx pg.Queryer) error {
+	// we need the specID to auto-approve workflow specs
+	var specID int64
+	err = s.orm.Transact(ctx, func(tx ORM) error {
 		var txerr error
 
 		// Parse the Job Spec TOML to extract the name
 		name := extractName(args.Spec)
 
 		// Upsert job proposal
-		id, txerr = s.orm.UpsertJobProposal(&JobProposal{
+		id, txerr = tx.UpsertJobProposal(ctx, &JobProposal{
 			Name:           name,
 			RemoteUUID:     args.RemoteUUID,
 			Status:         JobProposalStatusPending,
 			FeedsManagerID: args.FeedsManagerID,
 			Multiaddrs:     args.Multiaddrs,
-		}, pg.WithQueryer(tx))
+		})
 		if txerr != nil {
 			return errors.Wrap(txerr, "failed to upsert job proposal")
 		}
 
 		// Create the spec version
-		_, txerr = s.orm.CreateSpec(JobProposalSpec{
+		specID, txerr = tx.CreateSpec(ctx, JobProposalSpec{
 			Definition:    args.Spec,
 			Status:        SpecStatusPending,
 			Version:       args.Version,
 			JobProposalID: id,
-		}, pg.WithQueryer(tx))
+		})
 		if txerr != nil {
 			return errors.Wrap(txerr, "failed to create spec")
 		}
@@ -592,32 +837,56 @@ func (s *service) ProposeJob(ctx context.Context, args *ProposeJobArgs) (int64, 
 	if err != nil {
 		return 0, err
 	}
+	jobType, err := getJobType(args.Spec)
+	switch {
+	case err != nil:
+		lggr.Errorw("Failed to validate spec while checking for workflow", "err", err)
+	case jobType == job.CRESettings:
+		promWorkflowRequests.Inc()
+		promFeedsWorkflowRequests.Inc()
+		err = s.ApproveSpec(ctx, specID, true)
+		if err != nil {
+			promWorkflowFailures.Inc()
+			promFeedsWorkflowFailures.Inc()
+			lggr.Errorw("Failed to auto approve "+jobType.String()+" spec", "id", id, "err", err)
+			return 0, fmt.Errorf("failed to approve %s spec %d: %w", jobType, id, err)
+		}
+		lggr.Infow("Successful "+jobType.String()+" spec auto approval", "id", id)
+		promWorkflowApprovals.Inc()
+		promFeedsWorkflowApprovals.Inc()
+	default:
+		promJobProposalRequest.Inc()
+		promFeedsJobProposalRequest.Inc()
+	}
 
-	// Track the given job proposal request
-	promJobProposalRequest.Inc()
-
-	if err = s.observeJobProposalCounts(); err != nil {
-		return 0, err
+	if err = s.observeJobProposalCounts(ctx); err != nil {
+		lggr.Errorw("Failed to push metrics for propose job", "err", err)
 	}
 
 	return id, nil
 }
 
+func getJobType(spec string) (job.Type, error) {
+	jobType, err := job.ValidateSpec(spec)
+	if err != nil {
+		return "", err
+	}
+	return jobType, nil
+}
+
 // GetJobProposal gets a job proposal by id.
-func (s *service) GetJobProposal(id int64) (*JobProposal, error) {
-	return s.orm.GetJobProposal(id)
+func (s *service) GetJobProposal(ctx context.Context, id int64) (*JobProposal, error) {
+	return s.orm.GetJobProposal(ctx, id)
 }
 
 // CountJobProposalsByStatus returns the count of job proposals with a given status.
-func (s *service) CountJobProposalsByStatus() (*JobProposalCounts, error) {
-	return s.orm.CountJobProposalsByStatus()
+func (s *service) CountJobProposalsByStatus(ctx context.Context) (*JobProposalCounts, error) {
+	return s.orm.CountJobProposalsByStatus(ctx)
 }
 
 // RejectSpec rejects a spec.
 func (s *service) RejectSpec(ctx context.Context, id int64) error {
-	pctx := pg.WithParentCtx(ctx)
-
-	spec, err := s.orm.GetSpec(id, pctx)
+	spec, err := s.orm.GetSpec(ctx, id)
 	if err != nil {
 		return errors.Wrap(err, "orm: job proposal spec")
 	}
@@ -627,7 +896,7 @@ func (s *service) RejectSpec(ctx context.Context, id int64) error {
 		return errors.New("must be a pending job proposal spec")
 	}
 
-	proposal, err := s.orm.GetJobProposal(spec.JobProposalID, pctx)
+	proposal, err := s.orm.GetJobProposal(ctx, spec.JobProposalID)
 	if err != nil {
 		return errors.Wrap(err, "orm: job proposal")
 	}
@@ -637,9 +906,13 @@ func (s *service) RejectSpec(ctx context.Context, id int64) error {
 		return errors.Wrap(err, "fms rpc client is not connected")
 	}
 
-	q := s.q.WithOpts(pctx)
-	err = q.Transaction(func(tx pg.Queryer) error {
-		if err = s.orm.RejectSpec(id, pg.WithQueryer(tx)); err != nil {
+	lggr := s.lggr.With(
+		"job_proposal_id", proposal.ID,
+		"job_proposal_spec_id", id,
+	)
+
+	err = s.orm.Transact(ctx, func(tx ORM) error {
+		if err = tx.RejectSpec(ctx, id); err != nil {
 			return err
 		}
 
@@ -656,48 +929,48 @@ func (s *service) RejectSpec(ctx context.Context, id int64) error {
 		return errors.Wrap(err, "could not reject job proposal")
 	}
 
-	err = s.observeJobProposalCounts()
+	if err = s.observeJobProposalCounts(ctx); err != nil {
+		lggr.Errorw("Failed to push metrics for job rejection", "err", err)
+	}
 
-	return err
+	return nil
 }
 
 // IsJobManaged determines is a job is managed by the Feeds Manager.
 func (s *service) IsJobManaged(ctx context.Context, jobID int64) (bool, error) {
-	return s.orm.IsJobManaged(jobID, pg.WithParentCtx(ctx))
+	return s.orm.IsJobManaged(ctx, jobID)
 }
 
 // ApproveSpec approves a spec for a job proposal and creates a job with the
 // spec.
 func (s *service) ApproveSpec(ctx context.Context, id int64, force bool) error {
-	pctx := pg.WithParentCtx(ctx)
-
-	spec, err := s.orm.GetSpec(id, pctx)
+	spec, err := s.orm.GetSpec(ctx, id)
 	if err != nil {
 		return errors.Wrap(err, "orm: job proposal spec")
 	}
 
-	proposal, err := s.orm.GetJobProposal(spec.JobProposalID, pctx)
+	proposal, err := s.orm.GetJobProposal(ctx, spec.JobProposalID)
 	if err != nil {
 		return errors.Wrap(err, "orm: job proposal")
 	}
 
-	if err = s.isApprovable(proposal.Status, proposal.ID, spec.Status, spec.ID); err != nil {
+	if err = s.isApprovable(ctx, proposal.Status, proposal.ID, spec.Status, spec.ID); err != nil {
 		return err
 	}
 
-	logger := s.lggr.With(
+	lggr := s.lggr.With(
 		"job_proposal_id", proposal.ID,
 		"job_proposal_spec_id", id,
 	)
 
 	fmsClient, err := s.connMgr.GetClient(proposal.FeedsManagerID)
 	if err != nil {
-		logger.Errorw("Failed to get FMS Client", "err", err)
+		lggr.Errorw("Failed to get FMS Client", "err", err)
 
 		return errors.Wrap(err, "fms rpc client")
 	}
 
-	j, err := s.generateJob(spec.Definition)
+	j, err := s.generateJob(ctx, spec.Definition)
 	if err != nil {
 		return errors.Wrap(err, "could not generate job from spec")
 	}
@@ -708,23 +981,20 @@ func (s *service) ApproveSpec(ctx context.Context, id int64, force bool) error {
 	}
 
 	// Check that the bridges exist
-	if err = s.jobORM.AssertBridgesExist(j.Pipeline); err != nil {
-		logger.Errorw("Failed to approve job spec due to bridge check", "err", err.Error())
+	if err = s.jobORM.AssertBridgesExist(ctx, j.Pipeline); err != nil {
+		lggr.Errorw("Failed to approve job spec due to bridge check", "err", err.Error())
 
 		return errors.Wrap(err, "failed to approve job spec due to bridge check")
 	}
 
-	q := s.q.WithOpts(pctx)
-	err = q.Transaction(func(tx pg.Queryer) error {
+	err = s.transact(ctx, func(tx datasources) error {
 		var (
 			txerr         error
 			existingJobID int32
-
-			pgOpts = pg.WithQueryer(tx)
 		)
 
 		// Use the external job id to check if a job already exists
-		foundJob, txerr := s.jobORM.FindJobByExternalJobID(j.ExternalJobID, pgOpts)
+		foundJob, txerr := tx.jobORM.FindJobByExternalJobID(ctx, j.ExternalJobID)
 		if txerr != nil {
 			// Return an error if the repository errors. If there is a not found
 			// error we want to continue with approving the job.
@@ -741,7 +1011,7 @@ func (s *service) ApproveSpec(ctx context.Context, id int64, force bool) error {
 		if existingJobID == 0 {
 			switch j.Type {
 			case job.OffchainReporting, job.FluxMonitor:
-				existingJobID, txerr = s.findExistingJobForOCRFlux(j, pgOpts)
+				existingJobID, txerr = findExistingJobForOCRFlux(ctx, j, tx.jobORM)
 				if txerr != nil {
 					// Return an error if the repository errors. If there is a not found
 					// error we want to continue with approving the job.
@@ -750,7 +1020,7 @@ func (s *service) ApproveSpec(ctx context.Context, id int64, force bool) error {
 					}
 				}
 			case job.OffchainReporting2, job.Bootstrap:
-				existingJobID, txerr = s.findExistingJobForOCR2(j, pgOpts)
+				existingJobID, txerr = findExistingJobForOCR2(ctx, j, tx.jobORM)
 				if txerr != nil {
 					// Return an error if the repository errors. If there is a not found
 					// error we want to continue with approving the job.
@@ -758,6 +1028,26 @@ func (s *service) ApproveSpec(ctx context.Context, id int64, force bool) error {
 						return errors.Wrap(txerr, "FindOCR2JobIDByAddress failed")
 					}
 				}
+			case job.CCIP:
+				existingJobID, txerr = tx.jobORM.FindJobIDByCapabilityNameAndVersion(ctx, *j.CCIPSpec)
+				// Return an error if the repository errors. If there is a not found
+				// error we want to continue with approving the job.
+				if txerr != nil && !errors.Is(txerr, sql.ErrNoRows) {
+					return fmt.Errorf("failed while checking for existing ccip job: %w", txerr)
+				}
+			case job.Gateway:
+				existingJobID, txerr = tx.jobORM.FindGatewayJobID(ctx, *j.GatewaySpec)
+				// Return an error if the repository errors. If there is a not found
+				// error we want to continue with approving the job.
+				if txerr != nil && !errors.Is(txerr, sql.ErrNoRows) {
+					return fmt.Errorf("failed while checking for existing gateway job: %w", txerr)
+				}
+			case job.CRESettings,
+				job.Stream,
+				job.CCVCommitteeVerifier,
+				job.CCVExecutor,
+				job.StandardCapabilities:
+				// NOOP: These jobs are only matched by external job ID, so do nothing
 			default:
 				return errors.Errorf("unsupported job type when approving job proposal specs: %s", j.Type)
 			}
@@ -771,10 +1061,10 @@ func (s *service) ApproveSpec(ctx context.Context, id int64, force bool) error {
 			}
 
 			// Check if the job is managed by FMS
-			approvedSpec, serr := s.orm.GetApprovedSpec(proposal.ID, pgOpts)
+			approvedSpec, serr := tx.orm.GetApprovedSpec(ctx, proposal.ID)
 			if serr != nil {
 				if !errors.Is(serr, sql.ErrNoRows) {
-					logger.Errorw("Failed to get approved spec", "err", serr)
+					lggr.Errorw("Failed to get approved spec", "err", serr)
 
 					// Return an error for any other errors fetching the
 					// approved spec
@@ -784,31 +1074,31 @@ func (s *service) ApproveSpec(ctx context.Context, id int64, force bool) error {
 
 			// If a spec is found, cancel the existing job spec
 			if serr == nil {
-				if cerr := s.orm.CancelSpec(approvedSpec.ID, pgOpts); cerr != nil {
-					logger.Errorw("Failed to delete the cancel the spec", "err", cerr)
+				if cerr := tx.orm.CancelSpec(ctx, approvedSpec.ID); cerr != nil {
+					lggr.Errorw("Failed to delete the cancel the spec", "err", cerr)
 
 					return cerr
 				}
 			}
 
 			// Delete the job
-			if serr = s.jobSpawner.DeleteJob(existingJobID, pgOpts); serr != nil {
-				logger.Errorw("Failed to delete the job", "err", serr)
+			if serr = s.jobSpawner.DeleteJob(ctx, tx.ds, existingJobID); serr != nil {
+				lggr.Errorw("Failed to delete the job", "err", serr)
 
 				return errors.Wrap(serr, "DeleteJob failed")
 			}
 		}
 
 		// Create the job
-		if txerr = s.jobSpawner.CreateJob(j, pgOpts); txerr != nil {
-			logger.Errorw("Failed to create job", "err", txerr)
+		if txerr = s.jobSpawner.CreateJob(ctx, tx.ds, j); txerr != nil {
+			lggr.Errorw("Failed to create job", "err", txerr)
 
 			return txerr
 		}
 
 		// Approve the job proposal spec
-		if txerr = s.orm.ApproveSpec(id, j.ExternalJobID, pgOpts); txerr != nil {
-			logger.Errorw("Failed to approve spec", "err", txerr)
+		if txerr = tx.orm.ApproveSpec(ctx, id, j.ExternalJobID); txerr != nil {
+			lggr.Errorw("Failed to approve spec", "err", txerr)
 
 			return txerr
 		}
@@ -818,7 +1108,7 @@ func (s *service) ApproveSpec(ctx context.Context, id int64, force bool) error {
 			Uuid:    proposal.RemoteUUID.String(),
 			Version: int64(spec.Version),
 		}); txerr != nil {
-			logger.Errorw("Failed to approve job to FMS", "err", txerr)
+			lggr.Errorw("Failed to approve job to FMS", "err", txerr)
 
 			return txerr
 		}
@@ -829,18 +1119,32 @@ func (s *service) ApproveSpec(ctx context.Context, id int64, force bool) error {
 		return errors.Wrap(err, "could not approve job proposal")
 	}
 
-	if err = s.observeJobProposalCounts(); err != nil {
-		logger.Errorw("Failed to push metrics for job approval", err)
+	if err = s.observeJobProposalCounts(ctx); err != nil {
+		lggr.Errorw("Failed to push metrics for job approval", "err", err)
 	}
 
 	return nil
 }
 
+type datasources struct {
+	ds     sqlutil.DataSource
+	orm    ORM
+	jobORM job.ORM
+}
+
+func (s *service) transact(ctx context.Context, fn func(datasources) error) error {
+	return sqlutil.Transact(ctx, func(tx sqlutil.DataSource) datasources {
+		return datasources{
+			ds:     tx,
+			orm:    s.orm.WithDataSource(tx),
+			jobORM: s.jobORM.WithDataSource(tx),
+		}
+	}, s.ds, nil, fn)
+}
+
 // CancelSpec cancels a spec for a job proposal.
 func (s *service) CancelSpec(ctx context.Context, id int64) error {
-	pctx := pg.WithParentCtx(ctx)
-
-	spec, err := s.orm.GetSpec(id, pctx)
+	spec, err := s.orm.GetSpec(ctx, id)
 	if err != nil {
 		return errors.Wrap(err, "orm: job proposal spec")
 	}
@@ -849,7 +1153,7 @@ func (s *service) CancelSpec(ctx context.Context, id int64) error {
 		return errors.New("must be an approved job proposal spec")
 	}
 
-	jp, err := s.orm.GetJobProposal(spec.JobProposalID, pg.WithParentCtx(ctx))
+	jp, err := s.orm.GetJobProposal(ctx, spec.JobProposalID)
 	if err != nil {
 		return errors.Wrap(err, "orm: job proposal")
 	}
@@ -859,20 +1163,21 @@ func (s *service) CancelSpec(ctx context.Context, id int64) error {
 		return errors.Wrap(err, "fms rpc client")
 	}
 
-	q := s.q.WithOpts(pctx)
-	err = q.Transaction(func(tx pg.Queryer) error {
-		var (
-			txerr  error
-			pgOpts = pg.WithQueryer(tx)
-		)
+	lggr := s.lggr.With(
+		"job_proposal_id", jp.ID,
+		"job_proposal_spec_id", id,
+	)
 
-		if txerr = s.orm.CancelSpec(id, pgOpts); txerr != nil {
+	err = s.transact(ctx, func(tx datasources) error {
+		var txerr error
+
+		if txerr = tx.orm.CancelSpec(ctx, id); txerr != nil {
 			return txerr
 		}
 
 		// Delete the job
 		if jp.ExternalJobID.Valid {
-			j, txerr := s.jobORM.FindJobByExternalJobID(jp.ExternalJobID.UUID, pgOpts)
+			j, txerr := tx.jobORM.FindJobByExternalJobID(ctx, jp.ExternalJobID.UUID)
 			if txerr != nil {
 				// Return an error if the repository errors. If there is a not found error we want
 				// to continue with cancelling the spec but we won't have to cancel any jobs.
@@ -882,7 +1187,7 @@ func (s *service) CancelSpec(ctx context.Context, id int64) error {
 			}
 
 			if txerr == nil {
-				if serr := s.jobSpawner.DeleteJob(j.ID, pgOpts); serr != nil {
+				if serr := s.jobSpawner.DeleteJob(ctx, tx.ds, j.ID); serr != nil {
 					return errors.Wrap(serr, "DeleteJob failed")
 				}
 			}
@@ -902,26 +1207,26 @@ func (s *service) CancelSpec(ctx context.Context, id int64) error {
 		return err
 	}
 
-	err = s.observeJobProposalCounts()
+	if err = s.observeJobProposalCounts(ctx); err != nil {
+		lggr.Errorw("Failed to push metrics for job cancellation", "err", err)
+	}
 
-	return err
+	return nil
 }
 
 // ListSpecsByJobProposalIDs gets the specs which belong to the job proposal ids.
-func (s *service) ListSpecsByJobProposalIDs(ids []int64) ([]JobProposalSpec, error) {
-	return s.orm.ListSpecsByJobProposalIDs(ids)
+func (s *service) ListSpecsByJobProposalIDs(ctx context.Context, ids []int64) ([]JobProposalSpec, error) {
+	return s.orm.ListSpecsByJobProposalIDs(ctx, ids)
 }
 
 // GetSpec gets the spec details by id.
-func (s *service) GetSpec(id int64) (*JobProposalSpec, error) {
-	return s.orm.GetSpec(id)
+func (s *service) GetSpec(ctx context.Context, id int64) (*JobProposalSpec, error) {
+	return s.orm.GetSpec(ctx, id)
 }
 
 // UpdateSpecDefinition updates the spec's TOML definition.
 func (s *service) UpdateSpecDefinition(ctx context.Context, id int64, defn string) error {
-	pctx := pg.WithParentCtx(ctx)
-
-	spec, err := s.orm.GetSpec(id, pctx)
+	spec, err := s.orm.GetSpec(ctx, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return errors.Wrap(err, "job proposal spec does not exist")
@@ -935,7 +1240,7 @@ func (s *service) UpdateSpecDefinition(ctx context.Context, id int64, defn strin
 	}
 
 	// Update the spec definition
-	if err = s.orm.UpdateSpecDefinition(id, defn, pctx); err != nil {
+	if err = s.orm.UpdateSpecDefinition(ctx, id, defn); err != nil {
 		return errors.Wrap(err, "could not update job proposal")
 	}
 
@@ -945,13 +1250,19 @@ func (s *service) UpdateSpecDefinition(ctx context.Context, id int64, defn strin
 // Start starts the service.
 func (s *service) Start(ctx context.Context) error {
 	return s.StartOnce("FeedsService", func() error {
-		privkey, err := s.getCSAPrivateKey()
+		key, err := keystore.GetDefault(ctx, s.csaKeyStore)
 		if err != nil {
 			return err
 		}
+		s.csaSigner, err = core.NewEd25519Signer(key.ID(), keystore.CSASigner{CSA: s.csaKeyStore}.Sign)
+		if err != nil {
+			return err
+		}
+		if err = s.csaSigner.Start(ctx); err != nil {
+			return err
+		}
 
-		// We only support a single feeds manager right now
-		mgrs, err := s.ListManagers()
+		mgrs, err := s.ListManagers(ctx)
 		if err != nil {
 			return err
 		}
@@ -961,63 +1272,66 @@ func (s *service) Start(ctx context.Context) error {
 			return nil
 		}
 
-		mgr := mgrs[0]
-		s.connectFeedManager(ctx, mgr, privkey)
+		if s.featCfg.MultiFeedsManagers() {
+			s.lggr.Infof("starting connection to %d feeds managers", len(mgrs))
+			for _, mgr := range mgrs {
+				if mgr.DisabledAt == nil {
+					s.connectFeedManager(mgr)
+				}
+			}
+		} else if mgrs[0].DisabledAt == nil {
+			s.connectFeedManager(mgrs[0])
+		}
 
-		err = s.observeJobProposalCounts()
+		if err = s.observeJobProposalCounts(ctx); err != nil {
+			s.lggr.Error("failed to observe job proposal count when starting service", err)
+		}
 
-		return err
+		return nil
 	})
 }
 
 // Close shuts down the service
 func (s *service) Close() error {
 	return s.StopOnce("FeedsService", func() error {
+		s.syncNodeInfoCancel.callAllAndClear()
+
 		// This blocks until it finishes
 		s.connMgr.Close()
-
-		return nil
+		return s.csaSigner.Close()
 	})
 }
 
 // connectFeedManager connects to a feeds manager
-func (s *service) connectFeedManager(ctx context.Context, mgr FeedsManager, privkey []byte) {
+func (s *service) connectFeedManager(mgr Manager) {
 	s.connMgr.Connect(ConnectOpts{
 		FeedsManagerID: mgr.ID,
 		URI:            mgr.URI,
-		Privkey:        privkey,
+		CSASigner:      s.csaSigner,
 		Pubkey:         mgr.PublicKey,
-		Handlers: &RPCHandlers{
-			feedsManagerID: mgr.ID,
-			svc:            s,
-		},
+		Handlers:       NewRPCHandlers(s, mgr.ID, s.lggr),
 		OnConnect: func(pb.FeedsManagerClient) {
 			// Sync the node's information with FMS once connected
-			err := s.SyncNodeInfo(ctx, mgr.ID)
-			if err != nil {
-				s.lggr.Infof("Error syncing node info: %v", err)
-			}
+			s.syncNodeInfoWithRetry(mgr.ID)
 		},
 	})
 }
 
-// getCSAPrivateKey gets the server's CSA private key
-func (s *service) getCSAPrivateKey() (privkey []byte, err error) {
-	// Fetch the server's public key
-	keys, err := s.csaKeyStore.GetAll()
+// getWorkflowPublicKey retrieves the server's Workflow public key.
+// Since there will be at most one key, it returns the first key found.
+// If an error occurs or no keys are found, it returns blank.
+func (s *service) getWorkflowPublicKey(ctx context.Context) string {
+	key, err := keystore.GetDefault(ctx, s.workflowKeyStore)
 	if err != nil {
-		return privkey, err
+		return ""
 	}
-	if len(keys) < 1 {
-		return privkey, errors.New("CSA key does not exist")
-	}
-	return keys[0].Raw(), nil
+	return key.PublicKeyString()
 }
 
 // observeJobProposalCounts is a helper method that queries the repository for the count of
 // job proposals by status and then updates prometheus gauges.
-func (s *service) observeJobProposalCounts() error {
-	counts, err := s.CountJobProposalsByStatus()
+func (s *service) observeJobProposalCounts(ctx context.Context) error {
+	counts, err := s.CountJobProposalsByStatus(ctx)
 	if err != nil {
 		return errors.Wrap(err, "failed to fetch counts of job proposals")
 	}
@@ -1026,12 +1340,12 @@ func (s *service) observeJobProposalCounts() error {
 	metrics := counts.toMetrics()
 
 	// Set the prometheus gauge metrics.
-	for _, status := range []JobProposalStatus{JobProposalStatusPending, JobProposalStatusApproved,
-		JobProposalStatusCancelled, JobProposalStatusRejected, JobProposalStatusDeleted, JobProposalStatusRevoked} {
-
-		status := status
-
+	for _, status := range []JobProposalStatus{
+		JobProposalStatusPending, JobProposalStatusApproved,
+		JobProposalStatusCancelled, JobProposalStatusRejected, JobProposalStatusDeleted, JobProposalStatusRevoked,
+	} {
 		promJobProposalCounts.With(prometheus.Labels{"status": string(status)}).Set(metrics[status])
+		promFeedsJobProposalCounts.With(prometheus.Labels{"status": string(status)}).Set(metrics[status])
 	}
 
 	return nil
@@ -1043,37 +1357,50 @@ func (s *service) observeJobProposalCounts() error {
 // tests.
 //
 // ONLY TO BE USED FOR TESTING.
-func (s *service) Unsafe_SetConnectionsManager(connMgr ConnectionsManager) {
+func (s *service) Unsafe_SetConnectionsManager(connMgr ConnectionsManager) { //nolint:revive // naming preserved for mock compatibility
 	s.connMgr = connMgr
 }
 
+func parseChainIDFromJSONConfig(config job.JSONConfig) int64 {
+	if chainID, ok := config["chainID"].(int64); ok {
+		return chainID
+	}
+	return 0
+}
+
 // findExistingJobForOCR2 looks for existing job for OCR2
-func (s *service) findExistingJobForOCR2(j *job.Job, qopts pg.QOpt) (int32, error) {
+func findExistingJobForOCR2(ctx context.Context, j *job.Job, tx job.ORM) (int32, error) {
 	var contractID string
 	var feedID *common.Hash
+	var relay string
+	var chainID int64
 
 	switch j.Type {
 	case job.OffchainReporting2:
 		contractID = j.OCR2OracleSpec.ContractID
 		feedID = j.OCR2OracleSpec.FeedID
+		relay = j.OCR2OracleSpec.Relay
+		chainID = parseChainIDFromJSONConfig(j.OCR2OracleSpec.RelayConfig)
 	case job.Bootstrap:
 		contractID = j.BootstrapSpec.ContractID
 		if j.BootstrapSpec.FeedID != nil {
 			feedID = j.BootstrapSpec.FeedID
 		}
+		relay = j.BootstrapSpec.Relay
+		chainID = parseChainIDFromJSONConfig(j.BootstrapSpec.RelayConfig)
 	case job.FluxMonitor, job.OffchainReporting:
-		return 0, errors.Errorf("contradID and feedID not applicable for job type: %s", j.Type)
+		return 0, errors.Errorf("contractID and feedID not applicable for job type: %s", j.Type)
 	default:
 		return 0, errors.Errorf("unsupported job type: %s", j.Type)
 	}
 
-	return s.jobORM.FindOCR2JobIDByAddress(contractID, feedID, qopts)
+	return tx.FindOCR2JobIDByAddress(ctx, relay, chainID, contractID, feedID)
 }
 
 // findExistingJobForOCRFlux looks for existing job for OCR or flux
-func (s *service) findExistingJobForOCRFlux(j *job.Job, qopts pg.QOpt) (int32, error) {
-	var address ethkey.EIP55Address
-	var evmChainID *big.Big
+func findExistingJobForOCRFlux(ctx context.Context, j *job.Job, tx job.ORM) (int32, error) {
+	var address types.EIP55Address
+	var evmChainID *sqlutil.Big
 
 	switch j.Type {
 	case job.OffchainReporting:
@@ -1088,14 +1415,14 @@ func (s *service) findExistingJobForOCRFlux(j *job.Job, qopts pg.QOpt) (int32, e
 		return 0, errors.Errorf("unsupported job type: %s", j.Type)
 	}
 
-	return s.jobORM.FindJobIDByAddress(address, evmChainID, qopts)
+	return tx.FindJobIDByAddress(ctx, address, evmChainID)
 }
 
 // generateJob validates and generates a job from a spec.
-func (s *service) generateJob(spec string) (*job.Job, error) {
+func (s *service) generateJob(ctx context.Context, spec string) (*job.Job, error) {
 	jobType, err := job.ValidateSpec(spec)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse job spec TOML")
+		return nil, fmt.Errorf("failed to parse job spec TOML'%s': %w", spec, err)
 	}
 
 	var js job.Job
@@ -1104,22 +1431,37 @@ func (s *service) generateJob(spec string) (*job.Job, error) {
 		if !s.ocrCfg.Enabled() {
 			return nil, ErrOCRDisabled
 		}
-		js, err = ocr.ValidatedOracleSpecToml(s.legacyChains, spec)
+		js, err = ocr.ValidatedOracleSpecToml(s.gCfg, s.legacyChains, spec)
 	case job.OffchainReporting2:
 		if !s.ocr2cfg.Enabled() {
 			return nil, ErrOCR2Disabled
 		}
-		js, err = ocr2.ValidatedOracleSpecToml(s.ocr2cfg, s.insecureCfg, spec)
+		js, err = ocr2.ValidatedOracleSpecToml(ctx, s.ocr2cfg, s.insecureCfg, spec, s.loopRegistrarConfig)
 	case job.Bootstrap:
 		if !s.ocr2cfg.Enabled() {
 			return nil, ErrOCR2Disabled
 		}
 		js, err = ocrbootstrap.ValidatedBootstrapSpecToml(spec)
 	case job.FluxMonitor:
-		js, err = fluxmonitorv2.ValidatedFluxMonitorSpec(s.jobCfg, spec)
+		return nil, errors.New("job type fluxmonitor has been removed and is no longer supported")
+	case job.Workflow:
+		return nil, errors.New("job type workflow has been removed and is no longer supported")
+	case job.CCIP:
+		js, err = ccip.ValidatedCCIPSpec(spec)
+	case job.CCVCommitteeVerifier:
+		js, err = ccvcommitteeverifier.ValidatedCCVCommitteeVerifierSpec(spec)
+	case job.CCVExecutor:
+		js, err = ccvexecutor.ValidatedCCVExecutorSpec(spec)
+	case job.Stream:
+		js, err = streams.ValidatedStreamSpec(spec)
+	case job.Gateway:
+		js, err = gateway.ValidatedGatewaySpec(spec)
+	case job.StandardCapabilities:
+		js, err = standardcapabilities.ValidatedStandardCapabilitiesSpec(spec)
+	case job.CRESettings:
+		js, err = cresettings.ValidatedCRESettingsSpec(spec)
 	default:
 		return nil, errors.Errorf("unknown job type: %s", jobType)
-
 	}
 	if err != nil {
 		return nil, err
@@ -1128,11 +1470,21 @@ func (s *service) generateJob(spec string) (*job.Job, error) {
 	return &js, nil
 }
 
+// newP2PBundle generates a P2PKeyBundle protobuf message.
+func (s *service) newP2PBundle(key p2pkey.KeyV2) *pb.P2PKeyBundle {
+	pbP2PBundle := pb.P2PKeyBundle{
+		PeerId:    key.PeerID().String(),
+		PublicKey: key.PublicKeyHex(),
+	}
+
+	return &pbP2PBundle
+}
+
 // newChainConfigMsg generates a chain config protobuf message.
 func (s *service) newChainConfigMsg(cfg ChainConfig) (*pb.ChainConfig, error) {
-	// Only supports EVM Chains
-	if cfg.ChainType != "EVM" {
-		return nil, errors.New("unsupported chain type")
+	protoChainType := ChainTypeToProtoChainType(cfg.ChainType)
+	if protoChainType == pb.ChainType_CHAIN_TYPE_UNSPECIFIED {
+		return nil, errors.Errorf("unsupported chain type: %s", cfg.ChainType)
 	}
 
 	ocr1Cfg, err := s.newOCR1ConfigMsg(cfg.OCR1Config)
@@ -1145,20 +1497,26 @@ func (s *service) newChainConfigMsg(cfg ChainConfig) (*pb.ChainConfig, error) {
 		return nil, err
 	}
 
-	return &pb.ChainConfig{
+	pbChainConfig := pb.ChainConfig{
 		Chain: &pb.Chain{
 			Id:   cfg.ChainID,
-			Type: pb.ChainType_CHAIN_TYPE_EVM,
+			Type: protoChainType,
 		},
 		AccountAddress:    cfg.AccountAddress,
 		AdminAddress:      cfg.AdminAddress,
 		FluxMonitorConfig: s.newFluxMonitorConfigMsg(cfg.FluxMonitorConfig),
 		Ocr1Config:        ocr1Cfg,
 		Ocr2Config:        ocr2Cfg,
-	}, nil
+	}
+
+	if cfg.AccountAddressPublicKey.Valid {
+		pbChainConfig.AccountAddressPublicKey = &cfg.AccountAddressPublicKey.String
+	}
+
+	return &pbChainConfig, nil
 }
 
-// newFMConfigMsg generates a FMConfig protobuf message. Flux Monitor does not
+// newFluxMonitorConfigMsg generates a FMConfig protobuf message. Flux Monitor does not
 // have any configuration but this is here for consistency.
 func (*service) newFluxMonitorConfigMsg(cfg FluxMonitorConfig) *pb.FluxMonitorConfig {
 	return &pb.FluxMonitorConfig{Enabled: cfg.Enabled}
@@ -1222,10 +1580,11 @@ func (s *service) newOCR2ConfigMsg(cfg OCR2ConfigModel) (*pb.OCR2Config, error) 
 		Multiaddr:        cfg.Multiaddr.ValueOrZero(),
 		ForwarderAddress: cfg.ForwarderAddress.Ptr(),
 		Plugins: &pb.OCR2Config_Plugins{
-			Commit:  cfg.Plugins.Commit,
-			Execute: cfg.Plugins.Execute,
-			Median:  cfg.Plugins.Median,
-			Mercury: cfg.Plugins.Mercury,
+			Commit:     cfg.Plugins.Commit,
+			Execute:    cfg.Plugins.Execute,
+			Median:     cfg.Plugins.Median,
+			Mercury:    cfg.Plugins.Mercury,
+			Rebalancer: cfg.Plugins.Rebalancer,
 		},
 	}
 
@@ -1262,14 +1621,17 @@ func (s *service) newOCR2ConfigMsg(cfg OCR2ConfigModel) (*pb.OCR2Config, error) 
 			OffchainPublicKey:     hex.EncodeToString(ocrOffChainPublicKey[:]),
 			OnchainSigningAddress: ocrKey.OnChainPublicKey(),
 		}
+		if rawPubKey, ok := ocr2key.RawEVMOnChainPublicKey(ocrKey); ok {
+			msg.OcrKeyBundle.OnchainSigningPubKey = rawPubKey
+		}
 	}
 
 	return msg, nil
 }
 
-func (s *service) validateProposeJobArgs(args ProposeJobArgs) error {
+func (s *service) validateProposeJobArgs(ctx context.Context, args ProposeJobArgs) error {
 	// Validate the job spec
-	j, err := s.generateJob(args.Spec)
+	j, err := s.generateJob(ctx, args.Spec)
 	if err != nil {
 		return errors.Wrap(err, "failed to generate a job based on spec")
 	}
@@ -1282,20 +1644,14 @@ func (s *service) validateProposeJobArgs(args ProposeJobArgs) error {
 	return nil
 }
 
-func (s *service) restartConnection(ctx context.Context, mgr FeedsManager) error {
+func (s *service) restartConnection(mgr Manager) error {
 	s.lggr.Infof("Restarting connection")
 
 	if err := s.connMgr.Disconnect(mgr.ID); err != nil {
 		s.lggr.Info("Feeds Manager not connected, attempting to connect")
 	}
 
-	// Establish a new connection
-	privkey, err := s.getCSAPrivateKey()
-	if err != nil {
-		return err
-	}
-
-	s.connectFeedManager(ctx, mgr, privkey)
+	s.connectFeedManager(mgr)
 
 	return nil
 }
@@ -1317,7 +1673,7 @@ func extractName(defn string) null.String {
 // isApprovable returns nil if a spec can be approved based on the current
 // proposal and spec status, and if it can't be approved, the reason as an
 // error.
-func (s *service) isApprovable(propStatus JobProposalStatus, proposalID int64, specStatus SpecStatus, specID int64) error {
+func (s *service) isApprovable(ctx context.Context, propStatus JobProposalStatus, proposalID int64, specStatus SpecStatus, specID int64) error {
 	if propStatus == JobProposalStatusDeleted {
 		return errors.New("cannot approve spec for a deleted job proposal")
 	}
@@ -1334,17 +1690,33 @@ func (s *service) isApprovable(propStatus JobProposalStatus, proposalID int64, s
 	case SpecStatusRevoked:
 		return errors.New("cannot approve a revoked spec")
 	case SpecStatusCancelled:
-		// Allowed to approve a cancelled job if it is the latest job
-		latest, serr := s.orm.GetLatestSpec(proposalID)
+		// allow approval of a cancelled job if no other spec is approved
+		specs, serr := s.orm.ListSpecsByJobProposalIDs(ctx, []int64{proposalID})
 		if serr != nil {
 			return errors.Wrap(serr, "failed to get latest spec")
 		}
 
-		if latest.ID != specID {
-			return errors.New("cannot approve a cancelled spec")
+		for _, spec := range specs {
+			if spec.Status == SpecStatusApproved {
+				return fmt.Errorf("the job spec with version %d is already approved", spec.Version)
+			}
 		}
 
-		return nil
+		slices.SortFunc(specs, func(a, b JobProposalSpec) int { return int(b.Version - a.Version) })
+		cancelledIndex := 0
+		for _, spec := range specs {
+			if spec.ID == specID {
+				if cancelledIndex >= 2 {
+					return errors.New("only the last two cancelled spec versions may be approved")
+				}
+				return nil
+			}
+			if spec.Status == SpecStatusCancelled {
+				cancelledIndex++
+			}
+		}
+
+		return fmt.Errorf("failed to find spec %d associated with proposal %d", specID, proposalID)
 	case SpecStatusPending:
 		return nil
 	default:
@@ -1354,6 +1726,49 @@ func (s *service) isApprovable(propStatus JobProposalStatus, proposalID int64, s
 
 func (s *service) isRevokable(propStatus JobProposalStatus, specStatus SpecStatus) bool {
 	return propStatus != JobProposalStatusDeleted && (specStatus == SpecStatusPending || specStatus == SpecStatusCancelled)
+}
+
+type atomicCancelFns struct {
+	fns   map[int64]context.CancelFunc
+	mutex sync.Mutex
+}
+
+func (f *atomicCancelFns) callAndSwap(id int64, other func()) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+
+	fn, found := f.fns[id]
+	if found && fn != nil {
+		fn()
+	}
+
+	f.fns[id] = other
+}
+
+func (f *atomicCancelFns) callAllAndClear() {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+
+	for _, fn := range f.fns {
+		if fn != nil {
+			fn()
+		}
+	}
+	clear(f.fns)
+}
+
+type ServiceOption func(*service)
+
+func WithSyncMinDelay(delay time.Duration) ServiceOption {
+	return func(s *service) { s.syncMinDelay = delay }
+}
+
+func WithSyncMaxDelay(delay time.Duration) ServiceOption {
+	return func(s *service) { s.syncMaxDelay = delay }
+}
+
+func WithSyncMaxAttempts(attempts uint) ServiceOption {
+	return func(s *service) { s.syncMaxAttempts = attempts }
 }
 
 var _ Service = &NullService{}
@@ -1368,70 +1783,101 @@ func (ns NullService) Close() error                    { return nil }
 func (ns NullService) ApproveSpec(ctx context.Context, id int64, force bool) error {
 	return ErrFeedsManagerDisabled
 }
-func (ns NullService) CountManagers() (int64, error) { return 0, nil }
-func (ns NullService) CountJobProposalsByStatus() (*JobProposalCounts, error) {
+
+func (ns NullService) CountJobProposalsByStatus(ctx context.Context) (*JobProposalCounts, error) {
 	return nil, ErrFeedsManagerDisabled
 }
+
 func (ns NullService) CancelSpec(ctx context.Context, id int64) error {
 	return ErrFeedsManagerDisabled
 }
-func (ns NullService) GetJobProposal(id int64) (*JobProposal, error) {
+
+func (ns NullService) GetJobProposal(ctx context.Context, id int64) (*JobProposal, error) {
 	return nil, ErrFeedsManagerDisabled
 }
-func (ns NullService) ListSpecsByJobProposalIDs(ids []int64) ([]JobProposalSpec, error) {
+
+func (ns NullService) ListSpecsByJobProposalIDs(ctx context.Context, ids []int64) ([]JobProposalSpec, error) {
 	return nil, ErrFeedsManagerDisabled
 }
-func (ns NullService) GetManager(id int64) (*FeedsManager, error) {
+
+func (ns NullService) GetManager(ctx context.Context, id int64) (*Manager, error) {
 	return nil, ErrFeedsManagerDisabled
 }
-func (ns NullService) ListManagersByIDs(ids []int64) ([]FeedsManager, error) {
+
+func (ns NullService) ListManagersByIDs(ctx context.Context, ids []int64) ([]Manager, error) {
 	return nil, ErrFeedsManagerDisabled
 }
-func (ns NullService) GetSpec(id int64) (*JobProposalSpec, error) {
+
+func (ns NullService) GetSpec(ctx context.Context, id int64) (*JobProposalSpec, error) {
 	return nil, ErrFeedsManagerDisabled
 }
-func (ns NullService) ListManagers() ([]FeedsManager, error) { return nil, nil }
+func (ns NullService) ListManagers(ctx context.Context) ([]Manager, error) { return nil, nil }
 func (ns NullService) CreateChainConfig(ctx context.Context, cfg ChainConfig) (int64, error) {
 	return 0, ErrFeedsManagerDisabled
 }
-func (ns NullService) GetChainConfig(id int64) (*ChainConfig, error) {
+
+func (ns NullService) GetChainConfig(ctx context.Context, id int64) (*ChainConfig, error) {
 	return nil, ErrFeedsManagerDisabled
 }
+
 func (ns NullService) DeleteChainConfig(ctx context.Context, id int64) (int64, error) {
 	return 0, ErrFeedsManagerDisabled
 }
-func (ns NullService) ListChainConfigsByManagerIDs(mgrIDs []int64) ([]ChainConfig, error) {
+
+func (ns NullService) ListChainConfigsByManagerIDs(ctx context.Context, mgrIDs []int64) ([]ChainConfig, error) {
 	return nil, ErrFeedsManagerDisabled
 }
+
 func (ns NullService) UpdateChainConfig(ctx context.Context, cfg ChainConfig) (int64, error) {
 	return 0, ErrFeedsManagerDisabled
 }
-func (ns NullService) ListJobProposals() ([]JobProposal, error) { return nil, nil }
-func (ns NullService) ListJobProposalsByManagersIDs(ids []int64) ([]JobProposal, error) {
+
+func (ns NullService) ListJobProposals(ctx context.Context) ([]JobProposal, error) { return nil, nil }
+
+func (ns NullService) ListJobProposalsByManagersIDs(ctx context.Context, ids []int64) ([]JobProposal, error) {
 	return nil, ErrFeedsManagerDisabled
 }
+
 func (ns NullService) ProposeJob(ctx context.Context, args *ProposeJobArgs) (int64, error) {
 	return 0, ErrFeedsManagerDisabled
 }
+
 func (ns NullService) DeleteJob(ctx context.Context, args *DeleteJobArgs) (int64, error) {
 	return 0, ErrFeedsManagerDisabled
 }
+
 func (ns NullService) RevokeJob(ctx context.Context, args *RevokeJobArgs) (int64, error) {
 	return 0, ErrFeedsManagerDisabled
 }
+
+func (ns NullService) GetJobRuns(ctx context.Context, args *GetJobRunsArgs) ([]*pb.JobRunSummary, error) {
+	return nil, ErrFeedsManagerDisabled
+}
+
 func (ns NullService) RegisterManager(ctx context.Context, params RegisterManagerParams) (int64, error) {
 	return 0, ErrFeedsManagerDisabled
 }
+
 func (ns NullService) RejectSpec(ctx context.Context, id int64) error {
 	return ErrFeedsManagerDisabled
 }
 func (ns NullService) SyncNodeInfo(ctx context.Context, id int64) error { return nil }
-func (ns NullService) UpdateManager(ctx context.Context, mgr FeedsManager) error {
+func (ns NullService) UpdateManager(ctx context.Context, mgr Manager) error {
 	return ErrFeedsManagerDisabled
 }
+
+func (ns NullService) EnableManager(ctx context.Context, id int64) (*Manager, error) {
+	return nil, ErrFeedsManagerDisabled
+}
+
+func (ns NullService) DisableManager(ctx context.Context, id int64) (*Manager, error) {
+	return nil, ErrFeedsManagerDisabled
+}
+
 func (ns NullService) IsJobManaged(ctx context.Context, jobID int64) (bool, error) {
 	return false, nil
 }
+
 func (ns NullService) UpdateSpecDefinition(ctx context.Context, id int64, spec string) error {
 	return ErrFeedsManagerDisabled
 }

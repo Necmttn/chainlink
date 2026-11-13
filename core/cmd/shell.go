@@ -6,15 +6,16 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,80 +25,206 @@ import (
 	"github.com/Masterminds/semver/v3"
 	"github.com/getsentry/sentry-go"
 	"github.com/gin-gonic/gin"
+	"github.com/jmoiron/sqlx"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/urfave/cli"
-	"go.uber.org/multierr"
+	prombridge "go.opentelemetry.io/contrib/bridges/prometheus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/jmoiron/sqlx"
-
+	"github.com/smartcontractkit/chainlink-common/pkg/beholder"
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities/registry"
+	clhttp "github.com/smartcontractkit/chainlink-common/pkg/http"
 	"github.com/smartcontractkit/chainlink-common/pkg/loop"
-	"github.com/smartcontractkit/chainlink-common/pkg/utils/mailbox"
-
+	"github.com/smartcontractkit/chainlink-common/pkg/promutil"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-data-streams/llo/retirement"
+	"github.com/smartcontractkit/chainlink-data-streams/mercury/wsrpc"
+	"github.com/smartcontractkit/chainlink-data-streams/mercury/wsrpc/cache"
 	"github.com/smartcontractkit/chainlink/v2/core/build"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities/confidentialrelay"
 	"github.com/smartcontractkit/chainlink/v2/core/config"
+	"github.com/smartcontractkit/chainlink/v2/core/config/env"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/logger/audit"
 	"github.com/smartcontractkit/chainlink/v2/core/services"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ccv/ccvcommon"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/v2/core/services/cre"
+	gatewayv2metrics "github.com/smartcontractkit/chainlink/v2/core/services/gateway/handlers/capabilities/v2/metrics"
+	gatewaymonitoring "github.com/smartcontractkit/chainlink/v2/core/services/gateway/monitoring"
+	gatewaynetwork "github.com/smartcontractkit/chainlink/v2/core/services/gateway/network"
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
+	"github.com/smartcontractkit/chainlink/v2/core/services/llo"
+	ocr3beholderwrapper "github.com/smartcontractkit/chainlink/v2/core/services/ocr3/beholderwrapper"
+	ocr3_1beholderwrapper "github.com/smartcontractkit/chainlink/v2/core/services/ocr3_1/beholderwrapper"
 	"github.com/smartcontractkit/chainlink/v2/core/services/periodicbackup"
-	"github.com/smartcontractkit/chainlink/v2/core/services/relay/evm/mercury/wsrpc"
-	"github.com/smartcontractkit/chainlink/v2/core/services/relay/evm/mercury/wsrpc/cache"
+	"github.com/smartcontractkit/chainlink/v2/core/services/pg"
 	"github.com/smartcontractkit/chainlink/v2/core/services/versioning"
-	"github.com/smartcontractkit/chainlink/v2/core/services/webhook"
+	workflowsmonitoring "github.com/smartcontractkit/chainlink/v2/core/services/workflows/monitoring"
+	syncerv2 "github.com/smartcontractkit/chainlink/v2/core/services/workflows/syncer/v2"
 	"github.com/smartcontractkit/chainlink/v2/core/sessions"
 	"github.com/smartcontractkit/chainlink/v2/core/static"
 	"github.com/smartcontractkit/chainlink/v2/core/store/migrate"
-	"github.com/smartcontractkit/chainlink/v2/core/utils"
-	clhttp "github.com/smartcontractkit/chainlink/v2/core/utils/http"
 	"github.com/smartcontractkit/chainlink/v2/core/web"
-	"github.com/smartcontractkit/chainlink/v2/plugins"
 )
-
-func init() {
-	// hack to undo geth's disruption of the std default logger
-	// remove with geth v1.13.10
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
-}
 
 var (
 	initGlobalsOnce sync.Once
-	prometheus      *ginprom.Prometheus
+	ginPrometheus   *ginprom.Prometheus
 	grpcOpts        loop.GRPCOpts
 )
 
-func initGlobals(cfgProm config.Prometheus, cfgTracing config.Tracing, logger logger.Logger) error {
+func metricViews() []sdkmetric.View {
+	return slices.Concat(
+		workflowsmonitoring.MetricViews(),
+		ccvcommon.MetricViews(),
+		ocr3beholderwrapper.MetricViews(),
+		ocr3_1beholderwrapper.MetricViews(),
+		gatewaynetwork.HTTPClientMetricViews(),
+		gatewaynetwork.WSConnectionMetricViews(),
+		gatewaymonitoring.MetricViews(),
+		gatewayv2metrics.MetricViews(),
+	)
+}
+
+func initGlobals(cfgProm config.Prometheus, cfgTelemetry config.Telemetry, cfgTracing config.Tracing, lggr logger.Logger, beholderClient *beholder.Client) error {
 	// Avoid double initializations, but does not prevent relay methods from being called multiple times.
 	var err error
 	initGlobalsOnce.Do(func() {
-		prometheus = ginprom.New(ginprom.Namespace("service"), ginprom.Token(cfgProm.AuthToken()))
-		grpcOpts = loop.NewGRPCOpts(nil) // default prometheus.Registerer
-		err = loop.SetupTracing(loop.TracingConfig{
-			Enabled:         cfgTracing.Enabled(),
-			CollectorTarget: cfgTracing.CollectorTarget(),
-			NodeAttributes:  cfgTracing.Attributes(),
-			SamplingRatio:   cfgTracing.SamplingRatio(),
-			OnDialError:     func(error) { logger.Errorw("Failed to dial", "err", err) },
-		})
+		err = func() error {
+			ginPrometheus = ginprom.New(ginprom.Namespace("service"), ginprom.Token(cfgProm.AuthToken()))
+			grpcOpts = loop.NewGRPCOpts(nil) // default prometheus.Registerer
+
+			otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+				lggr.Errorw("Telemetry error", "err", err)
+			}))
+
+			if !cfgTelemetry.Enabled() {
+				return loop.SetupTracing(tracingConfig(cfgTracing, lggr))
+			}
+
+			if beholderClient != nil {
+				beholder.SetClient(beholderClient)
+				beholder.SetGlobalOtelProviders()
+			}
+			return nil
+		}()
 	})
 	return err
 }
 
-var (
-	// ErrorNoAPICredentialsAvailable is returned when not run from a terminal
-	// and no API credentials have been provided
-	ErrorNoAPICredentialsAvailable = errors.New("API credentials must be supplied")
-)
+func tracingConfig(cfgTracing config.Tracing, lggr logger.Logger) loop.TracingConfig {
+	return loop.TracingConfig{
+		Enabled:         cfgTracing.Enabled(),
+		CollectorTarget: cfgTracing.CollectorTarget(),
+		NodeAttributes:  cfgTracing.Attributes(),
+		SamplingRatio:   cfgTracing.SamplingRatio(),
+		TLSCertPath:     cfgTracing.TLSCertPath(),
+		OnDialError:     func(e error) { lggr.Errorw("Failed to dial", "err", e) },
+	}
+}
+
+// newBeholderClient builds a Beholder client from tracing/telemetry config
+// and sets the CSA signer used for auth header refresh.
+func newBeholderClient(
+	lggr logger.Logger,
+	keyStore keystore.Master,
+	cfgTracing config.Tracing,
+	cfgApp config.AppConfig,
+	cfgTelemetry config.Telemetry,
+	csaPubKeyHex string,
+	beholderAuthHeaders map[string]string,
+) (*beholder.Client, error) {
+	attributes := make([]attribute.KeyValue, 0, len(cfgApp.ResourceAttributes()))
+	for k, v := range cfgApp.ResourceAttributes() {
+		attributes = append(attributes, attribute.String(k, v))
+	}
+
+	clientCfg := beholder.Config{
+		InsecureConnection:             cfgTelemetry.InsecureConnection(),
+		CACertFile:                     cfgTelemetry.CACertFile(),
+		OtelExporterGRPCEndpoint:       cfgTelemetry.OtelExporterGRPCEndpoint(),
+		ResourceAttributes:             attributes,
+		TraceSampleRatio:               cfgTelemetry.TraceSampleRatio(),
+		EmitterBatchProcessor:          cfgTelemetry.EmitterBatchProcessor(),
+		EmitterExportTimeout:           cfgTelemetry.EmitterExportTimeout(),
+		AuthPublicKeyHex:               csaPubKeyHex,
+		AuthHeaders:                    beholderAuthHeaders,
+		AuthHeadersTTL:                 cfgTelemetry.AuthHeadersTTL(),
+		ChipIngressEmitterEnabled:      cfgTelemetry.ChipIngressEndpoint() != "",
+		ChipIngressEmitterGRPCEndpoint: cfgTelemetry.ChipIngressEndpoint(),
+		ChipIngressInsecureConnection:  cfgTelemetry.ChipIngressInsecureConnection(),
+		ChipIngressBatchEmitterEnabled: cfgTelemetry.ChipIngressBatchEmitterEnabled(),
+		ChipIngressBufferSize:          cfgTelemetry.ChipIngressBufferSize(),
+		ChipIngressMaxBatchSize:        cfgTelemetry.ChipIngressMaxBatchSize(),
+		ChipIngressMaxConcurrentSends:  cfgTelemetry.ChipIngressMaxConcurrentSends(),
+		ChipIngressSendInterval:        cfgTelemetry.ChipIngressSendInterval(),
+		ChipIngressSendTimeout:         cfgTelemetry.ChipIngressSendTimeout(),
+		ChipIngressDrainTimeout:        cfgTelemetry.ChipIngressDrainTimeout(),
+		ChipIngressMaxGRPCRequestSize:  cfgTelemetry.ChipIngressMaxGRPCRequestSize(),
+		ChipIngressLogger:              lggr,
+		LogStreamingEnabled:            cfgTelemetry.LogStreamingEnabled(),
+		LogLevel:                       cfgTelemetry.LogLevel(),
+		LogBatchProcessor:              cfgTelemetry.LogBatchProcessor(),
+		LogExportTimeout:               cfgTelemetry.LogExportTimeout(),
+		LogExportMaxBatchSize:          cfgTelemetry.LogExportMaxBatchSize(),
+		LogExportInterval:              cfgTelemetry.LogExportInterval(),
+		LogMaxQueueSize:                cfgTelemetry.LogMaxQueueSize(),
+		// Due to OpenTelemetry semantics, histogram bucket boundaries must be set
+		// when the Beholder client is constructed.
+		MetricViews:               metricViews(),
+		MetricViewsDenyAttributes: cfgTelemetry.MetricViewsDenyAttributes(),
+		MetricCardinalityLimit:    cfgTelemetry.MetricCardinalityLimit(),
+	}
+
+	if cfgTracing.Enabled() {
+		tracingCfg := tracingConfig(cfgTracing, lggr)
+		// add tracing attributes to resource attributes
+		clientCfg.ResourceAttributes = append(clientCfg.ResourceAttributes, tracingCfg.Attributes()...)
+
+		var err error
+		clientCfg.TraceSpanExporter, err = tracingCfg.NewSpanExporter()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if pmCfg := cfgTelemetry.PrometheusBridge(); pmCfg.Enabled() {
+		var bridgeOpts []prombridge.Option
+		if prefixes := pmCfg.Prefixes(); len(prefixes) > 0 {
+			bridgeOpts = append(bridgeOpts, prombridge.WithGatherer(promutil.NewPrefixGatherer(prometheus.DefaultGatherer, prefixes)))
+		}
+		clientCfg.MetricProducers = append(clientCfg.MetricProducers, prombridge.NewMetricProducer(bridgeOpts...))
+	}
+
+	beholderClient, err := beholder.NewClient(clientCfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set the signer used to refresh auth headers when AuthHeadersTTL is non-zero.
+	// TTL 0 means static headers only; the signer will not run.
+	beholderClient.SetSigner(&keystore.CSASigner{CSA: keyStore.CSA()})
+
+	return beholderClient, nil
+}
+
+// ErrNoAPICredentialsAvailable is returned when not run from a terminal
+// and no API credentials have been provided
+var ErrNoAPICredentialsAvailable = errors.New("API credentials must be supplied")
 
 // Shell for the node, local commands and remote commands.
 type Shell struct {
 	Renderer
 	Config                         chainlink.GeneralConfig // initialized in Before
-	Logger                         logger.Logger           // initialized in Before
-	CloseLogger                    func() error            // called in After
+	Logger                         logger.Logger
+	Registerer                     prometheus.Registerer // initialized in Before
+	CloseLogger                    func() error          // called in After
+	SetOtelCore                    func(zapcore.Core)    // reference to UpdatableCore.Update
 	AppFactory                     AppFactory
 	KeyStoreAuthenticator          TerminalKeyStoreAuthenticator
 	FallbackAPIInitializer         APIInitializer
@@ -113,6 +240,13 @@ type Shell struct {
 	configFilesIsSet bool
 	secretsFiles     []string
 	secretsFileIsSet bool
+
+	LDB            pg.LockedDB        // initialized in BeforeNode
+	DS             sqlutil.DataSource // initialized in BeforeNode
+	KeyStore       keystore.Master    // initialized in BeforeNode
+	BeholderClient *beholder.Client   // initialized in BeforeNode
+
+	CleanupOnce sync.Once // ensures cleanup happens exactly once
 }
 
 func (s *Shell) errorOut(err error) cli.ExitCoder {
@@ -128,7 +262,6 @@ func (s *Shell) configExitErr(validateFn func() error) cli.ExitCoder {
 	err := validateFn()
 	if err != nil {
 		fmt.Println("Invalid configuration:", err)
-		fmt.Println()
 		return s.errorOut(errors.New("invalid configuration"))
 	}
 	return nil
@@ -136,33 +269,18 @@ func (s *Shell) configExitErr(validateFn func() error) cli.ExitCoder {
 
 // AppFactory implements the NewApplication method.
 type AppFactory interface {
-	NewApplication(ctx context.Context, cfg chainlink.GeneralConfig, appLggr logger.Logger, db *sqlx.DB) (chainlink.Application, error)
+	NewApplication(ctx context.Context, cfg chainlink.GeneralConfig, appLggr logger.Logger, appRegisterer prometheus.Registerer, ds sqlutil.DataSource, keyStore keystore.Master) (chainlink.Application, error)
 }
 
 // ChainlinkAppFactory is used to create a new Application.
 type ChainlinkAppFactory struct{}
 
 // NewApplication returns a new instance of the node with the given config.
-func (n ChainlinkAppFactory) NewApplication(ctx context.Context, cfg chainlink.GeneralConfig, appLggr logger.Logger, db *sqlx.DB) (app chainlink.Application, err error) {
-	err = initGlobals(cfg.Prometheus(), cfg.Tracing(), appLggr)
-	if err != nil {
-		appLggr.Errorf("Failed to initialize globals: %v", err)
-	}
-
-	err = migrate.SetMigrationENVVars(cfg)
+func (n ChainlinkAppFactory) NewApplication(ctx context.Context, cfg chainlink.GeneralConfig, appLggr logger.Logger, appRegisterer prometheus.Registerer, ds sqlutil.DataSource, keyStore keystore.Master) (app chainlink.Application, err error) {
+	err = migrate.SetMigrationENVVars(cfg.EVMConfigs())
 	if err != nil {
 		return nil, err
 	}
-
-	err = handleNodeVersioning(ctx, db, appLggr, cfg.RootDir(), cfg.Database(), cfg.WebServer().HTTPPort())
-	if err != nil {
-		return nil, err
-	}
-
-	keyStore := keystore.New(db, utils.GetScryptParams(cfg), appLggr, cfg.Database())
-	mailMon := mailbox.NewMonitor(cfg.AppID().String(), appLggr.Named("Mailbox"))
-
-	loopRegistry := plugins.NewLoopRegistry(appLggr, cfg.Tracing())
 
 	mercuryPool := wsrpc.NewPool(appLggr, cache.Config{
 		LatestReportTTL:      cfg.Mercury().Cache().LatestReportTTL(),
@@ -170,77 +288,49 @@ func (n ChainlinkAppFactory) NewApplication(ctx context.Context, cfg chainlink.G
 		LatestReportDeadline: cfg.Mercury().Cache().LatestReportDeadline(),
 	})
 
-	// create the relayer-chain interoperators from application configuration
-	relayerFactory := chainlink.RelayerFactory{
-		Logger:       appLggr,
-		LoopRegistry: loopRegistry,
-		GRPCOpts:     grpcOpts,
-		MercuryPool:  mercuryPool,
-	}
-
-	evmFactoryCfg := chainlink.EVMFactoryConfig{
-		CSAETHKeystore: keyStore,
-		ChainOpts:      legacyevm.ChainOpts{AppConfig: cfg, MailMon: mailMon, DB: db},
-	}
-	// evm always enabled for backward compatibility
-	// TODO BCF-2510 this needs to change in order to clear the path for EVM extraction
-	initOps := []chainlink.CoreRelayerChainInitFunc{chainlink.InitEVM(ctx, relayerFactory, evmFactoryCfg)}
-
-	if cfg.CosmosEnabled() {
-		cosmosCfg := chainlink.CosmosFactoryConfig{
-			Keystore:    keyStore.Cosmos(),
-			TOMLConfigs: cfg.CosmosConfigs(),
-			DB:          db,
-			QConfig:     cfg.Database(),
-		}
-		initOps = append(initOps, chainlink.InitCosmos(ctx, relayerFactory, cosmosCfg))
-	}
-	if cfg.SolanaEnabled() {
-		solanaCfg := chainlink.SolanaFactoryConfig{
-			Keystore:    keyStore.Solana(),
-			TOMLConfigs: cfg.SolanaConfigs(),
-		}
-		initOps = append(initOps, chainlink.InitSolana(ctx, relayerFactory, solanaCfg))
-	}
-	if cfg.StarkNetEnabled() {
-		starkCfg := chainlink.StarkNetFactoryConfig{
-			Keystore:    keyStore.StarkNet(),
-			TOMLConfigs: cfg.StarknetConfigs(),
-		}
-		initOps = append(initOps, chainlink.InitStarknet(ctx, relayerFactory, starkCfg))
-
-	}
-
-	relayChainInterops, err := chainlink.NewCoreRelayerChainInteroperators(initOps...)
-	if err != nil {
-		return nil, err
-	}
+	unrestrictedClient := clhttp.NewUnrestrictedClient()
 
 	// Configure and optionally start the audit log forwarder service
 	auditLogger, err := audit.NewAuditLogger(appLggr, cfg.AuditLogger())
 	if err != nil {
-		return nil, err
+		appLggr.Criticalf("Failed to initialize audit logger: %v. In a future release, this error will prevent node startup.", err)
+		auditLogger = audit.NoopLogger
 	}
 
-	restrictedClient := clhttp.NewRestrictedHTTPClient(cfg.Database(), appLggr)
-	unrestrictedClient := clhttp.NewUnrestrictedHTTPClient()
-	externalInitiatorManager := webhook.NewExternalInitiatorManager(db, unrestrictedClient, appLggr, cfg.Database())
-	return chainlink.NewApplication(chainlink.ApplicationOpts{
-		Config:                     cfg,
-		SqlxDB:                     db,
-		KeyStore:                   keyStore,
-		RelayerChainInteroperators: relayChainInterops,
-		MailMon:                    mailMon,
-		Logger:                     appLggr,
-		AuditLogger:                auditLogger,
-		ExternalInitiatorManager:   externalInitiatorManager,
-		Version:                    static.Version,
-		RestrictedHTTPClient:       restrictedClient,
-		UnrestrictedHTTPClient:     unrestrictedClient,
-		SecretGenerator:            chainlink.FilePersistedSecretGenerator{},
-		LoopRegistry:               loopRegistry,
-		GRPCOpts:                   grpcOpts,
-		MercuryPool:                mercuryPool,
+	creOpts := cre.Opts{
+		CapabilitiesRegistry: registry.NewRegistry(appLggr),
+		ExecutionHandlers:    &confidentialrelay.ExecutionHandlers{},
+	}
+	if cfg.CRE().WorkflowFetcher() != nil && cfg.CRE().WorkflowFetcher().URL() != "" {
+		creOpts.FetcherFunc, err = syncerv2.NewFetcherFunc(cfg.CRE().WorkflowFetcher().URL(), appLggr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create workflow fetcher: %w", err)
+		}
+	}
+
+	dockerTag := static.Unset
+	if envTag, ok := env.DockerTag.Lookup(); ok && envTag != "" {
+		dockerTag = envTag
+	}
+
+	return chainlink.NewApplication(ctx, chainlink.ApplicationOpts{
+		Opts:                   creOpts,
+		Config:                 cfg,
+		DS:                     ds,
+		KeyStore:               keyStore,
+		Logger:                 appLggr,
+		Registerer:             appRegisterer,
+		AuditLogger:            auditLogger,
+		Version:                static.Version,
+		VersionTag:             static.VersionTag,
+		DockerTag:              dockerTag,
+		RestrictedHTTPClient:   clhttp.NewRestrictedClient(cfg.Database(), appLggr),
+		UnrestrictedHTTPClient: unrestrictedClient,
+		SecretGenerator:        chainlink.FilePersistedSecretGenerator{},
+		GRPCOpts:               grpcOpts,
+		MercuryPool:            mercuryPool,
+		RetirementReportCache:  retirement.NewRetirementReportCache(appLggr, ds),
+		LLOTransmissionReaper:  llo.NewTransmissionReaper(ds, appLggr, cfg.Mercury().Transmitter().ReaperFrequency(), cfg.Mercury().Transmitter().ReaperMaxAge()),
 	})
 }
 
@@ -248,14 +338,26 @@ func (n ChainlinkAppFactory) NewApplication(ctx context.Context, cfg chainlink.G
 func handleNodeVersioning(ctx context.Context, db *sqlx.DB, appLggr logger.Logger, rootDir string, cfg config.Database, healthReportPort uint16) error {
 	var err error
 	// Set up the versioning Configs
-	verORM := versioning.NewORM(db, appLggr, cfg.DefaultQueryTimeout())
+	verORM := versioning.NewORM(db, appLggr)
+	ibhr := services.NewStartUpHealthReport(healthReportPort, appLggr)
+	ibhr.Start()
+	defer ibhr.Stop()
 
 	if static.Version != static.Unset {
 		var appv, dbv *semver.Version
-		appv, dbv, err = versioning.CheckVersion(db, appLggr, static.Version)
+		appv, err = semver.NewVersion(static.Version)
 		if err != nil {
-			// Exit immediately and don't touch the database if the app version is too old
-			return fmt.Errorf("CheckVersion: %w", err)
+			return fmt.Errorf("failed to parse application version: %w", err)
+		}
+
+		if env.SkipAppVersionCheck.IsTrue() {
+			appLggr.Warn("Skipping app version check")
+		} else {
+			appv, dbv, err = versioning.CheckVersion(ctx, db, appLggr, static.Version, env.IgnorePrereleaseVersionCheck.IsTrue())
+			if err != nil {
+				// Exit immediately and don't touch the database if the app version is too old
+				return fmt.Errorf("CheckVersion: %w", err)
+			}
 		}
 
 		// Take backup if app version is newer than DB version
@@ -263,10 +365,11 @@ func handleNodeVersioning(ctx context.Context, db *sqlx.DB, appLggr logger.Logge
 		backupCfg := cfg.Backup()
 		if backupCfg.Mode() != config.DatabaseBackupModeNone && backupCfg.OnVersionUpgrade() {
 			if err = takeBackupIfVersionUpgrade(cfg.URL(), rootDir, cfg.Backup(), appLggr, appv, dbv, healthReportPort); err != nil {
+				//nolint:gocritic // errors.Is/strings.Contains chain, not a switch candidate
 				if errors.Is(err, sql.ErrNoRows) {
-					appLggr.Debugf("Failed to find any node version in the DB: %w", err)
+					appLggr.Debugf("Failed to find any node version in the DB: %v", err)
 				} else if strings.Contains(err.Error(), "relation \"node_versions\" does not exist") {
-					appLggr.Debugf("Failed to find any node version in the DB, the node_versions table does not exist yet: %w", err)
+					appLggr.Debugf("Failed to find any node version in the DB, the node_versions table does not exist yet: %v", err)
 				} else {
 					return fmt.Errorf("initializeORM#FindLatestNodeVersion: %w", err)
 				}
@@ -276,7 +379,7 @@ func handleNodeVersioning(ctx context.Context, db *sqlx.DB, appLggr logger.Logge
 
 	// Migrate the database
 	if cfg.MigrateDatabase() {
-		if err = migrate.Migrate(ctx, db.DB, appLggr); err != nil {
+		if err = migrate.Migrate(ctx, db.DB); err != nil {
 			return fmt.Errorf("initializeORM#Migrate: %w", err)
 		}
 	}
@@ -284,14 +387,14 @@ func handleNodeVersioning(ctx context.Context, db *sqlx.DB, appLggr logger.Logge
 	// Update to latest version
 	if static.Version != static.Unset {
 		version := versioning.NewNodeVersion(static.Version)
-		if err = verORM.UpsertNodeVersion(version); err != nil {
+		if err = verORM.UpsertNodeVersion(ctx, version); err != nil {
 			return fmt.Errorf("UpsertNodeVersion: %w", err)
 		}
 	}
 	return nil
 }
 
-func takeBackupIfVersionUpgrade(dbUrl url.URL, rootDir string, cfg periodicbackup.BackupConfig, lggr logger.Logger, appv, dbv *semver.Version, healthReportPort uint16) (err error) {
+func takeBackupIfVersionUpgrade(dbURL url.URL, rootDir string, cfg periodicbackup.BackupConfig, lggr logger.Logger, appv, dbv *semver.Version, healthReportPort uint16) (err error) {
 	if appv == nil {
 		lggr.Debug("Application version is missing, skipping automatic DB backup.")
 		return nil
@@ -306,16 +409,13 @@ func takeBackupIfVersionUpgrade(dbUrl url.URL, rootDir string, cfg periodicbacku
 	}
 	lggr.Infof("Upgrade detected: application version %s is newer than database version %s, taking automatic DB backup. To skip automatic database backup before version upgrades, set Database.Backup.OnVersionUpgrade=false. To disable backups entirely set Database.Backup.Mode=none.", appv.String(), dbv.String())
 
-	databaseBackup, err := periodicbackup.NewDatabaseBackup(dbUrl, rootDir, cfg, lggr)
+	databaseBackup, err := periodicbackup.NewDatabaseBackup(dbURL, rootDir, cfg, lggr)
 	if err != nil {
 		return errors.Wrap(err, "takeBackupIfVersionUpgrade failed")
 	}
 
-	//Because backups can take a long time we must start a "fake" health report to prevent
-	//node shutdown because of healthcheck fail/timeout
-	ibhr := services.NewInBackupHealthReport(healthReportPort, lggr)
-	ibhr.Start()
-	defer ibhr.Stop()
+	// Because backups can take a long time we must start a "fake" health report to prevent
+	// node shutdown because of healthcheck fail/timeout
 	err = databaseBackup.RunBackup(appv.String())
 	return err
 }
@@ -351,7 +451,7 @@ func (n ChainlinkRunner) Run(ctx context.Context, app chainlink.Application) err
 		return errors.New("You must specify at least one port to listen on")
 	}
 
-	handler, err := web.NewRouter(app, prometheus)
+	handler, err := web.NewRouter(app, ginPrometheus)
 	if err != nil {
 		return errors.Wrap(err, "failed to create web router")
 	}
@@ -360,21 +460,20 @@ func (n ChainlinkRunner) Run(ctx context.Context, app chainlink.Application) err
 	g, gCtx := errgroup.WithContext(ctx)
 	serverStartTimeoutDuration := config.WebServer().StartTimeout()
 	if ws.HTTPPort() != 0 {
-		go tryRunServerUntilCancelled(gCtx, app.GetLogger(), serverStartTimeoutDuration, func() error {
-			return server.run(ws.ListenIP(), ws.HTTPPort(), config.WebServer().HTTPWriteTimeout())
-		})
+		runServer := server.runFn(ws.ListenIP(), ws.HTTPPort(), config.WebServer().HTTPWriteTimeout())
+		go tryRunServerUntilCancelled(gCtx, app.GetLogger(), serverStartTimeoutDuration, runServer)
 	}
 
 	tls := config.WebServer().TLS()
 	if tls.HTTPSPort() != 0 {
-		go tryRunServerUntilCancelled(gCtx, app.GetLogger(), serverStartTimeoutDuration, func() error {
-			return server.runTLS(
-				tls.ListenIP(),
-				tls.HTTPSPort(),
-				tls.CertFile(),
-				tls.KeyFile(),
-				config.WebServer().HTTPWriteTimeout())
-		})
+		runServer := server.runTLS(
+			tls.ListenIP(),
+			tls.HTTPSPort(),
+			tls.CertFile(),
+			tls.KeyFile(),
+			config.WebServer().HTTPWriteTimeout(),
+		)
+		go tryRunServerUntilCancelled(gCtx, app.GetLogger(), serverStartTimeoutDuration, runServer)
 	}
 
 	g.Go(func() error {
@@ -384,7 +483,7 @@ func (n ChainlinkRunner) Run(ctx context.Context, app chainlink.Application) err
 			err = errors.WithStack(server.httpServer.Shutdown(context.Background()))
 		}
 		if server.tlsServer != nil {
-			err = multierr.Combine(err, errors.WithStack(server.tlsServer.Shutdown(context.Background())))
+			err = stderrors.Join(err, errors.WithStack(server.tlsServer.Shutdown(context.Background())))
 		}
 		return err
 	})
@@ -450,20 +549,24 @@ type server struct {
 	lggr       logger.Logger
 }
 
-func (s *server) run(ip net.IP, port uint16, writeTimeout time.Duration) error {
+func (s *server) runFn(ip net.IP, port uint16, writeTimeout time.Duration) func() error {
 	addr := fmt.Sprintf("%s:%d", ip.String(), port)
-	s.lggr.Infow(fmt.Sprintf("Listening and serving HTTP on %s", addr), "ip", ip, "port", port)
+	s.lggr.Infow("Listening and serving HTTP on "+addr, "ip", ip, "port", port)
 	s.httpServer = createServer(s.handler, addr, writeTimeout)
-	err := s.httpServer.ListenAndServe()
-	return errors.Wrap(err, "failed to run plaintext HTTP server")
+	return func() error {
+		err := s.httpServer.ListenAndServe()
+		return errors.Wrap(err, "failed to run plaintext HTTP server")
+	}
 }
 
-func (s *server) runTLS(ip net.IP, port uint16, certFile, keyFile string, requestTimeout time.Duration) error {
+func (s *server) runTLS(ip net.IP, port uint16, certFile, keyFile string, requestTimeout time.Duration) func() error {
 	addr := fmt.Sprintf("%s:%d", ip.String(), port)
-	s.lggr.Infow(fmt.Sprintf("Listening and serving HTTPS on %s", addr), "ip", ip, "port", port)
+	s.lggr.Infow("Listening and serving HTTPS on "+addr, "ip", ip, "port", port)
 	s.tlsServer = createServer(s.handler, addr, requestTimeout)
-	err := s.tlsServer.ListenAndServeTLS(certFile, keyFile)
-	return errors.Wrap(err, "failed to run TLS server (NOTE: you can disable TLS server completely and silence these errors by setting WebServer.TLS.HTTPSPort=0 in your config)")
+	return func() error {
+		err := s.tlsServer.ListenAndServeTLS(certFile, keyFile)
+		return errors.Wrap(err, "failed to run TLS server (NOTE: you can disable TLS server completely and silence these errors by setting WebServer.TLS.HTTPSPort=0 in your config)")
+	}
 }
 
 func createServer(handler *gin.Engine, addr string, requestTimeout time.Duration) *http.Server {
@@ -498,14 +601,14 @@ type authenticatedHTTPClient struct {
 // which is then used for all subsequent HTTP API requests.
 func NewAuthenticatedHTTPClient(lggr logger.Logger, clientOpts ClientOpts, cookieAuth CookieAuthenticator, sessionRequest sessions.SessionRequest) HTTPClient {
 	return &authenticatedHTTPClient{
-		client:         newHttpClient(lggr, clientOpts.InsecureSkipVerify),
+		client:         newHTTPClient(lggr, clientOpts.InsecureSkipVerify),
 		cookieAuth:     cookieAuth,
 		sessionRequest: sessionRequest,
 		remoteNodeURL:  clientOpts.RemoteNodeURL,
 	}
 }
 
-func newHttpClient(lggr logger.Logger, insecureSkipVerify bool) *http.Client {
+func newHTTPClient(lggr logger.Logger, insecureSkipVerify bool) *http.Client {
 	tr := &http.Transport{
 		// User enables this at their own risk!
 		// #nosec G402
@@ -621,19 +724,19 @@ func (t *SessionCookieAuthenticator) Cookie() (*http.Cookie, error) {
 // Authenticate retrieves a session ID via a cookie and saves it to disk.
 func (t *SessionCookieAuthenticator) Authenticate(ctx context.Context, sessionRequest sessions.SessionRequest) (*http.Cookie, error) {
 	b := new(bytes.Buffer)
-	err := json.NewEncoder(b).Encode(sessionRequest)
+	err := json.NewEncoder(b).Encode(sessionRequest) //nolint:gosec // SessionRequest.Password is the login payload, not a leaked secret
 	if err != nil {
 		return nil, err
 	}
 	url := t.config.RemoteNodeURL.String() + "/sessions"
-	req, err := http.NewRequestWithContext(ctx, "POST", url, b)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, b)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := newHttpClient(t.lggr, t.config.InsecureSkipVerify)
-	resp, err := client.Do(req)
+	client := newHTTPClient(t.lggr, t.config.InsecureSkipVerify)
+	resp, err := client.Do(req) //nolint:bodyclose // closed via defer t.lggr.ErrorIfFn below
 	if err != nil {
 		return nil, err
 	}
@@ -697,13 +800,13 @@ type DiskCookieStore struct {
 
 // Save stores a cookie.
 func (d DiskCookieStore) Save(cookie *http.Cookie) error {
-	return os.WriteFile(d.cookiePath(), []byte(cookie.String()), 0600)
+	return os.WriteFile(d.cookiePath(), []byte(cookie.String()), 0o600) //nolint:gosec // cookiePath derives from trusted config RootDir, not user input
 }
 
 // Removes any stored cookie.
 func (d DiskCookieStore) Reset() error {
 	// Write empty bytes
-	return os.WriteFile(d.cookiePath(), []byte(""), 0600)
+	return os.WriteFile(d.cookiePath(), []byte(""), 0o600)
 }
 
 // Retrieve returns any Saved cookies.
@@ -713,7 +816,7 @@ func (d DiskCookieStore) Retrieve() (*http.Cookie, error) {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, multierr.Append(errors.New("unable to retrieve credentials, you must first login through the CLI"), err)
+		return nil, stderrors.Join(errors.New("unable to retrieve credentials, you must first login through the CLI"), err)
 	}
 	header := http.Header{}
 	header.Add("Cookie", string(b))
@@ -744,7 +847,7 @@ func NewUserCache(subdir string, lggr func() logger.Logger) (*UserCache, error) 
 }
 
 func (cs *UserCache) ensure() {
-	if err := os.MkdirAll(cs.dir, 0700); err != nil {
+	if err := os.MkdirAll(cs.dir, 0o700); err != nil {
 		cs.lggr().Errorw("Failed to make user cache dir", "dir", cs.dir, "err", err)
 	}
 }
@@ -794,7 +897,7 @@ func (f *fileSessionRequestBuilder) Build(file string) (sessions.SessionRequest,
 // needed to access the API. Does nothing if API user already exists.
 type APIInitializer interface {
 	// Initialize creates a new local Admin user for API access, or does nothing if one exists.
-	Initialize(orm sessions.BasicAdminUsersORM, lggr logger.Logger) (sessions.User, error)
+	Initialize(ctx context.Context, orm sessions.BasicAdminUsersORM, lggr logger.Logger) (sessions.User, error)
 }
 
 type promptingAPIInitializer struct {
@@ -808,9 +911,9 @@ func NewPromptingAPIInitializer(prompter Prompter) APIInitializer {
 }
 
 // Initialize uses the terminal to get credentials that it then saves in the store.
-func (t *promptingAPIInitializer) Initialize(orm sessions.BasicAdminUsersORM, lggr logger.Logger) (sessions.User, error) {
+func (t *promptingAPIInitializer) Initialize(ctx context.Context, orm sessions.BasicAdminUsersORM, lggr logger.Logger) (sessions.User, error) {
 	// Load list of users to determine which to assume, or if a user needs to be created
-	dbUsers, err := orm.ListUsers()
+	dbUsers, err := orm.ListUsers(ctx)
 	if err != nil {
 		return sessions.User{}, errors.Wrap(err, "Unable to List users for initialization")
 	}
@@ -818,7 +921,7 @@ func (t *promptingAPIInitializer) Initialize(orm sessions.BasicAdminUsersORM, lg
 	// If there are no users in the database, prompt for initial admin user creation
 	if len(dbUsers) == 0 {
 		if !t.prompter.IsTerminal() {
-			return sessions.User{}, ErrorNoAPICredentialsAvailable
+			return sessions.User{}, ErrNoAPICredentialsAvailable
 		}
 
 		for {
@@ -830,8 +933,8 @@ func (t *promptingAPIInitializer) Initialize(orm sessions.BasicAdminUsersORM, lg
 				lggr.Errorw("Error creating API user", "err", err2)
 				continue
 			}
-			if err = orm.CreateUser(&user); err != nil {
-				lggr.Errorf("Error creating API user: ", err, "err")
+			if err = orm.CreateUser(ctx, &user); err != nil {
+				lggr.Errorw("Error creating API user", "err", err)
 			}
 			return user, err
 		}
@@ -844,8 +947,7 @@ func (t *promptingAPIInitializer) Initialize(orm sessions.BasicAdminUsersORM, lg
 
 	// Otherwise, multiple admin users exist, prompt for which to use
 	email := t.prompter.Prompt("Enter email of API user account to assume: ")
-	user, err := orm.FindUser(email)
-
+	user, err := orm.FindUser(ctx, email)
 	if err != nil {
 		return sessions.User{}, err
 	}
@@ -862,14 +964,14 @@ func NewFileAPIInitializer(file string) APIInitializer {
 	return fileAPIInitializer{file: file}
 }
 
-func (f fileAPIInitializer) Initialize(orm sessions.BasicAdminUsersORM, lggr logger.Logger) (sessions.User, error) {
+func (f fileAPIInitializer) Initialize(ctx context.Context, orm sessions.BasicAdminUsersORM, lggr logger.Logger) (sessions.User, error) {
 	request, err := credentialsFromFile(f.file, lggr)
 	if err != nil {
 		return sessions.User{}, err
 	}
 
 	// Load list of users to determine which to assume, or if a user needs to be created
-	dbUsers, err := orm.ListUsers()
+	dbUsers, err := orm.ListUsers(ctx)
 	if err != nil {
 		return sessions.User{}, errors.Wrap(err, "Unable to List users for initialization")
 	}
@@ -880,7 +982,7 @@ func (f fileAPIInitializer) Initialize(orm sessions.BasicAdminUsersORM, lggr log
 		if err2 != nil {
 			return user, errors.Wrap(err2, "failed to instantiate new user")
 		}
-		return user, orm.CreateUser(&user)
+		return user, orm.CreateUser(ctx, &user)
 	}
 
 	// Attempt to contextually return the correct admin user, CLI access here implies admin
@@ -889,7 +991,7 @@ func (f fileAPIInitializer) Initialize(orm sessions.BasicAdminUsersORM, lggr log
 	}
 
 	// Otherwise, multiple admin users exist, attempt to load email specified in session request
-	user, err := orm.FindUser(request.Email)
+	user, err := orm.FindUser(ctx, request.Email)
 	if err != nil {
 		return sessions.User{}, err
 	}
@@ -1020,9 +1122,10 @@ func confirmAction(c *cli.Context) bool {
 	var answer string
 	for {
 		answer = prompt.Prompt("Are you sure? This action is irreversible! (yes/no) ")
-		if answer == "yes" {
+		switch answer {
+		case "yes":
 			return true
-		} else if answer == "no" {
+		case "no":
 			return false
 		}
 		fmt.Printf("%s is not valid. Please type yes or no\n", answer)

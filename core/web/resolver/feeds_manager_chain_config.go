@@ -15,7 +15,7 @@ func NewFeedsManagerChainConfig(cfg feeds.ChainConfig) *FeedsManagerChainConfigR
 }
 
 func NewFeedsManagerChainConfigs(cfgs []feeds.ChainConfig) []*FeedsManagerChainConfigResolver {
-	var resolvers []*FeedsManagerChainConfigResolver
+	resolvers := make([]*FeedsManagerChainConfigResolver, 0, len(cfgs))
 	for _, cfg := range cfgs {
 		resolvers = append(resolvers, NewFeedsManagerChainConfig(cfg))
 	}
@@ -41,6 +41,11 @@ func (r *FeedsManagerChainConfigResolver) ChainType() string {
 // AccountAddr resolves the chain configs's account address.
 func (r *FeedsManagerChainConfigResolver) AccountAddr() string {
 	return r.cfg.AccountAddress
+}
+
+// AccountAddrPubKey resolves the chain configs's account address public key.
+func (r *FeedsManagerChainConfigResolver) AccountAddrPubKey() *string {
+	return r.cfg.AccountAddressPublicKey.Ptr()
 }
 
 // AdminAddr resolves the chain configs's admin address.
@@ -158,7 +163,7 @@ func (r *CreateFeedsManagerChainConfigPayloadResolver) ToCreateFeedsManagerChain
 
 func (r *CreateFeedsManagerChainConfigPayloadResolver) ToInputErrors() (*InputErrorsResolver, bool) {
 	if r.inputErrs != nil {
-		var errs []*InputErrorResolver
+		errs := make([]*InputErrorResolver, 0, len(r.inputErrs))
 
 		for path, message := range r.inputErrs {
 			errs = append(errs, NewInputError(path, message))
@@ -248,7 +253,7 @@ func (r *UpdateFeedsManagerChainConfigPayloadResolver) ToUpdateFeedsManagerChain
 
 func (r *UpdateFeedsManagerChainConfigPayloadResolver) ToInputErrors() (*InputErrorsResolver, bool) {
 	if r.inputErrs != nil {
-		var errs []*InputErrorResolver
+		errs := make([]*InputErrorResolver, 0, len(r.inputErrs))
 
 		for path, message := range r.inputErrs {
 			errs = append(errs, NewInputError(path, message))

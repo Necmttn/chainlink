@@ -3,23 +3,22 @@ package streams
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 	"github.com/smartcontractkit/chainlink/v2/core/services/ocrcommon"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	"gopkg.in/guregu/null.v4"
 )
 
 type mockRegistry struct{}
 
-func (m *mockRegistry) Get(streamID StreamID) (strm Stream, exists bool) { return }
-func (m *mockRegistry) Register(streamID StreamID, spec pipeline.Spec, rrs ResultRunSaver) error {
+func (m *mockRegistry) Get(streamID StreamID) (p Pipeline, exists bool) { return p, exists }
+func (m *mockRegistry) Register(jb job.Job, rrs ResultRunSaver) error {
 	return nil
 }
-func (m *mockRegistry) Unregister(streamID StreamID) {}
+func (m *mockRegistry) Unregister(int32) {}
 
 type mockDelegateConfig struct{}
 
@@ -35,13 +34,13 @@ func Test_Delegate(t *testing.T) {
 
 	t.Run("ServicesForSpec", func(t *testing.T) {
 		jb := job.Job{PipelineSpec: &pipeline.Spec{ID: 1}}
-		t.Run("errors if job is missing name", func(t *testing.T) {
-			_, err := d.ServicesForSpec(jb)
-			assert.EqualError(t, err, "job name is required to be present for stream specs")
+		t.Run("no error if job is missing streamID", func(t *testing.T) {
+			_, err := d.ServicesForSpec(t.Context(), jb)
+			require.NoError(t, err)
 		})
-		jb.Name = null.StringFrom("jobname")
+		jb.StreamID = new(uint32(42))
 		t.Run("returns services", func(t *testing.T) {
-			srvs, err := d.ServicesForSpec(jb)
+			srvs, err := d.ServicesForSpec(t.Context(), jb)
 			require.NoError(t, err)
 
 			assert.Len(t, srvs, 2)
@@ -49,8 +48,7 @@ func Test_Delegate(t *testing.T) {
 
 			strmSrv := srvs[1].(*StreamService)
 			assert.Equal(t, registry, strmSrv.registry)
-			assert.Equal(t, StreamID("jobname"), strmSrv.id)
-			assert.Equal(t, jb.PipelineSpec, strmSrv.spec)
+			assert.Equal(t, jb, strmSrv.jb)
 			assert.NotNil(t, strmSrv.lggr)
 			assert.Equal(t, srvs[0], strmSrv.rrs)
 		})
@@ -58,7 +56,7 @@ func Test_Delegate(t *testing.T) {
 }
 
 func Test_ValidatedStreamSpec(t *testing.T) {
-	var tt = []struct {
+	tt := []struct {
 		name      string
 		toml      string
 		assertion func(t *testing.T, os job.Job, err error)
@@ -67,6 +65,7 @@ func Test_ValidatedStreamSpec(t *testing.T) {
 			name: "minimal stream spec",
 			toml: `
 type               = "stream"
+streamID 		   = 12345
 name 			   = "voter-turnout"
 schemaVersion      = 1
 observationSource  = """
@@ -82,6 +81,8 @@ answer1      [type=median index=0];
 				assert.Equal(t, job.Type("stream"), jb.Type)
 				assert.Equal(t, uint32(1), jb.SchemaVersion)
 				assert.True(t, jb.Name.Valid)
+				require.NotNil(t, jb.StreamID)
+				assert.Equal(t, uint32(12345), *jb.StreamID)
 				assert.Equal(t, "voter-turnout", jb.Name.String)
 			},
 		},
@@ -89,7 +90,7 @@ answer1      [type=median index=0];
 			name: "unparseable toml",
 			toml: `not toml`,
 			assertion: func(t *testing.T, jb job.Job, err error) {
-				assert.EqualError(t, err, "toml unmarshal error on job: toml: expected character =")
+				assert.ErrorContains(t, err, "toml unmarshal error on job: toml:")
 			},
 		},
 		{
@@ -134,7 +135,25 @@ answer1      [type=median index=0];
 			},
 		},
 		{
-			name: "error if missing name",
+			name: "no error if missing name",
+			toml: `
+type               = "stream"
+schemaVersion      = 1
+streamID 		   = 12345
+observationSource  = """
+ds1          [type=bridge name=voter_turnout];
+ds1_parse    [type=jsonparse path="one,two"];
+ds1_multiply [type=multiply times=1.23];
+ds1 -> ds1_parse -> ds1_multiply -> answer1;
+answer1      [type=median index=0];
+"""
+`,
+			assertion: func(t *testing.T, jb job.Job, err error) {
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "error if missing streamID",
 			toml: `
 type               = "stream"
 schemaVersion      = 1
@@ -147,7 +166,7 @@ answer1      [type=median index=0];
 """
 `,
 			assertion: func(t *testing.T, jb job.Job, err error) {
-				assert.EqualError(t, err, "jobs of type 'stream' require a non-blank name as stream ID")
+				assert.EqualError(t, err, "no streamID found in spec (must be either specified as top-level key 'streamID' or at least one streamID tag must be provided in the pipeline)")
 			},
 		},
 	}

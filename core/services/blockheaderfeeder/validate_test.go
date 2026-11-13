@@ -6,16 +6,14 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/pkg/types"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
 )
 
 func TestValidate(t *testing.T) {
-	v1Coordinator := ethkey.EIP55Address("0x1F72B4A5DCf7CC6d2E38423bF2f4BFA7db97d139")
-	v2Coordinator := ethkey.EIP55Address("0x2be990eE17832b59E0086534c5ea2459Aa75E38F")
-	v2PlusCoordinator := ethkey.EIP55Address("0x92B5e28Ac583812874e4271380c7d070C5FB6E6b")
-	fromAddresses := []ethkey.EIP55Address{("0x469aA2CD13e037DC5236320783dCfd0e641c0559")}
+	v2PlusCoordinator := types.EIP55Address("0x92B5e28Ac583812874e4271380c7d070C5FB6E6b")
+	fromAddresses := []types.EIP55Address{("0x469aA2CD13e037DC5236320783dCfd0e641c0559")}
 
 	var tests = []struct {
 		name      string
@@ -27,8 +25,6 @@ func TestValidate(t *testing.T) {
 			toml: `
 type = "blockheaderfeeder"
 name = "valid-test"
-coordinatorV1Address = "0x1F72B4A5DCf7CC6d2E38423bF2f4BFA7db97d139"
-coordinatorV2Address = "0x2be990eE17832b59E0086534c5ea2459Aa75E38F"
 coordinatorV2PlusAddress = "0x92B5e28Ac583812874e4271380c7d070C5FB6E6b"
 lookbackBlocks = 2000
 waitBlocks = 500
@@ -45,21 +41,19 @@ storeBlockhashesBatchSize = 10
 				require.NoError(t, err)
 				require.Equal(t, job.BlockHeaderFeeder, os.Type)
 				require.Equal(t, "valid-test", os.Name.String)
-				require.Equal(t, &v1Coordinator,
-					os.BlockHeaderFeederSpec.CoordinatorV1Address)
-				require.Equal(t, &v2Coordinator,
-					os.BlockHeaderFeederSpec.CoordinatorV2Address)
+				require.Nil(t, os.BlockHeaderFeederSpec.CoordinatorV1Address)
+				require.Nil(t, os.BlockHeaderFeederSpec.CoordinatorV2Address)
 				require.Equal(t, &v2PlusCoordinator,
 					os.BlockHeaderFeederSpec.CoordinatorV2PlusAddress)
 				require.Equal(t, int32(2000), os.BlockHeaderFeederSpec.LookbackBlocks)
 				require.Equal(t, int32(500), os.BlockHeaderFeederSpec.WaitBlocks)
-				require.Equal(t, ethkey.EIP55Address("0x3e20Cef636EdA7ba135bCbA4fe6177Bd3cE0aB17"),
+				require.Equal(t, types.EIP55Address("0x3e20Cef636EdA7ba135bCbA4fe6177Bd3cE0aB17"),
 					os.BlockHeaderFeederSpec.BlockhashStoreAddress)
-				require.Equal(t, ethkey.EIP55Address("0xD04E5b2ea4e55AEbe6f7522bc2A69Ec6639bfc63"),
+				require.Equal(t, types.EIP55Address("0xD04E5b2ea4e55AEbe6f7522bc2A69Ec6639bfc63"),
 					os.BlockHeaderFeederSpec.BatchBlockhashStoreAddress)
 				require.Equal(t, 23*time.Second, os.BlockHeaderFeederSpec.PollPeriod)
 				require.Equal(t, 7*time.Second, os.BlockHeaderFeederSpec.RunTimeout)
-				require.Equal(t, big.NewI(4), os.BlockHeaderFeederSpec.EVMChainID)
+				require.Equal(t, sqlutil.NewI(4), os.BlockHeaderFeederSpec.EVMChainID)
 				require.Equal(t, fromAddresses,
 					os.BlockHeaderFeederSpec.FromAddresses)
 				require.Equal(t, uint16(20),
@@ -74,8 +68,7 @@ storeBlockhashesBatchSize = 10
 type = "blockheaderfeeder"
 name = "defaults-test"
 evmChainID = "4"
-coordinatorV1Address = "0x1F72B4A5DCf7CC6d2E38423bF2f4BFA7db97d139"
-coordinatorV2Address = "0x2be990eE17832b59E0086534c5ea2459Aa75E38F"
+coordinatorV2PlusAddress = "0x92B5e28Ac583812874e4271380c7d070C5FB6E6b"
 blockhashStoreAddress = "0x3e20Cef636EdA7ba135bCbA4fe6177Bd3cE0aB17"
 batchBlockhashStoreAddress = "0xD04E5b2ea4e55AEbe6f7522bc2A69Ec6639bfc63"
 fromAddresses = ["0x469aA2CD13e037DC5236320783dCfd0e641c0559"]
@@ -86,7 +79,7 @@ fromAddresses = ["0x469aA2CD13e037DC5236320783dCfd0e641c0559"]
 				require.Equal(t, int32(256), os.BlockHeaderFeederSpec.WaitBlocks)
 				require.Equal(t, 15*time.Second, os.BlockHeaderFeederSpec.PollPeriod)
 				require.Equal(t, 30*time.Second, os.BlockHeaderFeederSpec.RunTimeout)
-				require.Equal(t, big.NewI(4), os.BlockHeaderFeederSpec.EVMChainID)
+				require.Equal(t, sqlutil.NewI(4), os.BlockHeaderFeederSpec.EVMChainID)
 				require.Equal(t, fromAddresses,
 					os.BlockHeaderFeederSpec.FromAddresses)
 				require.Equal(t, uint16(100),
@@ -116,6 +109,27 @@ storeBlockhashesBatchSize = 10
 			},
 		},
 		{
+			name: "v2 coordinator not supported",
+			toml: `
+type = "blockheaderfeeder"
+name = "v2 coordinator not supported"
+lookbackBlocks = 2000
+waitBlocks = 500
+coordinatorV2Address = "0x2be990eE17832b59E0086534c5ea2459Aa75E38F"
+blockhashStoreAddress = "0x3e20Cef636EdA7ba135bCbA4fe6177Bd3cE0aB17"
+batchBlockhashStoreAddress = "0xD04E5b2ea4e55AEbe6f7522bc2A69Ec6639bfc63"
+pollPeriod = "23s"
+runTimeout = "7s"
+evmChainID = "4"
+fromAddresses = ["0x469aA2CD13e037DC5236320783dCfd0e641c0559"]
+getBlockhashesBatchSize = 20
+storeBlockhashesBatchSize = 10
+`,
+			assertion: func(t *testing.T, os job.Job, err error) {
+				require.Equal(t, `coordinatorV2Address is no longer supported; use coordinatorV2PlusAddress`, err.Error())
+			},
+		},
+		{
 			name: "missing-coordinators",
 			toml: `
 type = "blockheaderfeeder"
@@ -132,7 +146,7 @@ getBlockhashesBatchSize = 20
 storeBlockhashesBatchSize = 10
 `,
 			assertion: func(t *testing.T, os job.Job, err error) {
-				require.Equal(t, err.Error(), `at least one of "coordinatorV1Address", "coordinatorV2Address" and "coordinatorV2PlusAddress" must be set`)
+				require.Equal(t, `"coordinatorV2PlusAddress" must be set`, err.Error())
 			},
 		},
 		{
@@ -142,7 +156,7 @@ type = "blockheaderfeeder"
 name = "missing blockhash store address"
 lookbackBlocks = 2000
 waitBlocks = 500
-coordinatorV1Address = "0x1F72B4A5DCf7CC6d2E38423bF2f4BFA7db97d139"
+coordinatorV2PlusAddress = "0x92B5e28Ac583812874e4271380c7d070C5FB6E6b"
 batchBlockhashStoreAddress = "0xD04E5b2ea4e55AEbe6f7522bc2A69Ec6639bfc63"
 pollPeriod = "23s"
 runTimeout = "7s"
@@ -152,7 +166,7 @@ getBlockhashesBatchSize = 20
 storeBlockhashesBatchSize = 10
 `,
 			assertion: func(t *testing.T, os job.Job, err error) {
-				require.Equal(t, err.Error(), `"blockhashStoreAddress" must be set`)
+				require.Equal(t, `"blockhashStoreAddress" must be set`, err.Error())
 			},
 		},
 		{
@@ -162,7 +176,7 @@ type = "blockheaderfeeder"
 name = "missing batch blockhash store address"
 lookbackBlocks = 2000
 waitBlocks = 500
-coordinatorV1Address = "0x1F72B4A5DCf7CC6d2E38423bF2f4BFA7db97d139"
+coordinatorV2PlusAddress = "0x92B5e28Ac583812874e4271380c7d070C5FB6E6b"
 blockhashStoreAddress = "0xD04E5b2ea4e55AEbe6f7522bc2A69Ec6639bfc63"
 pollPeriod = "23s"
 runTimeout = "7s"
@@ -172,7 +186,7 @@ getBlockhashesBatchSize = 20
 storeBlockhashesBatchSize = 10
 `,
 			assertion: func(t *testing.T, os job.Job, err error) {
-				require.Equal(t, err.Error(), `"batchBlockhashStoreAddress" must be set`)
+				require.Equal(t, `"batchBlockhashStoreAddress" must be set`, err.Error())
 			},
 		},
 		{
@@ -182,7 +196,7 @@ type = "blockheaderfeeder"
 name = "missing evmChainID"
 lookbackBlocks = 2000
 waitBlocks = 500
-coordinatorV1Address = "0x1F72B4A5DCf7CC6d2E38423bF2f4BFA7db97d139"
+coordinatorV2PlusAddress = "0x92B5e28Ac583812874e4271380c7d070C5FB6E6b"
 blockhashStoreAddress = "0xD04E5b2ea4e55AEbe6f7522bc2A69Ec6639bfc63"
 batchBlockhashStoreAddress = "0xD04E5b2ea4e55AEbe6f7522bc2A69Ec6639bfc63"
 pollPeriod = "23s"
@@ -192,7 +206,7 @@ getBlockhashesBatchSize = 20
 storeBlockhashesBatchSize = 10
 `,
 			assertion: func(t *testing.T, os job.Job, err error) {
-				require.Equal(t, err.Error(), `"evmChainID" must be set`)
+				require.Equal(t, `"evmChainID" must be set`, err.Error())
 			},
 		},
 		{
@@ -202,7 +216,7 @@ type = "blockheaderfeeder"
 name = "wait block lower than 256 blocks"
 lookbackBlocks = 2000
 waitBlocks = 255
-coordinatorV1Address = "0x1F72B4A5DCf7CC6d2E38423bF2f4BFA7db97d139"
+coordinatorV2PlusAddress = "0x92B5e28Ac583812874e4271380c7d070C5FB6E6b"
 blockhashStoreAddress = "0xD04E5b2ea4e55AEbe6f7522bc2A69Ec6639bfc63"
 batchBlockhashStoreAddress = "0xD04E5b2ea4e55AEbe6f7522bc2A69Ec6639bfc63"
 pollPeriod = "23s"
@@ -213,7 +227,7 @@ getBlockhashesBatchSize = 20
 storeBlockhashesBatchSize = 10
 `,
 			assertion: func(t *testing.T, os job.Job, err error) {
-				require.Equal(t, err.Error(), `"waitBlocks" must be greater than or equal to 256`)
+				require.Equal(t, `"waitBlocks" must be greater than or equal to 256`, err.Error())
 			},
 		},
 		{
@@ -223,7 +237,7 @@ type = "blockheaderfeeder"
 name = "lookback block lower than 256 blocks"
 lookbackBlocks = 255
 waitBlocks = 256
-coordinatorV1Address = "0x1F72B4A5DCf7CC6d2E38423bF2f4BFA7db97d139"
+coordinatorV2PlusAddress = "0x92B5e28Ac583812874e4271380c7d070C5FB6E6b"
 blockhashStoreAddress = "0xD04E5b2ea4e55AEbe6f7522bc2A69Ec6639bfc63"
 batchBlockhashStoreAddress = "0xD04E5b2ea4e55AEbe6f7522bc2A69Ec6639bfc63"
 pollPeriod = "23s"
@@ -234,7 +248,7 @@ getBlockhashesBatchSize = 20
 storeBlockhashesBatchSize = 10
 `,
 			assertion: func(t *testing.T, os job.Job, err error) {
-				require.Equal(t, err.Error(), `"lookbackBlocks" must be greater than 256`)
+				require.Equal(t, `"lookbackBlocks" must be greater than 256`, err.Error())
 			},
 		},
 		{
@@ -244,7 +258,7 @@ type = "blockheaderfeeder"
 name = "lookback blocks lower than wait blocks"
 lookbackBlocks = 300
 waitBlocks = 500
-coordinatorV1Address = "0x1F72B4A5DCf7CC6d2E38423bF2f4BFA7db97d139"
+coordinatorV2PlusAddress = "0x92B5e28Ac583812874e4271380c7d070C5FB6E6b"
 blockhashStoreAddress = "0xD04E5b2ea4e55AEbe6f7522bc2A69Ec6639bfc63"
 batchBlockhashStoreAddress = "0xD04E5b2ea4e55AEbe6f7522bc2A69Ec6639bfc63"
 pollPeriod = "23s"
@@ -255,7 +269,7 @@ getBlockhashesBatchSize = 20
 storeBlockhashesBatchSize = 10
 `,
 			assertion: func(t *testing.T, os job.Job, err error) {
-				require.Equal(t, err.Error(), `"lookbackBlocks" must be greater than "waitBlocks"`)
+				require.Equal(t, `"lookbackBlocks" must be greater than "waitBlocks"`, err.Error())
 			},
 		},
 	}

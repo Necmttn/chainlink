@@ -3,6 +3,8 @@ package pipeline_test
 import (
 	"fmt"
 	"math"
+	"reflect"
+	"strconv"
 	"testing"
 
 	"github.com/pkg/errors"
@@ -10,7 +12,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
+	bridgesMocks "github.com/smartcontractkit/chainlink/v2/core/bridges/mocks"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 )
@@ -20,7 +24,7 @@ func TestDivideTask_Happy(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		input     interface{}
+		input     any
 		divisor   string
 		precision string
 		expected  *decimal.Decimal
@@ -97,7 +101,7 @@ func TestDivideTask_Happy(t *testing.T) {
 					Divisor:   test.divisor,
 					Precision: test.precision,
 				}
-				assertOK(task.Run(testutils.Context(t), logger.TestLogger(t), vars, []pipeline.Result{{Value: test.input}}))
+				assertOK(task.Run(t.Context(), logger.TestLogger(t), vars, []pipeline.Result{{Value: test.input}}))
 			})
 			t.Run("without vars through input param", func(t *testing.T) {
 				vars := pipeline.NewVarsFrom(nil)
@@ -107,13 +111,13 @@ func TestDivideTask_Happy(t *testing.T) {
 					Divisor:   test.divisor,
 					Precision: test.precision,
 				}
-				assertOK(task.Run(testutils.Context(t), logger.TestLogger(t), vars, []pipeline.Result{}))
+				assertOK(task.Run(t.Context(), logger.TestLogger(t), vars, []pipeline.Result{}))
 			})
 			t.Run("with vars", func(t *testing.T) {
-				vars := pipeline.NewVarsFrom(map[string]interface{}{
-					"foo":    map[string]interface{}{"bar": test.input},
-					"chain":  map[string]interface{}{"link": test.divisor},
-					"sergey": map[string]interface{}{"steve": test.precision},
+				vars := pipeline.NewVarsFrom(map[string]any{
+					"foo":    map[string]any{"bar": test.input},
+					"chain":  map[string]any{"link": test.divisor},
+					"sergey": map[string]any{"steve": test.precision},
 				})
 				task := pipeline.DivideTask{
 					BaseTask:  pipeline.NewBaseTask(0, "task", nil, nil, 0),
@@ -121,7 +125,7 @@ func TestDivideTask_Happy(t *testing.T) {
 					Divisor:   "$(chain.link)",
 					Precision: "$(sergey.steve)",
 				}
-				assertOK(task.Run(testutils.Context(t), logger.TestLogger(t), vars, []pipeline.Result{}))
+				assertOK(task.Run(t.Context(), logger.TestLogger(t), vars, []pipeline.Result{}))
 			})
 		})
 	}
@@ -139,10 +143,10 @@ func TestDivideTask_Unhappy(t *testing.T) {
 		wantErrorCause    error
 		wantErrorContains string
 	}{
-		{"map as input from inputs", "100", "", []pipeline.Result{{Value: map[string]interface{}{"chain": "link"}}}, pipeline.NewVarsFrom(nil), pipeline.ErrBadInput, "input"},
-		{"map as input from var", "100", "$(foo)", nil, pipeline.NewVarsFrom(map[string]interface{}{"foo": map[string]interface{}{"chain": "link"}}), pipeline.ErrBadInput, "input"},
-		{"slice as input from inputs", "100", "", []pipeline.Result{{Value: []interface{}{"chain", "link"}}}, pipeline.NewVarsFrom(nil), pipeline.ErrBadInput, "input"},
-		{"slice as input from var", "100", "$(foo)", nil, pipeline.NewVarsFrom(map[string]interface{}{"foo": []interface{}{"chain", "link"}}), pipeline.ErrBadInput, "input"},
+		{"map as input from inputs", "100", "", []pipeline.Result{{Value: map[string]any{"chain": "link"}}}, pipeline.NewVarsFrom(nil), pipeline.ErrBadInput, "input"},
+		{"map as input from var", "100", "$(foo)", nil, pipeline.NewVarsFrom(map[string]any{"foo": map[string]any{"chain": "link"}}), pipeline.ErrBadInput, "input"},
+		{"slice as input from inputs", "100", "", []pipeline.Result{{Value: []any{"chain", "link"}}}, pipeline.NewVarsFrom(nil), pipeline.ErrBadInput, "input"},
+		{"slice as input from var", "100", "$(foo)", nil, pipeline.NewVarsFrom(map[string]any{"foo": []any{"chain", "link"}}), pipeline.ErrBadInput, "input"},
 		{"input as missing var", "100", "$(foo)", nil, pipeline.NewVarsFrom(nil), pipeline.ErrKeypathNotFound, "input"},
 		{"divisor as missing var", "$(foo)", "", []pipeline.Result{{Value: "123"}}, pipeline.NewVarsFrom(nil), pipeline.ErrKeypathNotFound, "divisor"},
 		{"errored inputs", "1000", "", []pipeline.Result{{Error: errors.New("uh oh")}}, pipeline.NewVarsFrom(nil), pipeline.ErrTooManyErrors, "task inputs"},
@@ -157,12 +161,12 @@ func TestDivideTask_Unhappy(t *testing.T) {
 				Input:    test.input,
 				Divisor:  test.divisor,
 			}
-			result, runInfo := task.Run(testutils.Context(t), logger.TestLogger(t), test.vars, test.inputs)
+			result, runInfo := task.Run(t.Context(), logger.TestLogger(t), test.vars, test.inputs)
 			assert.False(t, runInfo.IsPending)
 			assert.False(t, runInfo.IsRetryable)
-			require.Equal(t, test.wantErrorCause, errors.Cause(result.Error))
+			require.ErrorIs(t, result.Error, test.wantErrorCause)
 			if test.wantErrorContains != "" {
-				require.Contains(t, result.Error.Error(), test.wantErrorContains)
+				require.ErrorContains(t, result.Error, test.wantErrorContains)
 			}
 		})
 	}
@@ -172,24 +176,59 @@ func TestDivideTask_Overflow(t *testing.T) {
 	t.Parallel()
 
 	d1, err := decimal.NewFromString("6.34e-01")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	d2, err := decimal.NewFromString("6.34e-10")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	task := pipeline.DivideTask{
 		BaseTask:  pipeline.NewBaseTask(0, "task", nil, nil, 0),
 		Input:     "$(a)",
 		Divisor:   "$(b)",
-		Precision: fmt.Sprintf("%d", math.MaxInt32),
+		Precision: strconv.Itoa(math.MaxInt32),
 	}
 
-	vars := pipeline.NewVarsFrom(map[string]interface{}{
+	vars := pipeline.NewVarsFrom(map[string]any{
 		"a": d1,
 		"b": d2,
 	})
 
-	result, runInfo := task.Run(testutils.Context(t), logger.TestLogger(t), vars, []pipeline.Result{{Value: "123"}})
+	result, runInfo := task.Run(t.Context(), logger.TestLogger(t), vars, []pipeline.Result{{Value: "123"}})
 	assert.False(t, runInfo.IsPending)
 	assert.False(t, runInfo.IsRetryable)
-	require.Equal(t, pipeline.ErrDivisionOverlow, errors.Cause(result.Error))
+	require.Equal(t, pipeline.ErrDivisionOverflow, errors.Cause(result.Error))
+}
+
+func TestDivide_Example(t *testing.T) {
+	t.Parallel()
+
+	dag := `
+ds1 [type=memo value=10000.1234];
+ds2 [type=memo value=100];
+
+div_by_ds2 [type=divide divisor="$(ds2)"];
+multiply [type=multiply times=10000 index=0];
+
+ds1 -> div_by_ds2 -> multiply;
+
+`
+
+	db := pgtest.NewSqlxDB(t)
+	cfg := configtest.NewTestGeneralConfig(t)
+	btORM := bridgesMocks.NewORM(t)
+	r, _ := newRunner(t, db, btORM, cfg)
+
+	spec := pipeline.Spec{DotDagSource: dag}
+	vars := pipeline.NewVarsFrom(nil)
+
+	_, trrs, err := r.ExecuteRun(t.Context(), spec, vars)
+
+	require.NoError(t, err)
+	require.Len(t, trrs, 4)
+
+	finalResult := trrs[3]
+
+	require.NoError(t, finalResult.Result.Error)
+	require.Equal(t, reflect.TypeFor[decimal.Decimal](), reflect.TypeOf(finalResult.Result.Value))
+
+	assert.Equal(t, "1000012.34", finalResult.Result.Value.(decimal.Decimal).String())
 }

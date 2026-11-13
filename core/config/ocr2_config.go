@@ -17,8 +17,10 @@ type OCR2 interface {
 	KeyBundleID() (string, error)
 	// OCR2 config, cannot override in jobs
 	TraceLogging() bool
+	SampleTelemetry() bool
 	CaptureEATelemetry() bool
 	DefaultTransactionQueueDepth() uint32
 	SimulateTransactions() bool
-	CaptureAutomationCustomTelemetry() bool
+	AllowNoBootstrappers() bool
+	KeyValueStoreRootDir() string
 }

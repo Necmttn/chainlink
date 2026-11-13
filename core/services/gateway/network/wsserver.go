@@ -10,12 +10,12 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink-common/pkg/services"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/limits"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 )
 
-//go:generate mockery --quiet --name WebSocketServer --output ./mocks/ --case=underscore
 type WebSocketServer interface {
 	job.ServiceCtx
 
@@ -26,6 +26,29 @@ type WebSocketServer interface {
 type WebSocketServerConfig struct {
 	HTTPServerConfig
 	HandshakeTimeoutMillis uint32
+}
+
+const (
+	defaultRWTimeoutMillis = 10_000
+	defaultMsgSizeBytes    = 1_000_000
+)
+
+func (c *WebSocketServerConfig) applyDefaults() {
+	if c.ReadTimeoutMillis == 0 {
+		c.ReadTimeoutMillis = defaultRWTimeoutMillis
+	}
+	if c.WriteTimeoutMillis == 0 {
+		c.WriteTimeoutMillis = defaultRWTimeoutMillis
+	}
+	if c.RequestTimeoutMillis == 0 {
+		c.RequestTimeoutMillis = defaultRWTimeoutMillis
+	}
+	if c.MaxRequestBytes == 0 {
+		c.MaxRequestBytes = defaultMsgSizeBytes
+	}
+	if c.HandshakeTimeoutMillis == 0 {
+		c.HandshakeTimeoutMillis = defaultRWTimeoutMillis
+	}
 }
 
 type webSocketServer struct {
@@ -40,7 +63,14 @@ type webSocketServer struct {
 	lggr              logger.Logger
 }
 
-func NewWebSocketServer(config *WebSocketServerConfig, acceptor ConnectionAcceptor, lggr logger.Logger) WebSocketServer {
+func NewWebSocketServer(config *WebSocketServerConfig, acceptor ConnectionAcceptor, lggr logger.Logger, lf limits.Factory) (WebSocketServer, error) {
+	config.applyDefaults()
+	if config.Path == HealthCheckPath {
+		return nil, fmt.Errorf("WebSocket request path %q conflicts with health check path", config.Path)
+	}
+	if err := config.ensureLimiters(lf); err != nil {
+		return nil, err
+	}
 	baseCtx, cancelBaseCtx := context.WithCancel(context.Background())
 	upgrader := &websocket.Upgrader{
 		HandshakeTimeout: time.Duration(config.HandshakeTimeoutMillis) * time.Millisecond,
@@ -51,9 +81,10 @@ func NewWebSocketServer(config *WebSocketServerConfig, acceptor ConnectionAccept
 		upgrader:          upgrader,
 		doneCh:            make(chan struct{}),
 		cancelBaseContext: cancelBaseCtx,
-		lggr:              lggr.Named("WebSocketServer"),
+		lggr:              logger.Named(lggr, "WebSocketServer"),
 	}
 	mux := http.NewServeMux()
+	mux.Handle(HealthCheckPath, http.HandlerFunc(server.handleHealthCheck))
 	mux.Handle(config.Path, http.HandlerFunc(server.handleRequest))
 	server.server = &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", config.Host, config.Port),
@@ -63,7 +94,14 @@ func NewWebSocketServer(config *WebSocketServerConfig, acceptor ConnectionAccept
 		ReadHeaderTimeout: time.Duration(config.ReadTimeoutMillis) * time.Millisecond,
 		WriteTimeout:      time.Duration(config.WriteTimeoutMillis) * time.Millisecond,
 	}
-	return server
+	return server, nil
+}
+
+func (s *webSocketServer) handleHealthCheck(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write([]byte(HealthCheckResponse)); err != nil {
+		s.lggr.Debugw("error writing health response", "err", err)
+	}
 }
 
 func (s *webSocketServer) GetPort() int {
@@ -73,19 +111,19 @@ func (s *webSocketServer) GetPort() int {
 func (s *webSocketServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get(WsServerHandshakeAuthHeaderName)
 	if len(authHeader) > HandshakeEncodedAuthHeaderMaxLen {
-		s.lggr.Errorw("received auth header is too large", "len", len(authHeader))
+		s.lggr.Debugw("received auth header is too large", "len", len(authHeader))
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 	authBytes, err := base64.StdEncoding.DecodeString(authHeader)
 	if err != nil {
-		s.lggr.Error("received auth header can't be base64-decoded", err)
+		s.lggr.Debugw("received auth header can't be base64-decoded", "err", err)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	attemptId, challenge, err := s.acceptor.StartHandshake(authBytes)
+	attemptID, challenge, err := s.acceptor.StartHandshake(authBytes)
 	if err != nil {
-		s.lggr.Error("received invalid auth header", err)
+		s.lggr.Debugw("received invalid auth header", "err", err)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
@@ -95,24 +133,33 @@ func (s *webSocketServer) handleRequest(w http.ResponseWriter, r *http.Request) 
 	hdr.Add(WsServerHandshakeChallengeHeaderName, challengeStr)
 	conn, err := s.upgrader.Upgrade(w, r, hdr)
 	if err != nil {
-		s.lggr.Error("failed websocket upgrade", err)
-		conn.Close()
-		s.acceptor.AbortHandshake(attemptId)
+		s.lggr.Errorw("failed websocket upgrade", "err", err)
+		if conn != nil {
+			conn.Close()
+		}
+		s.acceptor.AbortHandshake(attemptID)
 		return
 	}
 
+	maxRequestBytes, err := s.config.MaxRequestBytesLimiter.Limit(r.Context())
+	if err != nil {
+		s.lggr.Errorw("failed to get request size limit", "err", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	conn.SetReadLimit(int64(maxRequestBytes))
 	msgType, response, err := conn.ReadMessage()
 	if err != nil || msgType != websocket.BinaryMessage {
-		s.lggr.Error("invalid handshake message", msgType, err)
+		s.lggr.Errorw("invalid handshake message", "msgType", msgType, "err", err, "remoteAddr", conn.RemoteAddr())
 		conn.Close()
-		s.acceptor.AbortHandshake(attemptId)
+		s.acceptor.AbortHandshake(attemptID)
 		return
 	}
 
-	if err = s.acceptor.FinalizeHandshake(attemptId, response, conn); err != nil {
-		s.lggr.Error("unable to finalize handshake", err)
+	if err = s.acceptor.FinalizeHandshake(attemptID, response, conn); err != nil {
+		s.lggr.Errorw("unable to finalize handshake", "err", err)
 		conn.Close()
-		s.acceptor.AbortHandshake(attemptId)
+		s.acceptor.AbortHandshake(attemptID)
 		return
 	}
 }
@@ -120,7 +167,7 @@ func (s *webSocketServer) handleRequest(w http.ResponseWriter, r *http.Request) 
 func (s *webSocketServer) Start(ctx context.Context) error {
 	return s.StartOnce("GatewayWebSocketServer", func() error {
 		s.lggr.Info("starting gateway WebSocket server")
-		return s.runServer()
+		return s.runServer(ctx)
 	})
 }
 
@@ -130,29 +177,31 @@ func (s *webSocketServer) Close() error {
 		s.cancelBaseContext()
 		err = s.server.Shutdown(context.Background())
 		<-s.doneCh
-		return
+		return err
 	})
 }
 
-func (s *webSocketServer) runServer() (err error) {
-	s.listener, err = net.Listen("tcp", s.server.Addr)
+func (s *webSocketServer) runServer(ctx context.Context) error {
+	var lc net.ListenConfig
+	listener, err := lc.Listen(ctx, "tcp", s.server.Addr)
 	if err != nil {
-		return
+		return err
 	}
+	s.listener = listener
 	tlsEnabled := s.config.TLSEnabled
 	go func() {
 		if tlsEnabled {
-			err := s.server.ServeTLS(s.listener, s.config.TLSCertPath, s.config.TLSKeyPath)
-			if err != http.ErrServerClosed {
-				s.lggr.Error("gateway WS server closed with error:", err)
+			serveErr := s.server.ServeTLS(s.listener, s.config.TLSCertPath, s.config.TLSKeyPath)
+			if serveErr != http.ErrServerClosed {
+				s.lggr.Error("gateway WS server closed with error:", serveErr)
 			}
 		} else {
-			err := s.server.Serve(s.listener)
-			if err != http.ErrServerClosed {
-				s.lggr.Error("gateway WS server closed with error:", err)
+			serveErr := s.server.Serve(s.listener)
+			if serveErr != http.ErrServerClosed {
+				s.lggr.Error("gateway WS server closed with error:", serveErr)
 			}
 		}
 		s.doneCh <- struct{}{}
 	}()
-	return
+	return nil
 }

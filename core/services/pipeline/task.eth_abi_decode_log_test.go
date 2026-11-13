@@ -10,8 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
+	"github.com/smartcontractkit/chainlink-evm/pkg/utils"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 )
@@ -24,7 +23,7 @@ func TestETHABIDecodeLogTask(t *testing.T) {
 		topics                string
 		vars                  pipeline.Vars
 		inputs                []pipeline.Result
-		expected              map[string]interface{}
+		expected              map[string]any
 		expectedErrorCause    error
 		expectedErrorContains string
 	}{
@@ -33,8 +32,8 @@ func TestETHABIDecodeLogTask(t *testing.T) {
 			"NewRound(uint256 indexed roundId, address indexed startedBy, uint256 startedAt)",
 			`$(foo.data)`,
 			`$(foo.topics)`,
-			pipeline.NewVarsFrom(map[string]interface{}{
-				"foo": map[string]interface{}{
+			pipeline.NewVarsFrom(map[string]any{
+				"foo": map[string]any{
 					"address": common.HexToAddress("0x2fCeA879fDC9FE5e90394faf0CA644a1749d0ad6"),
 					"data":    hexutil.MustDecode("0x000000000000000000000000000000000000000000000000000000000000000f"),
 					"topics": []common.Hash{
@@ -45,7 +44,7 @@ func TestETHABIDecodeLogTask(t *testing.T) {
 				},
 			}),
 			nil,
-			map[string]interface{}{
+			map[string]any{
 				"roundId":   big.NewInt(9),
 				"startedBy": common.HexToAddress("0xf17f52151ebef6c7334fad080c5704d77216b732"),
 				"startedAt": big.NewInt(15),
@@ -58,8 +57,8 @@ func TestETHABIDecodeLogTask(t *testing.T) {
 			"OracleRequest(bytes32 indexed specId, address requester, bytes32 requestId, uint256 payment, address callbackAddr, bytes4 callbackFunctionId, uint256 cancelExpiration, uint256 dataVersion, bytes data)",
 			`$(foo.data)`,
 			`$(foo.topics)`,
-			pipeline.NewVarsFrom(map[string]interface{}{
-				"foo": map[string]interface{}{
+			pipeline.NewVarsFrom(map[string]any{
+				"foo": map[string]any{
 					"address": common.HexToAddress("0x2fCeA879fDC9FE5e90394faf0CA644a1749d0ad6"),
 					"data":    hexutil.MustDecode("0x000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeefdeadbeef74686520726571756573742069640000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020a6e000000000000000000000000cafebabecafebabecafebabecafebabecafebabe61736466000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003039000000000000000000000000000000000000000000000000000000000000d431000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000147374657665746f7368692073657267616d6f746f000000000000000000000000"),
 					"topics": []common.Hash{
@@ -69,7 +68,7 @@ func TestETHABIDecodeLogTask(t *testing.T) {
 				},
 			}),
 			nil,
-			map[string]interface{}{
+			map[string]any{
 				"specId":             utils.Bytes32FromString("the job id"),
 				"requester":          common.HexToAddress("0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF"),
 				"requestId":          utils.Bytes32FromString("the request id"),
@@ -88,8 +87,8 @@ func TestETHABIDecodeLogTask(t *testing.T) {
 			"AuthorizedSendersChanged(address[] senders)",
 			`$(foo.data)`,
 			`$(foo.topics)`,
-			pipeline.NewVarsFrom(map[string]interface{}{
-				"foo": map[string]interface{}{
+			pipeline.NewVarsFrom(map[string]any{
+				"foo": map[string]any{
 					"address": common.HexToAddress("0x2fCeA879fDC9FE5e90394faf0CA644a1749d0ad6"),
 					"data":    hexutil.MustDecode("0x00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000002000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeefdeadbeef000000000000000000000000cafebabecafebabecafebabecafebabecafebabe"),
 					"topics": []common.Hash{
@@ -98,7 +97,7 @@ func TestETHABIDecodeLogTask(t *testing.T) {
 				},
 			}),
 			nil,
-			map[string]interface{}{
+			map[string]any{
 				"senders": []common.Address{
 					common.HexToAddress("0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF"),
 					common.HexToAddress("0xCafEBAbECAFEbAbEcaFEbabECAfebAbEcAFEBaBe"),
@@ -113,8 +112,8 @@ func TestETHABIDecodeLogTask(t *testing.T) {
 			"SomeEvent(bytes32)",
 			`$(foo.data)`,
 			`$(foo.topics)`,
-			pipeline.NewVarsFrom(map[string]interface{}{
-				"foo": map[string]interface{}{
+			pipeline.NewVarsFrom(map[string]any{
+				"foo": map[string]any{
 					"address": common.HexToAddress("0x2fCeA879fDC9FE5e90394faf0CA644a1749d0ad6"),
 					"data":    hexutil.MustDecode("0x000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeefdeadbeef74686520726571756573742069640000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020a6e000000000000000000000000cafebabecafebabecafebabecafebabecafebabe61736466000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003039000000000000000000000000000000000000000000000000000000000000d431000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000147374657665746f7368692073657267616d6f746f000000000000000000000000"),
 					"topics": []common.Hash{
@@ -132,8 +131,8 @@ func TestETHABIDecodeLogTask(t *testing.T) {
 			"SomeEvent(bytes32 indexed)",
 			`$(foo.data)`,
 			`$(foo.topics)`,
-			pipeline.NewVarsFrom(map[string]interface{}{
-				"foo": map[string]interface{}{
+			pipeline.NewVarsFrom(map[string]any{
+				"foo": map[string]any{
 					"address": common.HexToAddress("0x2fCeA879fDC9FE5e90394faf0CA644a1749d0ad6"),
 					"data":    hexutil.MustDecode("0x000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeefdeadbeef74686520726571756573742069640000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020a6e000000000000000000000000cafebabecafebabecafebabecafebabecafebabe61736466000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003039000000000000000000000000000000000000000000000000000000000000d431000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000147374657665746f7368692073657267616d6f746f000000000000000000000000"),
 					"topics": []common.Hash{
@@ -151,8 +150,8 @@ func TestETHABIDecodeLogTask(t *testing.T) {
 			"OracleRequest(bytes32 indexed specId, address requester, bytes32 requestId, uint256 payment, address callbackAddr, bytes4 callbackFunctionId, uint256 cancelExpiration, uint256 dataVersion, bytes data)",
 			`$(foo.data)`,
 			`$(foo.topics)`,
-			pipeline.NewVarsFrom(map[string]interface{}{
-				"foo": map[string]interface{}{
+			pipeline.NewVarsFrom(map[string]any{
+				"foo": map[string]any{
 					"address": common.HexToAddress("0x2fCeA879fDC9FE5e90394faf0CA644a1749d0ad6"),
 					"data":    hexutil.MustDecode("0x000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeefdeadbeef74686520726571756573742069640000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020a6e000000000000000000000000cafebabecafebabecafebabecafebabecafebabe61736466000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003039000000000000000000000000000000000000000000000000000000000000d431000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000147374657665746f7368692073657267616d6f746f000000000000000000000000"),
 					"topics": []common.Hash{
@@ -170,8 +169,8 @@ func TestETHABIDecodeLogTask(t *testing.T) {
 			"OracleRequest(bytes32 indexed specId, address requester, bytes32 requestId, uint256 payment, address callbackAddr, bytes4 callbackFunctionId, uint256 cancelExpiration, uint256 dataVersion, bytes data)",
 			`$(foo.data)`,
 			`$(foo.topics)`,
-			pipeline.NewVarsFrom(map[string]interface{}{
-				"foo": map[string]interface{}{
+			pipeline.NewVarsFrom(map[string]any{
+				"foo": map[string]any{
 					"address": common.HexToAddress("0x2fCeA879fDC9FE5e90394faf0CA644a1749d0ad6"),
 					"data":    hexutil.MustDecode("0x000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeefdeadbeef74686520726571756573742069640000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020a6e000000000000000000000000cafebabecafebabecafebabecafebabecafebabe61736466000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003039000000000000000000000000000000000000000000000000000000000000d4310000000000000000000000000000000000000000000000000000"),
 					"topics": []common.Hash{
@@ -190,8 +189,8 @@ func TestETHABIDecodeLogTask(t *testing.T) {
 			"OracleRequest(bytes32 indexed specId, address requester, bytes32 requestId, uint256 foobar)",
 			`$(foo.data)`,
 			`$(foo.topics)`,
-			pipeline.NewVarsFrom(map[string]interface{}{
-				"foo": map[string]interface{}{
+			pipeline.NewVarsFrom(map[string]any{
+				"foo": map[string]any{
 					"address": common.HexToAddress("0x2fCeA879fDC9FE5e90394faf0CA644a1749d0ad6"),
 					"data":    hexutil.MustDecode("0x000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeefdeadbeef7468652072657175657374206964000000000000000000000000000000000000"),
 					"topics": []common.Hash{
@@ -210,8 +209,8 @@ func TestETHABIDecodeLogTask(t *testing.T) {
 			"NewRound(uint256 indexed roundId, address indexed startedBy, uint256 startedAt)",
 			`$(foo.data)`,
 			`$(foo.topics)`,
-			pipeline.NewVarsFrom(map[string]interface{}{
-				"foo": map[string]interface{}{
+			pipeline.NewVarsFrom(map[string]any{
+				"foo": map[string]any{
 					"address": common.HexToAddress("0x2fCeA879fDC9FE5e90394faf0CA644a1749d0ad6"),
 					"data":    hexutil.MustDecode("0x000000000000000000000000000000000000000000000000000000000000000f"),
 					"topics": []common.Hash{
@@ -229,7 +228,6 @@ func TestETHABIDecodeLogTask(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			task := pipeline.ETHABIDecodeLogTask{
 				BaseTask: pipeline.NewBaseTask(0, "decodelog", nil, nil, 0),
@@ -238,7 +236,7 @@ func TestETHABIDecodeLogTask(t *testing.T) {
 				Topics:   test.topics,
 			}
 
-			result, runInfo := task.Run(testutils.Context(t), logger.TestLogger(t), test.vars, test.inputs)
+			result, runInfo := task.Run(t.Context(), logger.TestLogger(t), test.vars, test.inputs)
 			assert.False(t, runInfo.IsPending)
 			assert.False(t, runInfo.IsRetryable)
 

@@ -3,13 +3,13 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/pkg/errors"
-	"go.uber.org/multierr"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 )
 
 // Return types:
@@ -37,7 +37,7 @@ func (t *ETHABIEncodeTask2) Run(_ context.Context, _ logger.Logger, vars Vars, i
 		inputValues MapParam
 		theABI      BytesParam
 	)
-	err = multierr.Combine(
+	err = stderrors.Join(
 		errors.Wrap(ResolveParam(&inputValues, From(VarExpr(t.Data, vars), JSONWithVarExprs(t.Data, vars, false), nil)), "data"),
 		errors.Wrap(ResolveParam(&theABI, From(NonemptyString(t.ABI))), "abi"),
 	)
@@ -53,7 +53,7 @@ func (t *ETHABIEncodeTask2) Run(_ context.Context, _ logger.Logger, vars Vars, i
 
 	method := abi.NewMethod(inputMethod.Name, inputMethod.Name, abi.Function, "", false, false, inputMethod.Inputs, nil)
 
-	var vals []interface{}
+	var vals []any
 	for _, arg := range method.Inputs {
 		if len(arg.Name) == 0 {
 			return Result{Error: errors.Wrapf(ErrBadInput, "ETHABIEncode: bad ABI specification, missing argument name")}, RunInfo{}
@@ -75,7 +75,8 @@ func (t *ETHABIEncodeTask2) Run(_ context.Context, _ logger.Logger, vars Vars, i
 	}
 	var dataBytes []byte
 	if method.Name != "" {
-		dataBytes = append(method.ID, argsEncoded...)
+		dataBytes = append(dataBytes, method.ID...)
+		dataBytes = append(dataBytes, argsEncoded...)
 	} else {
 		dataBytes = argsEncoded
 	}

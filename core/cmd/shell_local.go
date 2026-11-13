@@ -2,56 +2,56 @@ package cmd
 
 import (
 	"context"
-	crand "crypto/rand"
-	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"math"
 	"math/big"
 	"net/http"
-	"net/url"
 	"os"
-	"os/exec"
-	"path"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	gethCommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/fatih/color"
-	"github.com/lib/pq"
-
-	"github.com/kylelemons/godebug/diff"
-	"github.com/pkg/errors"
 	"github.com/urfave/cli"
-	"go.uber.org/multierr"
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/guregu/null.v4"
 
-	"github.com/jmoiron/sqlx"
+	chain_selectors "github.com/smartcontractkit/chain-selectors"
 
-	cutils "github.com/smartcontractkit/chainlink-common/pkg/utils"
+	"github.com/smartcontractkit/chainlink-ccv/cli/chainstatuses"
+	"github.com/smartcontractkit/chainlink-ccv/verifier/pkg/chainstatus"
+	commonkeystore "github.com/smartcontractkit/chainlink-common/keystore"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys"
+	"github.com/smartcontractkit/chainlink-common/pkg/beholder"
+	"github.com/smartcontractkit/chainlink-common/pkg/custmsg"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger/otelzap"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
+	"github.com/smartcontractkit/chainlink-evm/pkg/gas"
+	"github.com/smartcontractkit/chainlink-evm/pkg/keys"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr"
+	evmtypes "github.com/smartcontractkit/chainlink-evm/pkg/types"
 	"github.com/smartcontractkit/chainlink/v2/core/build"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/assets"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/gas"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/txmgr"
-	evmtypes "github.com/smartcontractkit/chainlink/v2/core/chains/evm/types"
-	ubig "github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/chaintype"
+	beholderServices "github.com/smartcontractkit/chainlink/v2/core/services/beholder"
+	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pg"
 	"github.com/smartcontractkit/chainlink/v2/core/sessions"
 	"github.com/smartcontractkit/chainlink/v2/core/shutdown"
 	"github.com/smartcontractkit/chainlink/v2/core/static"
-	"github.com/smartcontractkit/chainlink/v2/core/store/dialects"
+	"github.com/smartcontractkit/chainlink/v2/core/store"
 	"github.com/smartcontractkit/chainlink/v2/core/store/migrate"
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
 	"github.com/smartcontractkit/chainlink/v2/core/web"
 	webPresenters "github.com/smartcontractkit/chainlink/v2/core/web/presenters"
-	"github.com/smartcontractkit/chainlink/v2/internal/testdb"
 )
 
 var ErrProfileTooLong = errors.New("requested profile duration too large")
@@ -81,11 +81,15 @@ func initLocalSubCmds(s *Shell, safe bool) []cli.Command {
 			},
 			Usage:  "Run the Chainlink node",
 			Action: s.RunNode,
+			Before: s.BeforeNode,
+			After:  s.AfterNode,
 		},
 		{
 			Name:   "rebroadcast-transactions",
 			Usage:  "Manually rebroadcast txs matching nonce range with the specified gas price. This is useful in emergencies e.g. high gas prices and/or network congestion to forcibly clear out the pending TX queue",
 			Action: s.RebroadcastTransactions,
+			Before: s.BeforeNode,
+			After:  s.AfterNode,
 			Flags: []cli.Flag{
 				cli.Uint64Flag{
 					Name:  "beginningNonce, beginning-nonce, b",
@@ -144,6 +148,10 @@ func initLocalSubCmds(s *Shell, safe bool) []cli.Command {
 					Usage: "output directory of the captured profile",
 					Value: "/tmp/",
 				},
+				cli.StringSliceFlag{
+					Name:  "vitals, v",
+					Usage: "vitals to collect, can be specified multiple times. Options: 'allocs', 'block', 'cmdline', 'goroutine', 'heap', 'mutex', 'profile', 'threadcreate', 'trace'",
+				},
 			},
 			Hidden: true,
 			Before: func(_ *cli.Context) error {
@@ -172,6 +180,10 @@ func initLocalSubCmds(s *Shell, safe bool) []cli.Command {
 							Name:  "dangerWillRobinson",
 							Usage: "set to true to enable dropping non-test databases",
 						},
+						cli.BoolFlag{
+							Name:  "force",
+							Usage: "legacy flag (ignored for drop); reset uses DROP DATABASE ... WITH (FORCE) (PostgreSQL 13+)",
+						},
 					},
 				},
 				{
@@ -184,6 +196,10 @@ func initLocalSubCmds(s *Shell, safe bool) []cli.Command {
 						cli.BoolFlag{
 							Name:  "user-only",
 							Usage: "only include test user fixture",
+						},
+						cli.BoolFlag{
+							Name:  "force",
+							Usage: "legacy flag (ignored for drop); reset uses DROP DATABASE ... WITH (FORCE) (PostgreSQL 13+)",
 						},
 					},
 				},
@@ -253,11 +269,96 @@ func initLocalSubCmds(s *Shell, safe bool) []cli.Command {
 				},
 			},
 		},
+		{
+			Name:   "remove-blocks",
+			Usage:  "Deletes block range and all associated data",
+			Action: s.RemoveBlocks,
+			Before: s.BeforeNode,
+			After:  s.AfterNode,
+			Flags: []cli.Flag{
+				cli.IntFlag{
+					Name:     "start",
+					Usage:    "Beginning of block range to be deleted",
+					Required: true,
+				},
+				cli.Int64Flag{
+					Name:     "evm-chain-id",
+					Usage:    "Chain ID of the EVM-based blockchain",
+					Required: true,
+				},
+			},
+		},
+		initCCVCommand(s),
+	}
+}
+
+type ccvLoggerAdapter struct {
+	logger.Logger
+}
+
+func (a ccvLoggerAdapter) Errorw(msg string, keysAndValues ...any) {
+	a.Logger.Errorw(msg, keysAndValues...)
+}
+
+func initCCVCommand(s *Shell) cli.Command {
+	getDeps := func() chainstatuses.Deps {
+		adapter := ccvLoggerAdapter{Logger: s.Logger}
+		store := chainstatus.NewPostgresChainStatusStore(s.DS, adapter)
+		return chainstatuses.Deps{Logger: adapter, Store: store}
+	}
+	chainStatusesSub := cli.Command{
+		Name:   "chain-statuses",
+		Usage:  "List, enable, disable, or set finalized block height for CCV chain statuses. Shut down the node before enable/disable/set-finalized-height; changes take effect on next start.",
+		Before: s.BeforeNode,
+		After:  s.AfterNode,
+		Flags: []cli.Flag{
+			cli.StringFlag{
+				Name:  "password, p",
+				Usage: "text file holding the password for the node's account (for one-off runs when the node is not started)",
+			},
+		},
+		Subcommands: chainstatuses.InitCCVChainStatusesCommandsWithFactory(getDeps),
+	}
+	return cli.Command{
+		Name:        "ccv",
+		Usage:       "CCV (Cross-Chain Verification) commands",
+		Subcommands: []cli.Command{chainStatusesSub},
 	}
 }
 
 // ownerPermsMask are the file permission bits reserved for owner.
 const ownerPermsMask = os.FileMode(0o700)
+
+// beholderEmitter returns the shell's own beholder emitter when the client is
+// configured, falling back to the global one (resolved at emit time) otherwise.
+func (s *Shell) beholderEmitter() beholder.Emitter {
+	if s.BeholderClient != nil && s.BeholderClient.Emitter != nil {
+		return s.BeholderClient.Emitter
+	}
+	return beholder.GlobalEmitter()
+}
+
+// EmitNodeConfig emits the node configuration through beholder as a pb.BaseMessage
+func (s *Shell) EmitNodeConfig(ctx context.Context) {
+	cme := custmsg.NewLabelerWithEmitter(s.beholderEmitter())
+	labels := map[string]string{
+		"system":  "Application",
+		"version": static.Version,
+		"commit":  static.Sha,
+	}
+	emitter := cme.WithMapLabels(labels)
+
+	// Get the effective TOML configuration (with defaults applied)
+	_, effectiveTOML := s.Config.ConfigTOML()
+
+	// Emit the configuration as a message
+	err := emitter.Emit(ctx, effectiveTOML)
+	if err != nil {
+		s.Logger.Errorf("failed to emit node configuration through beholder: %v", err)
+	} else {
+		s.Logger.Debug("node configuration emitted through beholder")
+	}
+}
 
 // RunNode starts the Chainlink core.
 func (s *Shell) RunNode(c *cli.Context) error {
@@ -268,30 +369,20 @@ func (s *Shell) RunNode(c *cli.Context) error {
 }
 
 func (s *Shell) runNode(c *cli.Context) error {
+	ctx := s.ctx()
 	lggr := logger.Sugared(s.Logger.Named("RunNode"))
+	lggr.Infow("configuration args", "config files", s.configFiles, "secret files", s.secretsFiles)
 
-	var pwd, vrfpwd *string
-	if passwordFile := c.String("password"); passwordFile != "" {
-		p, err := utils.PasswordFromFile(passwordFile)
-		if err != nil {
-			return errors.Wrap(err, "error reading password from file")
-		}
-		pwd = &p
+	beholderConfigRecorder := beholderServices.NewConfigRecorder(lggr, 1*time.Hour)
+	if err := beholderConfigRecorder.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start beholder config recorder service: %w", err)
 	}
-	if vrfPasswordFile := c.String("vrfpassword"); len(vrfPasswordFile) != 0 {
-		p, err := utils.PasswordFromFile(vrfPasswordFile)
-		if err != nil {
-			return errors.Wrapf(err, "error reading VRF password from vrfpassword file \"%s\"", vrfPasswordFile)
-		}
-		vrfpwd = &p
-	}
-
-	s.Config.SetPasswords(pwd, vrfpwd)
+	defer beholderConfigRecorder.Close()
 
 	s.Config.LogConfiguration(lggr.Debugf, lggr.Warnf)
 
 	if err := s.Config.Validate(); err != nil {
-		return errors.Wrap(err, "config validation failed")
+		return fmt.Errorf("config validation failed: %w", err)
 	}
 
 	lggr.Infow(fmt.Sprintf("Starting Chainlink Node %s at commit %s", static.Version, static.Sha), "Version", static.Version, "SHA", static.Sha)
@@ -300,30 +391,27 @@ func (s *Shell) runNode(c *cli.Context) error {
 		lggr.Warn("Chainlink is running in DEVELOPMENT mode. This is a security risk if enabled in production.")
 	}
 
-	if err := utils.EnsureDirAndMaxPerms(s.Config.RootDir(), os.FileMode(0700)); err != nil {
+	if err := utils.EnsureDirAndMaxPerms(s.Config.RootDir(), os.FileMode(0o700)); err != nil {
 		return fmt.Errorf("failed to create root directory %q: %w", s.Config.RootDir(), err)
 	}
-
-	cfg := s.Config
-	ldb := pg.NewLockedDB(cfg.AppID(), cfg.Database(), cfg.Database().Lock(), lggr)
 
 	// rootCtx will be cancelled when SIGINT|SIGTERM is received
 	rootCtx, cancelRootCtx := context.WithCancel(context.Background())
 
 	// cleanExit is used to skip "fail fast" routine
 	cleanExit := make(chan struct{})
-	var shutdownStartTime time.Time
+	var shutdownStartTime atomic.Value // time.Time
 	defer func() {
 		close(cleanExit)
-		if !shutdownStartTime.IsZero() {
-			log.Printf("Graceful shutdown time: %s", time.Since(shutdownStartTime))
+		if val := shutdownStartTime.Load(); val != nil {
+			log.Printf("Graceful shutdown time: %s", time.Since(val.(time.Time)))
 		}
 	}()
 
 	go shutdown.HandleShutdown(func(sig string) {
 		lggr.Infof("Shutting down due to %s signal received...", sig)
 
-		shutdownStartTime = time.Now()
+		shutdownStartTime.Store(time.Now())
 		cancelRootCtx()
 
 		select {
@@ -335,112 +423,221 @@ func (s *Shell) runNode(c *cli.Context) error {
 		lggr.Criticalf("Shutdown grace period of %v exceeded, closing DB and exiting...", s.Config.ShutdownGracePeriod())
 		// LockedDB.Close() will release DB locks and close DB connection
 		// Executing this explicitly because defers are not executed in case of os.Exit()
-		if err := ldb.Close(); err != nil {
-			lggr.Criticalf("Failed to close LockedDB: %v", err)
-		}
-		if err := s.CloseLogger(); err != nil {
-			log.Printf("Failed to close Logger: %v", err)
-		}
+		s.afterNode(lggr)
 
 		os.Exit(-1)
 	})
 
-	// Try opening DB connection and acquiring DB locks at once
-	if err := ldb.Open(rootCtx); err != nil {
-		// If not successful, we know neither locks nor connection remains opened
-		return s.errorOut(errors.Wrap(err, "opening db"))
-	}
-	defer lggr.ErrorIfFn(ldb.Close, "Error closing db")
-
-	// From now on, DB locks and DB connection will be released on every return.
-	// Keep watching on logger.Fatal* calls and os.Exit(), because defer will not be executed.
-
-	app, err := s.AppFactory.NewApplication(rootCtx, s.Config, s.Logger, ldb.DB())
+	app, err := s.AppFactory.NewApplication(rootCtx, s.Config, s.Logger, s.Registerer, s.DS, s.KeyStore)
 	if err != nil {
-		return s.errorOut(errors.Wrap(err, "fatal error instantiating application"))
+		return s.errorOut(fmt.Errorf("fatal error instantiating application: %w", err))
 	}
 
 	// Local shell initialization always uses local auth users table for admin auth
 	authProviderORM := app.BasicAdminUsersORM()
-	keyStore := app.GetKeyStore()
-	err = s.KeyStoreAuthenticator.authenticate(keyStore, s.Config.Password())
-	if err != nil {
-		return errors.Wrap(err, "error authenticating keystore")
-	}
-
-	legacyEVMChains := app.GetRelayers().LegacyEVMChains()
 
 	if s.Config.EVMEnabled() {
-		chainList, err2 := legacyEVMChains.List()
-		if err2 != nil {
-			return fmt.Errorf("error listing legacy evm chains: %w", err2)
+		// ensure any imported keys are imported
+		for _, k := range s.Config.ImportedEthKeys().List() {
+			lggr.Debug("Importing eth key")
+			id, err2 := chain_selectors.GetChainIDFromSelector(k.ChainDetails().ChainSelector)
+			if err2 != nil {
+				return s.errorOut(fmt.Errorf("error getting chain id from selector when trying to import eth key %v: %w", k.JSON(), err2))
+			}
+			cid, _ := big.NewInt(0).SetString(id, 10)
+			if cid == nil {
+				return s.errorOut(fmt.Errorf("error converting chain id '%s' to big int", id))
+			}
+			_, err2 = app.GetKeyStore().Eth().Import(rootCtx, []byte(k.JSON()), k.Password(), cid)
+			if err2 != nil {
+				if errors.Is(err2, keystore.ErrKeyExists) {
+					lggr.Debugf("Eth key %s already exists for chain %v", k.JSON(), k.ChainDetails())
+					continue
+				}
+				return s.errorOut(fmt.Errorf("error importing eth key: %w", err2))
+			}
+			lggr.Debugf("Imported eth key %s for chain %v", k.JSON(), k.ChainDetails())
 		}
-		for _, ch := range chainList {
-			if ch.Config().EVM().AutoCreateKey() {
-				lggr.Debugf("AutoCreateKey=true, will ensure EVM key for chain %s", ch.ID())
-				err2 := app.GetKeyStore().Eth().EnsureKeys(ch.ID())
+
+		for _, cs := range s.Config.EVMConfigs() {
+			id := cs.ChainID.ToInt()
+			if b := cs.AutoCreateKey; b != nil && *b {
+				lggr.Debugf("AutoCreateKey=true, will ensure EVM key for chain %s", id)
+				err2 := app.GetKeyStore().Eth().EnsureKeys(rootCtx, id)
 				if err2 != nil {
-					return errors.Wrap(err2, "failed to ensure keystore keys")
+					return fmt.Errorf("failed to ensure keystore keys: %w", err2)
 				}
 			} else {
-				lggr.Debugf("AutoCreateKey=false, will not ensure EVM key for chain %s", ch.ID())
+				lggr.Debugf("AutoCreateKey=false, will not ensure EVM key for chain %s", id)
 			}
 		}
 	}
 
 	if s.Config.OCR().Enabled() {
-		err2 := app.GetKeyStore().OCR().EnsureKey()
+		err2 := app.GetKeyStore().OCR().EnsureKey(rootCtx)
 		if err2 != nil {
-			return errors.Wrap(err2, "failed to ensure ocr key")
+			return fmt.Errorf("failed to ensure ocr key: %w", err2)
 		}
 	}
 	if s.Config.OCR2().Enabled() {
-		var enabledChains []chaintype.ChainType
+		var enabledChains []corekeys.ChainType
 		if s.Config.EVMEnabled() {
-			enabledChains = append(enabledChains, chaintype.EVM)
-		}
-		if s.Config.CosmosEnabled() {
-			enabledChains = append(enabledChains, chaintype.Cosmos)
+			enabledChains = append(enabledChains, corekeys.EVM)
 		}
 		if s.Config.SolanaEnabled() {
-			enabledChains = append(enabledChains, chaintype.Solana)
+			enabledChains = append(enabledChains, corekeys.Solana)
 		}
 		if s.Config.StarkNetEnabled() {
-			enabledChains = append(enabledChains, chaintype.StarkNet)
+			enabledChains = append(enabledChains, corekeys.StarkNet)
 		}
-		err2 := app.GetKeyStore().OCR2().EnsureKeys(enabledChains...)
-		if err2 != nil {
-			return errors.Wrap(err2, "failed to ensure ocr key")
+		if s.Config.AptosEnabled() {
+			enabledChains = append(enabledChains, corekeys.Aptos)
 		}
-	}
-	if s.Config.P2P().Enabled() {
-		err2 := app.GetKeyStore().P2P().EnsureKey()
-		if err2 != nil {
-			return errors.Wrap(err2, "failed to ensure p2p key")
+		if s.Config.TronEnabled() {
+			enabledChains = append(enabledChains, corekeys.Tron)
 		}
-	}
-	if s.Config.CosmosEnabled() {
-		err2 := app.GetKeyStore().Cosmos().EnsureKey()
-		if err2 != nil {
-			return errors.Wrap(err2, "failed to ensure cosmos key")
+		if s.Config.TONEnabled() {
+			enabledChains = append(enabledChains, corekeys.TON)
 		}
-	}
-	if s.Config.SolanaEnabled() {
-		err2 := app.GetKeyStore().Solana().EnsureKey()
-		if err2 != nil {
-			return errors.Wrap(err2, "failed to ensure solana key")
+		if s.Config.SuiEnabled() {
+			enabledChains = append(enabledChains, corekeys.Sui)
 		}
-	}
-	if s.Config.StarkNetEnabled() {
-		err2 := app.GetKeyStore().StarkNet().EnsureKey()
+		if s.Config.StellarEnabled() {
+			enabledChains = append(enabledChains, corekeys.Stellar)
+		}
+		err2 := app.GetKeyStore().OCR2().EnsureKeys(rootCtx, enabledChains...)
 		if err2 != nil {
-			return errors.Wrap(err2, "failed to ensure starknet key")
+			return fmt.Errorf("failed to ensure ocr key: %w", err2)
 		}
 	}
 
-	err2 := app.GetKeyStore().CSA().EnsureKey()
+	if s.Config.P2P().Enabled() {
+		if s.Config.ImportedP2PKey().JSON() != "" {
+			lggr.Debugf("Importing p2p key %s", s.Config.ImportedP2PKey().JSON())
+			_, err2 := app.GetKeyStore().P2P().Import(rootCtx, []byte(s.Config.ImportedP2PKey().JSON()), s.Config.ImportedP2PKey().Password())
+			if errors.Is(err2, keystore.ErrKeyExists) {
+				lggr.Debugf("P2P key already exists %s", s.Config.ImportedP2PKey().JSON())
+			} else if err2 != nil {
+				return s.errorOut(fmt.Errorf("error importing p2p key: %w", err2))
+			}
+		}
+		err2 := app.GetKeyStore().P2P().EnsureKey(rootCtx)
+		if err2 != nil {
+			return fmt.Errorf("failed to ensure p2p key: %w", err2)
+		}
+	}
+	if s.Config.SolanaEnabled() {
+		for _, k := range s.Config.ImportedSolKeys().List() {
+			lggr.Debug("Importing sol key")
+			_, err2 := app.GetKeyStore().Solana().Import(rootCtx, []byte(k.JSON()), k.Password())
+			if err2 != nil {
+				if errors.Is(err2, keystore.ErrKeyExists) {
+					lggr.Debugf("Sol key %s already exists for chain %v", k.JSON(), k.ChainDetails())
+					continue
+				}
+				return s.errorOut(fmt.Errorf("error importing sol key: %w", err2))
+			}
+			lggr.Debugf("Imported sol key %s for chain %v", k.JSON(), k.ChainDetails())
+		}
+
+		err2 := app.GetKeyStore().Solana().EnsureKey(rootCtx)
+		if err2 != nil {
+			return fmt.Errorf("failed to ensure solana key: %w", err2)
+		}
+	}
+	if s.Config.StarkNetEnabled() {
+		err2 := app.GetKeyStore().StarkNet().EnsureKey(rootCtx)
+		if err2 != nil {
+			return fmt.Errorf("failed to ensure starknet key: %w", err2)
+		}
+	}
+	if s.Config.AptosEnabled() {
+		for _, k := range s.Config.ImportedAptosKeys().List() {
+			lggr.Debug("Importing aptos key")
+			_, err2 := app.GetKeyStore().Aptos().Import(rootCtx, []byte(k.JSON()), k.Password())
+			if err2 != nil {
+				if errors.Is(err2, keystore.ErrKeyExists) {
+					lggr.Debugf("Aptos key %s already exists for chain %v", k.JSON(), k.ChainDetails())
+					continue
+				}
+				return s.errorOut(fmt.Errorf("error importing aptos key: %w", err2))
+			}
+			lggr.Debugf("Imported aptos key %s for chain %v", k.JSON(), k.ChainDetails())
+		}
+
+		err2 := app.GetKeyStore().Aptos().EnsureKey(rootCtx)
+		if err2 != nil {
+			return fmt.Errorf("failed to ensure aptos key: %w", err2)
+		}
+	}
+	if s.Config.StellarEnabled() {
+		for _, k := range s.Config.ImportedStellarKeys().List() {
+			lggr.Debug("Importing stellar key")
+			_, err2 := app.GetKeyStore().Stellar().Import(rootCtx, []byte(k.JSON()), k.Password())
+			if err2 != nil {
+				if errors.Is(err2, keystore.ErrKeyExists) {
+					lggr.Debugf("Stellar key %s already exists for chain %v", k.JSON(), k.ChainDetails())
+					continue
+				}
+				return s.errorOut(fmt.Errorf("error importing stellar key: %w", err2))
+			}
+			lggr.Debugf("Imported stellar key %s for chain %v", k.JSON(), k.ChainDetails())
+		}
+
+		err2 := app.GetKeyStore().Stellar().EnsureKey(rootCtx)
+		if err2 != nil {
+			return fmt.Errorf("failed to ensure stellar key: %w", err2)
+		}
+	}
+	if s.Config.TronEnabled() {
+		err2 := app.GetKeyStore().Tron().EnsureKey(rootCtx)
+		if err2 != nil {
+			return fmt.Errorf("failed to ensure tron key: %w", err2)
+		}
+	}
+	if s.Config.TONEnabled() {
+		err2 := app.GetKeyStore().TON().EnsureKey(rootCtx)
+		if err2 != nil {
+			return fmt.Errorf("failed to ensure ton key: %w", err2)
+		}
+	}
+	if s.Config.SuiEnabled() {
+		err2 := app.GetKeyStore().Sui().EnsureKey(rootCtx)
+		if err2 != nil {
+			return fmt.Errorf("failed to ensure Sui key: %w", err2)
+		}
+	}
+	if s.Config.StellarEnabled() {
+		err2 := app.GetKeyStore().Stellar().EnsureKey(rootCtx)
+		if err2 != nil {
+			return fmt.Errorf("failed to ensure Stellar key: %w", err2)
+		}
+	}
+	if s.Config.CRE().EnableDKGRecipient() {
+		if s.Config.ImportedDKGRecipientKey().JSON() != "" {
+			lggr.Debugf("Importing DKG recipient key %s", s.Config.ImportedDKGRecipientKey().JSON())
+			_, err2 := app.GetKeyStore().DKGRecipient().Import(rootCtx, []byte(s.Config.ImportedDKGRecipientKey().JSON()), s.Config.ImportedDKGRecipientKey().Password())
+			if errors.Is(err2, keystore.ErrKeyExists) {
+				lggr.Debugf("DKG recipient key already exists %s", s.Config.ImportedDKGRecipientKey().JSON())
+			} else if err2 != nil {
+				return s.errorOut(fmt.Errorf("error importing dkg recipient key: %w", err2))
+			}
+		}
+
+		err2 := app.GetKeyStore().DKGRecipient().EnsureKey(rootCtx)
+		if err2 != nil {
+			return fmt.Errorf("failed to ensure dkg recipient key: %w", err2)
+		}
+	}
+
+	err2 := app.GetKeyStore().Workflow().EnsureKey(rootCtx)
 	if err2 != nil {
-		return errors.Wrap(err2, "failed to ensure CSA key")
+		return fmt.Errorf("failed to ensure workflow key: %w", err2)
+	}
+
+	err2 = app.GetKeyStore().CSA().EnsureKey(rootCtx)
+	if err2 != nil {
+		return fmt.Errorf("failed to ensure CSA key: %w", err2)
 	}
 
 	if e := checkFilePermissions(lggr, s.Config.RootDir()); e != nil {
@@ -448,15 +645,12 @@ func (s *Shell) runNode(c *cli.Context) error {
 	}
 
 	var user sessions.User
-	if user, err = NewFileAPIInitializer(c.String("api")).Initialize(authProviderORM, lggr); err != nil {
+	if user, err = NewFileAPIInitializer(c.String("api")).Initialize(ctx, authProviderORM, lggr); err != nil {
 		if !errors.Is(err, ErrNoCredentialFile) {
-			return errors.Wrap(err, "error creating api initializer")
+			return fmt.Errorf("error creating api initializer: %w", err)
 		}
-		if user, err = s.FallbackAPIInitializer.Initialize(authProviderORM, lggr); err != nil {
-			if errors.Is(err, ErrorNoAPICredentialsAvailable) {
-				return errors.WithStack(err)
-			}
-			return errors.Wrap(err, "error creating fallback initializer")
+		if user, err = s.FallbackAPIInitializer.Initialize(ctx, authProviderORM, lggr); err != nil {
+			return fmt.Errorf("error creating fallback initializer: %w", err)
 		}
 	}
 
@@ -466,7 +660,7 @@ func (s *Shell) runNode(c *cli.Context) error {
 		// We do not try stopping any sub-services that might be started,
 		// because the app will exit immediately upon return.
 		// But LockedDB will be released by defer in above.
-		return errors.Wrap(err, "error starting app")
+		return fmt.Errorf("error starting app: %w", err)
 	}
 
 	grp, grpCtx := errgroup.WithContext(rootCtx)
@@ -474,7 +668,7 @@ func (s *Shell) runNode(c *cli.Context) error {
 	grp.Go(func() error {
 		<-grpCtx.Done()
 		if errInternal := app.Stop(); errInternal != nil {
-			return errors.Wrap(errInternal, "error stopping app")
+			return fmt.Errorf("error stopping app: %w", errInternal)
 		}
 		return nil
 	})
@@ -503,13 +697,13 @@ func checkFilePermissions(lggr logger.Logger, rootDir string) error {
 	} else if err == nil {
 		err := utils.EnsureDirAndMaxPerms(tlsDir, ownerPermsMask)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to ensure TLS directory permissions for %s: %w", tlsDir, err)
 		}
 
 		err = filepath.Walk(tlsDir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				lggr.Errorf(`error checking perms of "%v": %v`, path, err)
-				return err
+				return fmt.Errorf("error checking permissions of %s: %w", path, err)
 			}
 			if utils.TooPermissive(info.Mode().Perm(), ownerPermsMask) {
 				newPerms := info.Mode().Perm() & ownerPermsMask
@@ -519,7 +713,7 @@ func checkFilePermissions(lggr logger.Logger, rootDir string) error {
 			return nil
 		})
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to walk TLS directory %s: %w", tlsDir, err)
 		}
 	}
 
@@ -531,14 +725,14 @@ func checkFilePermissions(lggr logger.Logger, rootDir string) error {
 		if os.IsNotExist(err) {
 			continue
 		} else if err != nil {
-			return err
+			return fmt.Errorf("failed to stat file %s: %w", path, err)
 		}
 		if utils.TooPermissive(fileInfo.Mode().Perm(), ownerPermsMask) {
 			newPerms := fileInfo.Mode().Perm() & ownerPermsMask
 			lggr.Warnf("%s has overly permissive file permissions, reducing them from %s to %s", path, fileInfo.Mode().Perm(), newPerms)
 			err = utils.EnsureFilepathMaxPerms(path, newPerms)
 			if err != nil {
-				return err
+				return fmt.Errorf("failed to set permissions for %s: %w", path, err)
 			}
 		}
 		owned, err := utils.IsFileOwnedByChainlink(fileInfo)
@@ -566,7 +760,7 @@ func (s *Shell) RebroadcastTransactions(c *cli.Context) (err error) {
 
 	addressBytes, err := hexutil.Decode(addressHex)
 	if err != nil {
-		return s.errorOut(errors.Wrap(err, "could not decode address"))
+		return s.errorOut(fmt.Errorf("could not decode address '%s': %w", addressHex, err))
 	}
 	address := gethCommon.BytesToAddress(addressBytes)
 
@@ -579,24 +773,28 @@ func (s *Shell) RebroadcastTransactions(c *cli.Context) (err error) {
 		}
 	}
 
-	lggr := logger.Sugared(s.Logger.Named("RebroadcastTransactions"))
-	db, err := pg.OpenUnlockedDB(s.Config.AppID(), s.Config.Database())
+	err = s.Config.Validate()
 	if err != nil {
-		return s.errorOut(errors.Wrap(err, "opening DB"))
+		return fmt.Errorf("config validation failed of %v: %w", s.Config, err)
 	}
-	defer lggr.ErrorIfFn(db.Close, "Error closing db")
 
-	app, err := s.AppFactory.NewApplication(ctx, s.Config, lggr, db)
+	lggr := logger.Sugared(s.Logger.Named("RebroadcastTransactions"))
+
+	app, err := s.AppFactory.NewApplication(ctx, s.Config, lggr, s.Registerer, s.DS, s.KeyStore)
 	if err != nil {
-		return s.errorOut(errors.Wrap(err, "fatal error instantiating application"))
+		return s.errorOut(fmt.Errorf("fatal error instantiating application: %w", err))
 	}
 
 	// TODO: BCF-2511 once the dust settles on BCF-2440/1 evaluate how the
 	// [loop.Relayer] interface needs to be extended to support programming similar to
 	// this pattern but in a chain-agnostic way
-	chain, err := app.GetRelayers().LegacyEVMChains().Get(chainID.String())
+	chainService, err := app.GetRelayers().LegacyEVMChains().Get(chainID.String()) //nolint:staticcheck // legacy EVM chain access required for standalone rebroadcast (see BCF-2511)
 	if err != nil {
-		return s.errorOut(err)
+		return s.errorOut(fmt.Errorf("failed to get EVM chain service for chain ID %s: %w", chainID.String(), err))
+	}
+	chain, ok := chainService.(legacyevm.Chain)
+	if !ok {
+		return fmt.Errorf("transaction rebroadcast is not available in loop mode: %w", errors.ErrUnsupported)
 	}
 	keyStore := app.GetKeyStore()
 
@@ -604,45 +802,46 @@ func (s *Shell) RebroadcastTransactions(c *cli.Context) (err error) {
 
 	err = ethClient.Dial(ctx)
 	if err != nil {
-		return err
-	}
-
-	if c.IsSet("password") {
-		pwd, err2 := utils.PasswordFromFile(c.String("password"))
-		if err2 != nil {
-			return s.errorOut(fmt.Errorf("error reading password: %+v", err2))
-		}
-		s.Config.SetPasswords(&pwd, nil)
+		return fmt.Errorf("failed to dial EVM client for chain ID %s: %w", chainID.String(), err)
 	}
 
 	err = s.Config.Validate()
 	if err != nil {
-		return s.errorOut(fmt.Errorf("error validating configuration: %+v", err))
+		return s.errorOut(fmt.Errorf("error validating configuration: %w", err))
 	}
 
-	err = keyStore.Unlock(s.Config.Password().Keystore())
+	err = keyStore.Unlock(ctx, s.Config.Password().Keystore())
 	if err != nil {
-		return s.errorOut(errors.Wrap(err, "error authenticating keystore"))
+		return s.errorOut(fmt.Errorf("error authenticating keystore: %w", err))
 	}
 
-	if err = keyStore.Eth().CheckEnabled(address, chain.ID()); err != nil {
-		return s.errorOut(err)
+	if err = keyStore.Eth().CheckEnabled(ctx, address, chain.ID()); err != nil {
+		return s.errorOut(fmt.Errorf("address '%s' not enabled for chain ID %s: %w", address.Hex(), chain.ID().String(), err))
 	}
+
+	ks := keys.NewChainStore(keystore.NewEthSigner(keyStore.Eth(), chain.ID()), chain.ID())
 
 	s.Logger.Infof("Rebroadcasting transactions from %v to %v", beginningNonce, endingNonce)
 
-	orm := txmgr.NewTxStore(app.GetSqlxDB(), lggr, s.Config.Database())
-	txBuilder := txmgr.NewEvmTxAttemptBuilder(*ethClient.ConfiguredChainID(), chain.Config().EVM().GasEstimator(), keyStore.Eth(), nil)
-	cfg := txmgr.NewEvmTxmConfig(chain.Config().EVM())
+	orm := txmgr.NewTxStore(app.GetDB(), lggr)
+	txBuilder := txmgr.NewEvmTxAttemptBuilder(*ethClient.ConfiguredChainID(), chain.Config().EVM().GasEstimator(), ks, nil)
 	feeCfg := txmgr.NewEvmTxmFeeConfig(chain.Config().EVM().GasEstimator())
-	ec := txmgr.NewEvmConfirmer(orm, txmgr.NewEvmTxmClient(ethClient), cfg, feeCfg, chain.Config().EVM().Transactions(), chain.Config().Database(), keyStore.Eth(), txBuilder, chain.Logger())
+	stuckTxDetector := txmgr.NewStuckTxDetector(lggr, ethClient.ConfiguredChainID(), "", assets.NewWei(assets.NewEth(100).ToInt()), chain.Config().EVM().Transactions().AutoPurge(), nil, orm, ethClient)
+	metrics, err := txmgr.NewEVMTxmMetrics(ethClient.ConfiguredChainID().String())
+	if err != nil {
+		return s.errorOut(fmt.Errorf("failed to create EVM transaction metrics for chain ID %s: %w", ethClient.ConfiguredChainID().String(), err))
+	}
+	ec := txmgr.NewEvmConfirmer(orm, txmgr.NewEvmTxmClient(ethClient, chain.Config().EVM().NodePool().Errors()),
+		feeCfg, chain.Config().EVM().Transactions(), app.GetConfig().Database(), ks, txBuilder, chain.Logger(), stuckTxDetector, metrics)
 	totalNonces := endingNonce - beginningNonce + 1
 	nonces := make([]evmtypes.Nonce, totalNonces)
-	for i := int64(0); i < totalNonces; i++ {
+	for i := range totalNonces {
 		nonces[i] = evmtypes.Nonce(beginningNonce + i)
 	}
-	err = ec.ForceRebroadcast(ctx, nonces, gas.EvmFee{Legacy: assets.NewWeiI(int64(gasPriceWei))}, address, uint32(overrideGasLimit))
-	return s.errorOut(err)
+	if gasPriceWei <= math.MaxInt64 {
+		return s.errorOut(ec.ForceRebroadcast(ctx, nonces, gas.EvmFee{GasPrice: assets.NewWeiI(int64(gasPriceWei))}, address, uint64(overrideGasLimit)))
+	}
+	return s.errorOut(fmt.Errorf("integer overflow conversion error. GasPrice: %v", gasPriceWei))
 }
 
 type HealthCheckPresenter struct {
@@ -674,7 +873,7 @@ type HealthCheckPresenters []HealthCheckPresenter
 // RenderTable implements TableRenderer
 func (ps HealthCheckPresenters) RenderTable(rt RendererTable) error {
 	headers := []string{"Name", "Status", "Output"}
-	rows := [][]string{}
+	rows := make([][]string, 0, len(ps))
 
 	for _, p := range ps {
 		rows = append(rows, p.ToRow())
@@ -685,14 +884,14 @@ func (ps HealthCheckPresenters) RenderTable(rt RendererTable) error {
 	return nil
 }
 
-var errDBURLMissing = errors.New("You must set CL_DATABASE_URL env variable or provide a secrets TOML with Database.URL set. HINT: If you are running this to set up your local test database, try CL_DATABASE_URL=postgresql://postgres@localhost:5432/chainlink_test?sslmode=disable")
+var errDBURLMissing = errors.New("you must set CL_DATABASE_URL env variable or provide a secrets TOML with Database.URL set. HINT: If you are running this to set up your local test database, try CL_DATABASE_URL=postgresql://postgres@localhost:5432/chainlink_test?sslmode=disable")
 
 // ConfigValidate validate the client configuration and pretty-prints results
 func (s *Shell) ConfigFileValidate(_ *cli.Context) error {
 	fn := func(f string, params ...any) { fmt.Printf(f, params...) }
 	s.Config.LogConfiguration(fn, fn)
 	if err := s.configExitErr(s.Config.Validate); err != nil {
-		return err
+		return fmt.Errorf("configuration validation failed: %w", err)
 	}
 	fmt.Println("Valid configuration.")
 	return nil
@@ -716,37 +915,19 @@ func (s *Shell) ctx() context.Context {
 func (s *Shell) ResetDatabase(c *cli.Context) error {
 	ctx := s.ctx()
 	cfg := s.Config.Database()
-	parsed := cfg.URL()
-	if parsed.String() == "" {
+	u := cfg.URL()
+	if u.String() == "" {
 		return s.errorOut(errDBURLMissing)
 	}
-
 	dangerMode := c.Bool("dangerWillRobinson")
-
-	dbname := parsed.Path[1:]
+	dbname := u.Path[1:]
 	if !dangerMode && !strings.HasSuffix(dbname, "_test") {
 		return s.errorOut(fmt.Errorf("cannot reset database named `%s`. This command can only be run against databases with a name that ends in `_test`, to prevent accidental data loss. If you REALLY want to reset this database, pass in the -dangerWillRobinson option", dbname))
 	}
-	lggr := s.Logger
-	lggr.Infof("Resetting database: %#v", parsed.String())
-	lggr.Debugf("Dropping and recreating database: %#v", parsed.String())
-	if err := dropAndCreateDB(parsed); err != nil {
-		return s.errorOut(err)
-	}
-	lggr.Debugf("Migrating database: %#v", parsed.String())
-	if err := migrateDB(ctx, cfg, lggr); err != nil {
-		return s.errorOut(err)
-	}
-	schema, err := dumpSchema(parsed)
-	if err != nil {
-		return s.errorOut(err)
-	}
-	lggr.Debugf("Testing rollback and re-migrate for database: %#v", parsed.String())
-	var baseVersionID int64 = 54
-	if err := downAndUpDB(ctx, cfg, lggr, baseVersionID); err != nil {
-		return s.errorOut(err)
-	}
-	if err := checkSchema(parsed, schema); err != nil {
+
+	force := c.Bool("force")
+
+	if err := store.ResetDatabase(ctx, s.Logger, cfg, force, false); err != nil {
 		return s.errorOut(err)
 	}
 	return nil
@@ -758,125 +939,9 @@ func (s *Shell) PrepareTestDatabase(c *cli.Context) error {
 		return s.errorOut(err)
 	}
 	cfg := s.Config
-
-	// Creating pristine DB copy to speed up FullTestDB
-	dbUrl := cfg.Database().URL()
-	db, err := sqlx.Open(string(dialects.Postgres), dbUrl.String())
-	if err != nil {
-		return s.errorOut(err)
-	}
-	defer db.Close()
-	templateDB := strings.Trim(dbUrl.Path, "/")
-	if err = dropAndCreatePristineDB(db, templateDB); err != nil {
-		return s.errorOut(err)
-	}
-
+	dbURL := cfg.Database().URL()
 	userOnly := c.Bool("user-only")
-	fixturePath := "../store/fixtures/fixtures.sql"
-	if userOnly {
-		fixturePath = "../store/fixtures/users_only_fixture.sql"
-	}
-	if err = insertFixtures(dbUrl, fixturePath); err != nil {
-		return s.errorOut(err)
-	}
-	if err = dropDanglingTestDBs(s.Logger, db); err != nil {
-		return s.errorOut(err)
-	}
-	return s.errorOut(randomizeTestDBSequences(db))
-}
-
-func dropDanglingTestDBs(lggr logger.Logger, db *sqlx.DB) (err error) {
-	// Drop all old dangling databases
-	var dbs []string
-	if err = db.Select(&dbs, `SELECT datname FROM pg_database WHERE datistemplate = false;`); err != nil {
-		return err
-	}
-
-	// dropping database is very slow in postgres so we parallelise it here
-	nWorkers := 25
-	ch := make(chan string)
-	var wg sync.WaitGroup
-	wg.Add(nWorkers)
-	errCh := make(chan error, len(dbs))
-	for i := 0; i < nWorkers; i++ {
-		go func() {
-			defer wg.Done()
-			for dbname := range ch {
-				lggr.Infof("Dropping old, dangling test database: %q", dbname)
-				gerr := cutils.JustError(db.Exec(fmt.Sprintf(`DROP DATABASE IF EXISTS %s`, dbname)))
-				errCh <- gerr
-			}
-		}()
-	}
-	for _, dbname := range dbs {
-		if strings.HasPrefix(dbname, testdb.TestDBNamePrefix) && !strings.HasSuffix(dbname, "_pristine") {
-			ch <- dbname
-		}
-	}
-	close(ch)
-	wg.Wait()
-	close(errCh)
-	for gerr := range errCh {
-		err = multierr.Append(err, gerr)
-	}
-	return
-}
-
-type failedToRandomizeTestDBSequencesError struct{}
-
-func (m *failedToRandomizeTestDBSequencesError) Error() string {
-	return "failed to randomize test db sequences"
-}
-
-// randomizeTestDBSequences randomizes sequenced table columns sequence
-// This is necessary as to avoid false positives in some test cases.
-func randomizeTestDBSequences(db *sqlx.DB) error {
-	// not ideal to hard code this, but also not safe to do it programmatically :(
-	schemas := pq.Array([]string{"public", "evm"})
-	seqRows, err := db.Query(`SELECT sequence_schema, sequence_name, minimum_value FROM information_schema.sequences WHERE sequence_schema IN ($1)`, schemas)
-	if err != nil {
-		return fmt.Errorf("%s: error fetching sequences: %s", failedToRandomizeTestDBSequencesError{}, err)
-	}
-
-	defer seqRows.Close()
-	for seqRows.Next() {
-		var sequenceSchema, sequenceName string
-		var minimumSequenceValue int64
-		if err = seqRows.Scan(&sequenceSchema, &sequenceName, &minimumSequenceValue); err != nil {
-			return fmt.Errorf("%s: failed scanning sequence rows: %s", failedToRandomizeTestDBSequencesError{}, err)
-		}
-
-		if sequenceName == "goose_migrations_id_seq" || sequenceName == "configurations_id_seq" {
-			continue
-		}
-
-		var randNum *big.Int
-		randNum, err = crand.Int(crand.Reader, ubig.NewI(10000).ToInt())
-		if err != nil {
-			return fmt.Errorf("%s: failed to generate random number", failedToRandomizeTestDBSequencesError{})
-		}
-		randNum.Add(randNum, big.NewInt(minimumSequenceValue))
-
-		if _, err = db.Exec(fmt.Sprintf("ALTER SEQUENCE %s.%s RESTART WITH %d", sequenceSchema, sequenceName, randNum)); err != nil {
-			return fmt.Errorf("%s: failed to alter and restart %s sequence: %w", failedToRandomizeTestDBSequencesError{}, sequenceName, err)
-		}
-	}
-
-	if err = seqRows.Err(); err != nil {
-		return fmt.Errorf("%s: failed to iterate through sequences: %w", failedToRandomizeTestDBSequencesError{}, err)
-	}
-
-	return nil
-}
-
-// PrepareTestDatabaseUserOnly calls ResetDatabase then loads only user fixtures required for local
-// testing against testnets. Does not include fake chain fixtures.
-func (s *Shell) PrepareTestDatabaseUserOnly(c *cli.Context) error {
-	if err := s.ResetDatabase(c); err != nil {
-		return s.errorOut(err)
-	}
-	cfg := s.Config
-	if err := insertFixtures(cfg.Database().URL(), "../store/fixtures/users_only_fixtures.sql"); err != nil {
+	if err := store.PrepareTestDB(s.Logger, dbURL, userOnly); err != nil {
 		return s.errorOut(err)
 	}
 	return nil
@@ -891,14 +956,14 @@ func (s *Shell) MigrateDatabase(_ *cli.Context) error {
 		return s.errorOut(errDBURLMissing)
 	}
 
-	err := migrate.SetMigrationENVVars(s.Config)
+	err := migrate.SetMigrationENVVars(s.Config.EVMConfigs())
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to set migration environment variables: %w", err)
 	}
 
 	s.Logger.Infof("Migrating database: %#v", parsed.String())
-	if err := migrateDB(ctx, cfg, s.Logger); err != nil {
-		return s.errorOut(err)
+	if err := migrateDB(ctx, cfg); err != nil {
+		return s.errorOut(fmt.Errorf("migrateDB failed: %w", err))
 	}
 	return nil
 }
@@ -911,18 +976,18 @@ func (s *Shell) RollbackDatabase(c *cli.Context) error {
 		arg := c.Args().First()
 		numVersion, err := strconv.ParseInt(arg, 10, 64)
 		if err != nil {
-			return s.errorOut(errors.Errorf("Unable to parse %v as integer", arg))
+			return s.errorOut(fmt.Errorf("unable to parse %v as integer", arg))
 		}
 		version = null.IntFrom(numVersion)
 	}
 
-	db, err := newConnection(s.Config.Database())
+	db, err := store.NewConnection(ctx, s.Config.Database())
 	if err != nil {
-		return fmt.Errorf("failed to initialize orm: %v", err)
+		return fmt.Errorf("failed to initialize orm: %w", err)
 	}
 
-	if err := migrate.Rollback(ctx, db.DB, s.Logger, version); err != nil {
-		return fmt.Errorf("migrateDB failed: %v", err)
+	if err := migrate.Rollback(ctx, db.DB, version); err != nil {
+		return fmt.Errorf("migrateDB failed: %w", err)
 	}
 
 	return nil
@@ -931,14 +996,14 @@ func (s *Shell) RollbackDatabase(c *cli.Context) error {
 // VersionDatabase displays the current database version.
 func (s *Shell) VersionDatabase(_ *cli.Context) error {
 	ctx := s.ctx()
-	db, err := newConnection(s.Config.Database())
+	db, err := store.NewConnection(ctx, s.Config.Database())
 	if err != nil {
-		return fmt.Errorf("failed to initialize orm: %v", err)
+		return fmt.Errorf("failed to initialize orm: %w", err)
 	}
 
-	version, err := migrate.Current(ctx, db.DB, s.Logger)
+	version, err := migrate.Current(ctx, db.DB)
 	if err != nil {
-		return fmt.Errorf("migrateDB failed: %v", err)
+		return fmt.Errorf("migrateDB failed: %w", err)
 	}
 
 	s.Logger.Infof("Database version: %v", version)
@@ -948,25 +1013,26 @@ func (s *Shell) VersionDatabase(_ *cli.Context) error {
 // StatusDatabase displays the database migration status
 func (s *Shell) StatusDatabase(_ *cli.Context) error {
 	ctx := s.ctx()
-	db, err := newConnection(s.Config.Database())
+	db, err := store.NewConnection(ctx, s.Config.Database())
 	if err != nil {
-		return fmt.Errorf("failed to initialize orm: %v", err)
+		return fmt.Errorf("failed to initialize orm: %w", err)
 	}
 
-	if err = migrate.Status(ctx, db.DB, s.Logger); err != nil {
-		return fmt.Errorf("Status failed: %v", err)
+	if err = migrate.Status(ctx, db.DB); err != nil {
+		return fmt.Errorf("Status failed: %w", err)
 	}
 	return nil
 }
 
 // CreateMigration displays the database migration status
 func (s *Shell) CreateMigration(c *cli.Context) error {
+	ctx := s.ctx()
 	if !c.Args().Present() {
-		return s.errorOut(errors.New("You must specify a migration name"))
+		return s.errorOut(errors.New("you must specify a migration name"))
 	}
-	db, err := newConnection(s.Config.Database())
+	db, err := store.NewConnection(ctx, s.Config.Database())
 	if err != nil {
-		return fmt.Errorf("failed to initialize orm: %v", err)
+		return fmt.Errorf("failed to initialize orm: %w", err)
 	}
 
 	migrationType := c.String("type")
@@ -975,13 +1041,14 @@ func (s *Shell) CreateMigration(c *cli.Context) error {
 	}
 
 	if err = migrate.Create(db.DB, c.Args().First(), migrationType); err != nil {
-		return fmt.Errorf("Status failed: %v", err)
+		return fmt.Errorf("Status failed: %w", err)
 	}
 	return nil
 }
 
 // CleanupChainTables deletes database table rows based on chain type and chain id input.
 func (s *Shell) CleanupChainTables(c *cli.Context) error {
+	ctx := s.ctx()
 	cfg := s.Config.Database()
 	parsed := cfg.URL()
 	if parsed.String() == "" {
@@ -993,184 +1060,254 @@ func (s *Shell) CleanupChainTables(c *cli.Context) error {
 		return s.errorOut(fmt.Errorf("cannot reset database named `%s`. This command can only be run against databases with a name that ends in `_test`, to prevent accidental data loss. If you really want to delete chain specific data from this database, pass in the --danger option", dbname))
 	}
 
-	db, err := newConnection(cfg)
+	db, err := store.NewConnection(ctx, cfg)
 	if err != nil {
-		return s.errorOut(errors.Wrap(err, "error connecting to the database"))
+		return s.errorOut(fmt.Errorf("error connecting to the database: %w", err))
 	}
 	defer db.Close()
 
 	// some tables with evm_chain_id (mostly job specs) are in public schema
 	tablesToDeleteFromQuery := `SELECT table_name, table_schema FROM information_schema.columns WHERE "column_name"=$1;`
 	// Delete rows from each table based on the chain_id.
-	if strings.EqualFold("EVM", c.String("type")) {
-		rows, err := db.Query(tablesToDeleteFromQuery, "evm_chain_id")
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		var tablesToDeleteFrom []string
-		for rows.Next() {
-			var name string
-			var schema string
-			if err = rows.Scan(&name, &schema); err != nil {
-				return err
-			}
-			tablesToDeleteFrom = append(tablesToDeleteFrom, schema+"."+name)
-		}
-		if rows.Err() != nil {
-			return rows.Err()
-		}
-
-		for _, tableName := range tablesToDeleteFrom {
-			query := fmt.Sprintf(`DELETE FROM %s WHERE "evm_chain_id"=$1;`, tableName)
-			_, err = db.Exec(query, c.String("id"))
-			if err != nil {
-				fmt.Printf("Error deleting rows containing evm_chain_id from %s: %v\n", tableName, err)
-			} else {
-				fmt.Printf("Rows with evm_chain_id %s deleted from %s.\n", c.String("id"), tableName)
-			}
-		}
-	} else {
+	if !strings.EqualFold("EVM", c.String("type")) {
 		return s.errorOut(errors.New("unknown chain type"))
 	}
-	return nil
-}
-
-type dbConfig interface {
-	DefaultIdleInTxSessionTimeout() time.Duration
-	DefaultLockTimeout() time.Duration
-	MaxOpenConns() int
-	MaxIdleConns() int
-	URL() url.URL
-	Dialect() dialects.DialectName
-}
-
-func newConnection(cfg dbConfig) (*sqlx.DB, error) {
-	parsed := cfg.URL()
-	if parsed.String() == "" {
-		return nil, errDBURLMissing
-	}
-	return pg.NewConnection(parsed.String(), cfg.Dialect(), cfg)
-}
-
-func dropAndCreateDB(parsed url.URL) (err error) {
-	// Cannot drop the database if we are connected to it, so we must connect
-	// to a different one. template1 should be present on all postgres installations
-	dbname := parsed.Path[1:]
-	parsed.Path = "/template1"
-	db, err := sql.Open(string(dialects.Postgres), parsed.String())
+	rows, err := db.QueryContext(ctx, tablesToDeleteFromQuery, "evm_chain_id")
 	if err != nil {
-		return fmt.Errorf("unable to open postgres database for creating test db: %+v", err)
+		return fmt.Errorf("failed to query tables with evm_chain_id column: %w", err)
 	}
-	defer func() {
-		if cerr := db.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+	defer rows.Close()
+
+	var tablesToDeleteFrom []string
+	for rows.Next() {
+		var name string
+		var schema string
+		if err = rows.Scan(&name, &schema); err != nil {
+			return fmt.Errorf("failed to scan table_name and table_schema: %w", err)
 		}
-	}()
-
-	_, err = db.Exec(fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, dbname))
-	if err != nil {
-		return fmt.Errorf("unable to drop postgres database: %v", err)
+		tablesToDeleteFrom = append(tablesToDeleteFrom, schema+"."+name)
 	}
-	_, err = db.Exec(fmt.Sprintf(`CREATE DATABASE "%s"`, dbname))
-	if err != nil {
-		return fmt.Errorf("unable to create postgres database: %v", err)
+	if rows.Err() != nil {
+		return fmt.Errorf("error iterating over rows: %w", rows.Err())
+	}
+
+	for _, tableName := range tablesToDeleteFrom {
+		query := fmt.Sprintf(`DELETE FROM %s WHERE "evm_chain_id"=$1;`, tableName)
+		_, err = db.ExecContext(ctx, query, c.String("id"))
+		if err != nil {
+			fmt.Printf("Error deleting rows containing evm_chain_id from %s: %v\n", tableName, err)
+		} else {
+			fmt.Printf("Rows with evm_chain_id %s deleted from %s.\n", c.String("id"), tableName)
+		}
 	}
 	return nil
 }
 
-func dropAndCreatePristineDB(db *sqlx.DB, template string) (err error) {
-	_, err = db.Exec(fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, testdb.PristineDBName))
+func migrateDB(ctx context.Context, config store.Config) error {
+	db, err := store.NewConnection(ctx, config)
 	if err != nil {
-		return fmt.Errorf("unable to drop postgres database: %v", err)
-	}
-	_, err = db.Exec(fmt.Sprintf(`CREATE DATABASE "%s" WITH TEMPLATE "%s"`, testdb.PristineDBName, template))
-	if err != nil {
-		return fmt.Errorf("unable to create postgres database: %v", err)
-	}
-	return nil
-}
-
-func migrateDB(ctx context.Context, config dbConfig, lggr logger.Logger) error {
-	db, err := newConnection(config)
-	if err != nil {
-		return fmt.Errorf("failed to initialize orm: %v", err)
+		return fmt.Errorf("failed to initialize orm: %w", err)
 	}
 
-	if err = migrate.Migrate(ctx, db.DB, lggr); err != nil {
-		return fmt.Errorf("migrateDB failed: %v", err)
+	if err = migrate.Migrate(ctx, db.DB); err != nil {
+		return fmt.Errorf("migrateDB failed: %w", err)
 	}
 	return db.Close()
 }
 
-func downAndUpDB(ctx context.Context, cfg dbConfig, lggr logger.Logger, baseVersionID int64) error {
-	db, err := newConnection(cfg)
-	if err != nil {
-		return fmt.Errorf("failed to initialize orm: %v", err)
+// RemoveBlocks - removes blocks after the specified blocks number
+func (s *Shell) RemoveBlocks(c *cli.Context) error {
+	start := c.Int64("start")
+	if start <= 0 {
+		return s.errorOut(errors.New("must pass a positive value in '--start' parameter"))
 	}
-	if err = migrate.Rollback(ctx, db.DB, lggr, null.IntFrom(baseVersionID)); err != nil {
-		return fmt.Errorf("test rollback failed: %v", err)
-	}
-	if err = migrate.Migrate(ctx, db.DB, lggr); err != nil {
-		return fmt.Errorf("second migrateDB failed: %v", err)
-	}
-	return db.Close()
-}
 
-func dumpSchema(dbURL url.URL) (string, error) {
-	args := []string{
-		dbURL.String(),
-		"--schema-only",
-	}
-	cmd := exec.Command(
-		"pg_dump", args...,
-	)
-
-	schema, err := cmd.Output()
-	if err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return "", fmt.Errorf("failed to dump schema: %v\n%s", err, string(ee.Stderr))
+	chainID := big.NewInt(0)
+	if c.IsSet("evm-chain-id") {
+		err := chainID.UnmarshalText([]byte(c.String("evm-chain-id")))
+		if err != nil {
+			return s.errorOut(fmt.Errorf("failed to parse evm-chain-id %s: %w", c.String("evm-chain-id"), err))
 		}
-		return "", fmt.Errorf("failed to dump schema: %v", err)
 	}
-	return string(schema), nil
+
+	cfg := s.Config
+	err := cfg.Validate()
+	if err != nil {
+		return s.errorOut(fmt.Errorf("error validating configuration: %w", err))
+	}
+
+	lggr := logger.Sugared(s.Logger.Named("RemoveBlocks"))
+	ctx, cancel := context.WithCancel(context.Background())
+	go shutdown.HandleShutdown(func(sig string) {
+		cancel()
+		lggr.Info("received signal to stop - closing the database and releasing lock")
+
+		s.afterNode(lggr)
+	})
+
+	app, err := s.AppFactory.NewApplication(ctx, s.Config, s.Logger, s.Registerer, s.DS, s.KeyStore)
+	if err != nil {
+		return s.errorOut(fmt.Errorf("fatal error instantiating application: %w", err))
+	}
+
+	err = app.DeleteLogPollerDataAfter(ctx, chainID, start)
+	if err != nil {
+		return s.errorOut(fmt.Errorf("failed to delete log poller data after block %d for chain ID %s: %w", start, chainID.String(), err))
+	}
+
+	lggr.Infof("RemoveBlocks: successfully removed blocks")
+
+	return nil
 }
 
-func checkSchema(dbURL url.URL, prevSchema string) error {
-	newSchema, err := dumpSchema(dbURL)
+// beforeNode performs the actual initialization of DB, keystore, and telemetry.
+// It handles password loading, database connection, keystore authentication, and Beholder setup.
+func (s *Shell) beforeNode(c *cli.Context) error {
+	ctx := s.ctx()
+
+	var pwd, vrfpwd *string
+	if passwordFile := c.String("password"); passwordFile != "" {
+		p, err := utils.PasswordFromFile(passwordFile)
+		if err != nil {
+			return fmt.Errorf("error reading password from file: %w", err)
+		}
+		pwd = &p
+	}
+	if vrfPasswordFile := c.String("vrfpassword"); len(vrfPasswordFile) != 0 {
+		p, err := utils.PasswordFromFile(vrfPasswordFile)
+		if err != nil {
+			return fmt.Errorf("error reading VRF password from vrfpassword file \"%s\": %w", vrfPasswordFile, err)
+		}
+		vrfpwd = &p
+	}
+
+	s.Config.SetPasswords(pwd, vrfpwd)
+
+	lggr := s.Logger
+	cfg := s.Config
+
+	ldb := pg.NewLockedDB(cfg.AppID(), cfg.Database(), cfg.Database().Lock(), lggr)
+	s.LDB = ldb
+
+	// Try opening DB connection and acquiring DB locks at once
+	if err := ldb.Open(ctx); err != nil {
+		// If not successful, we know neither locks nor connection remains opened
+		return s.errorOut(fmt.Errorf("opening db: %w", err))
+	}
+	db := ldb.DB()
+	// From now on, DB locks and DB connection will be released on every return.
+	// Keep watching on logger.Fatal* calls and os.Exit(), because defer will not be executed.
+
+	err := handleNodeVersioning(ctx, db, lggr, cfg.RootDir(), cfg.Database(), cfg.WebServer().HTTPPort())
 	if err != nil {
+		return fmt.Errorf("failed to handle node versioning: %w", err)
+	}
+
+	ds := sqlutil.WrapDataSource(db, lggr, sqlutil.TimeoutHook(cfg.Database().DefaultQueryTimeout), sqlutil.MonitorHook(cfg.Database().LogSQL))
+	keyStore := keystore.New(ds, getScryptParams(cfg), lggr.Infof)
+	s.DS = ds
+	s.KeyStore = keyStore
+
+	err = s.KeyStoreAuthenticator.Authenticate(ctx, keyStore, cfg.Password())
+	if err != nil {
+		return fmt.Errorf("error authenticating keystore: %w", err)
+	}
+
+	beholderAuthHeaders, csaPubKeyHex, err := keystore.BuildBeholderAuth(ctx, keyStore.CSA())
+	if err != nil {
+		return fmt.Errorf("failed to build Beholder auth: %w", err)
+	}
+
+	// Build Beholder client: a real one when telemetry is enabled, otherwise a
+	// no-op so that downstream code never needs to nil-check.
+	if s.Config.Telemetry().Enabled() {
+		var beholderErr error
+		s.BeholderClient, beholderErr = newBeholderClient(s.Logger, keyStore, s.Config.Tracing(), s.Config, s.Config.Telemetry(), csaPubKeyHex, beholderAuthHeaders)
+		if beholderErr != nil {
+			return fmt.Errorf("failed creating beholder client: %w", beholderErr)
+		}
+	} else {
+		s.BeholderClient = beholder.NewNoopClient()
+	}
+
+	// Prometheus, grpc, tracing, and (when telemetry is on) Beholder OTel globals.
+	if err = initGlobals(s.Config.Prometheus(), s.Config.Telemetry(), s.Config.Tracing(), s.Logger, s.BeholderClient); err != nil {
+		return fmt.Errorf("failed initializing globals: %w", err)
+	}
+
+	// Wire log streaming before Start so ChipIngressLogger and other internals
+	// see the OTel-backed logger core.
+	if err = s.setupLogStreaming(); err != nil {
 		return err
 	}
-	df := diff.Diff(prevSchema, newSchema)
-	if len(df) > 0 {
-		fmt.Println(df)
-		return errors.New("schema pre- and post- rollback does not match (ctrl+f for '+' or '-' to find the changed lines)")
+
+	// Start the beholder client after log streaming is wired.
+	if err = s.BeholderClient.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start beholder client: %w", err)
+	}
+
+	if s.Config.Telemetry().Enabled() {
+		s.EmitNodeConfig(ctx)
+	}
+
+	return nil
+}
+
+func (s *Shell) setupLogStreaming() error {
+	if !s.Config.Telemetry().LogStreamingEnabled() {
+		return nil
+	}
+	if s.SetOtelCore == nil {
+		return errors.New("Shell.SetOtelCore is nil")
+	}
+	logLevel := s.Config.Telemetry().LogLevel()
+	otelCore := otelzap.NewCore(s.BeholderClient.Logger, otelzap.WithLevel(logLevel))
+	s.SetOtelCore(otelCore)
+	s.Logger.Info("Log streaming enabled")
+	return nil
+}
+
+// BeforeNode initializes database, keystore, logger, and beholder for node startup.
+// This is used as a Before hook in CLI commands that require these components.
+func (s *Shell) BeforeNode(c *cli.Context) error {
+	if err := s.beforeNode(c); err != nil {
+		return s.errorOut(err)
 	}
 	return nil
 }
 
-func insertFixtures(dbURL url.URL, pathToFixtures string) (err error) {
-	db, err := sql.Open(string(dialects.Postgres), dbURL.String())
-	if err != nil {
-		return fmt.Errorf("unable to open postgres database for creating test db: %+v", err)
-	}
-	defer func() {
-		if cerr := db.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+// afterNode is a thread-safe helper method to close the database and logger.
+// This is used in multiple places: shutdown handler, signal handler, and cleanup.
+// It uses sync.Once to ensure cleanup happens exactly once, even if called concurrently.
+func (s *Shell) afterNode(lggr logger.SugaredLogger) {
+	s.CleanupOnce.Do(func() {
+		if err := s.LDB.Close(); err != nil {
+			lggr.Criticalf("Failed to close LockedDB: %v", err)
 		}
-	}()
+		lggr.Debug("Closed DB")
 
-	_, filename, _, ok := runtime.Caller(1)
-	if !ok {
-		return errors.New("could not get runtime.Caller(1)")
+		if s.CloseLogger != nil {
+			if err := s.CloseLogger(); err != nil {
+				log.Printf("Failed to close Logger: %v", err)
+			}
+		}
+		if err := s.BeholderClient.Close(); err != nil {
+			log.Printf("Failed to close Beholder client: %v", err)
+		}
+	})
+}
+
+// AfterNode cleans up resources initialized by BeforeNode.
+// This is used as an After hook in CLI commands.
+func (s *Shell) AfterNode(c *cli.Context) error {
+	s.afterNode(logger.Sugared(s.Logger))
+	return nil
+}
+
+// getScryptParams fetches ScryptParams from a ScryptConfigReader
+func getScryptParams(config chainlink.GeneralConfig) commonkeystore.ScryptParams {
+	if config.InsecureFastScrypt() {
+		return commonkeystore.FastScryptParams
 	}
-	filepath := path.Join(path.Dir(filename), pathToFixtures)
-	fixturesSQL, err := os.ReadFile(filepath)
-	if err != nil {
-		return err
-	}
-	_, err = db.Exec(string(fixturesSQL))
-	return err
+	return commonkeystore.DefaultScryptParams
 }

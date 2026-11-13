@@ -18,7 +18,7 @@ func (o *ocr2Config) Enabled() bool {
 }
 
 func (o *ocr2Config) ContractConfirmations() uint16 {
-	return uint16(*o.c.ContractConfirmations)
+	return uint16(*o.c.ContractConfirmations) //nolint:gosec // G115: confirmation count is far below math.MaxUint16
 }
 
 func (o *ocr2Config) ContractTransmitterTransmitTimeout() time.Duration {
@@ -53,12 +53,16 @@ func (o *ocr2Config) TraceLogging() bool {
 	return *o.c.TraceLogging
 }
 
+func (o *ocr2Config) SampleTelemetry() bool {
+	return *o.c.SampleTelemetry
+}
+
 func (o *ocr2Config) CaptureEATelemetry() bool {
 	return *o.c.CaptureEATelemetry
 }
 
-func (o *ocr2Config) CaptureAutomationCustomTelemetry() bool {
-	return *o.c.CaptureAutomationCustomTelemetry
+func (o *ocr2Config) AllowNoBootstrappers() bool {
+	return *o.c.AllowNoBootstrappers
 }
 
 func (o *ocr2Config) DefaultTransactionQueueDepth() uint32 {
@@ -67,4 +71,8 @@ func (o *ocr2Config) DefaultTransactionQueueDepth() uint32 {
 
 func (o *ocr2Config) SimulateTransactions() bool {
 	return *o.c.SimulateTransactions
+}
+
+func (o *ocr2Config) KeyValueStoreRootDir() string {
+	return *o.c.KeyValueStoreRootDir
 }

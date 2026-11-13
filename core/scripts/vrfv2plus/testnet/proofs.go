@@ -12,8 +12,8 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/shopspring/decimal"
 
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/vrfkey"
 	helpers "github.com/smartcontractkit/chainlink/core/scripts/common"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/vrfkey"
 	"github.com/smartcontractkit/chainlink/v2/core/services/vrf/extraargs"
 	"github.com/smartcontractkit/chainlink/v2/core/services/vrf/proof"
 )
@@ -49,13 +49,12 @@ var rcTemplate = `{
 	callbackGasLimit: %d,
 	numWords: %d,
 	sender: %s,
-	nativePayment: %t
+	extraArgs: %s
 }
 `
 
 func generateProofForV2Plus(e helpers.Environment) {
-
-	deployCmd := flag.NewFlagSet("generate-proof", flag.ExitOnError)
+	deployCmd := flag.NewFlagSet("generate-proof-v2-plus", flag.ExitOnError)
 
 	keyHashString := deployCmd.String("key-hash", "", "key hash for VRF request")
 	preSeedString := deployCmd.String("pre-seed", "", "pre-seed for VRF request")
@@ -63,7 +62,7 @@ func generateProofForV2Plus(e helpers.Environment) {
 	blockNum := deployCmd.Uint64("block-num", 0, "block number of VRF request")
 	senderString := deployCmd.String("sender", "", "requestor of VRF request")
 	secretKeyString := deployCmd.String("secret-key", "10", "secret key for VRF V2Key")
-	subId := deployCmd.String("sub-id", "1", "subscription Id for VRF request")
+	subID := deployCmd.String("sub-id", "1", "subscription ID for VRF request")
 	callbackGasLimit := deployCmd.Uint64("gas-limit", 1_000_000, "callback gas limit for VRF request")
 	numWords := deployCmd.Uint64("num-words", 1, "number of words for VRF request")
 	nativePayment := deployCmd.Bool("native-payment", false, "requestor of VRF request")
@@ -79,6 +78,7 @@ func generateProofForV2Plus(e helpers.Environment) {
 	if err != nil {
 		panic(err)
 	}
+
 	pk := key.PublicKey
 	pkh := pk.MustHash()
 	fmt.Println("Compressed: ", pk.String())
@@ -87,6 +87,7 @@ func generateProofForV2Plus(e helpers.Environment) {
 
 	// Parse big ints and hexes.
 	requestKeyHash := common.HexToHash(*keyHashString)
+
 	requestPreSeed := decimal.RequireFromString(*preSeedString).BigInt()
 	sender := common.HexToAddress(*senderString)
 	blockHash := common.HexToHash(*blockhashString)
@@ -102,19 +103,19 @@ func generateProofForV2Plus(e helpers.Environment) {
 		helpers.PanicErr(fmt.Errorf("unable to parse preseed: %w", err))
 	}
 
-	parsedSubId, ok := new(big.Int).SetString(*subId, 10)
+	parsedSubID, ok := new(big.Int).SetString(*subID, 10)
 	if !ok {
-		helpers.PanicErr(fmt.Errorf("unable to parse subID: %s %w", *subId, err))
+		helpers.PanicErr(fmt.Errorf("unable to parse subID: %s %w", *subID, err))
 	}
-	extraArgs, err := extraargs.ExtraArgsV1(*nativePayment)
+	extraArgs, err := extraargs.EncodeV1(*nativePayment)
 	helpers.PanicErr(err)
 	preSeedData := proof.PreSeedDataV2Plus{
 		PreSeed:          preSeed,
 		BlockHash:        blockHash,
 		BlockNum:         *blockNum,
-		SubId:            parsedSubId,
-		CallbackGasLimit: uint32(*callbackGasLimit),
-		NumWords:         uint32(*numWords),
+		SubID:            parsedSubID,
+		CallbackGasLimit: uint32(*callbackGasLimit), //nolint:gosec // callback gas limit fits in uint32
+		NumWords:         uint32(*numWords),         //nolint:gosec // num words fits in uint32
 		Sender:           sender,
 		ExtraArgs:        extraArgs,
 	}

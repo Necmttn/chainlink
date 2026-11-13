@@ -1,6 +1,7 @@
 package auth_test
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,7 +16,6 @@ import (
 
 	"github.com/smartcontractkit/chainlink/v2/core/auth"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/sessions"
 	"github.com/smartcontractkit/chainlink/v2/core/web"
 	webauth "github.com/smartcontractkit/chainlink/v2/core/web/auth"
@@ -26,46 +26,47 @@ func authError(*gin.Context, webauth.Authenticator) error {
 }
 
 func authFailure(*gin.Context, webauth.Authenticator) error {
-	return auth.ErrorAuthFailed
+	return auth.ErrAuthFailed
 }
 
 func authSuccess(*gin.Context, webauth.Authenticator) error {
 	return nil
 }
 
-type userFindFailer struct {
+type userFindFailure struct {
 	sessions.AuthenticationProvider
 	err error
 }
 
-func (u userFindFailer) FindUser(email string) (sessions.User, error) {
+func (u userFindFailure) FindUser(ctx context.Context, email string) (sessions.User, error) {
 	return sessions.User{}, u.err
 }
 
-func (u userFindFailer) FindUserByAPIToken(token string) (sessions.User, error) {
+func (u userFindFailure) FindUserByAPIToken(ctx context.Context, token string) (sessions.User, error) {
 	return sessions.User{}, u.err
 }
 
-type userFindSuccesser struct {
+type userFindSuccess struct {
 	sessions.AuthenticationProvider
 	user sessions.User
 }
 
-func (u userFindSuccesser) FindUser(email string) (sessions.User, error) {
+func (u userFindSuccess) FindUser(ctx context.Context, email string) (sessions.User, error) {
 	return u.user, nil
 }
 
-func (u userFindSuccesser) FindUserByAPIToken(token string) (sessions.User, error) {
+func (u userFindSuccess) FindUserByAPIToken(ctx context.Context, token string) (sessions.User, error) {
 	return u.user, nil
 }
 
 func TestAuthenticateByToken_Success(t *testing.T) {
+	t.Parallel()
 	user := cltest.MustRandomUser(t)
 	key, secret := uuid.New().String(), uuid.New().String()
 	apiToken := auth.Token{AccessKey: key, Secret: secret}
 	err := user.SetAuthToken(&apiToken)
 	require.NoError(t, err)
-	authr := userFindSuccesser{user: user}
+	authr := userFindSuccess{user: user}
 
 	called := false
 	router := gin.New()
@@ -86,7 +87,8 @@ func TestAuthenticateByToken_Success(t *testing.T) {
 }
 
 func TestAuthenticateByToken_AuthFailed(t *testing.T) {
-	authr := userFindFailer{err: auth.ErrorAuthFailed}
+	t.Parallel()
+	authr := userFindFailure{err: auth.ErrAuthFailed}
 
 	called := false
 	router := gin.New()
@@ -107,12 +109,13 @@ func TestAuthenticateByToken_AuthFailed(t *testing.T) {
 }
 
 func TestAuthenticateByToken_RejectsBlankAccessKey(t *testing.T) {
+	t.Parallel()
 	user := cltest.MustRandomUser(t)
 	key, secret := "", uuid.New().String()
 	apiToken := auth.Token{AccessKey: key, Secret: secret}
 	err := user.SetAuthToken(&apiToken)
 	require.NoError(t, err)
-	authr := userFindSuccesser{user: user}
+	authr := userFindSuccess{user: user}
 
 	called := false
 	router := gin.New()
@@ -133,6 +136,7 @@ func TestAuthenticateByToken_RejectsBlankAccessKey(t *testing.T) {
 }
 
 func TestRequireAuth_NoneRequired(t *testing.T) {
+	t.Parallel()
 	called := false
 	var authr webauth.Authenticator
 
@@ -152,6 +156,7 @@ func TestRequireAuth_NoneRequired(t *testing.T) {
 }
 
 func TestRequireAuth_AuthFailed(t *testing.T) {
+	t.Parallel()
 	called := false
 	var authr webauth.Authenticator
 	router := gin.New()
@@ -170,6 +175,7 @@ func TestRequireAuth_AuthFailed(t *testing.T) {
 }
 
 func TestRequireAuth_LastAuthSuccess(t *testing.T) {
+	t.Parallel()
 	called := false
 	var authr webauth.Authenticator
 	router := gin.New()
@@ -188,6 +194,7 @@ func TestRequireAuth_LastAuthSuccess(t *testing.T) {
 }
 
 func TestRequireAuth_Error(t *testing.T) {
+	t.Parallel()
 	called := false
 	var authr webauth.Authenticator
 	router := gin.New()
@@ -236,7 +243,6 @@ var routesRolesMap = [...]routeRules{
 	{"DELETE", "/v2/bridge_types/MOCK", false, false, true},
 	{"POST", "/v2/transfers", false, false, false},
 	{"POST", "/v2/transfers/evm", false, false, false},
-	{"POST", "/v2/transfers/cosmos", false, false, false},
 	{"POST", "/v2/transfers/solana", false, false, false},
 	{"GET", "/v2/config", true, true, true},
 	{"GET", "/v2/config/v2", true, true, true},
@@ -272,20 +278,35 @@ var routesRolesMap = [...]routeRules{
 	{"POST", "/v2/keys/p2p/import", false, false, false},
 	{"POST", "/v2/keys/p2p/export/MOCK", false, false, false},
 	{"GET", "/v2/keys/solana", true, true, true},
-	{"GET", "/v2/keys/cosmos", true, true, true},
-	{"GET", "/v2/keys/dkgsign", true, true, true},
+	{"GET", "/v2/keys/starknet", true, true, true},
+	{"GET", "/v2/keys/aptos", true, true, true},
+	{"GET", "/v2/keys/stellar", true, true, true},
+	{"GET", "/v2/keys/tron", true, true, true},
+	{"GET", "/v2/keys/ton", true, true, true},
 	{"POST", "/v2/keys/solana", false, false, true},
-	{"POST", "/v2/keys/cosmos", false, false, true},
-	{"POST", "/v2/keys/dkgsign", false, false, true},
+	{"POST", "/v2/keys/starknet", false, false, true},
+	{"POST", "/v2/keys/aptos", false, false, true},
+	{"POST", "/v2/keys/stellar", false, false, true},
+	{"POST", "/v2/keys/tron", false, false, true},
+	{"POST", "/v2/keys/ton", false, false, true},
 	{"DELETE", "/v2/keys/solana/MOCK", false, false, false},
-	{"DELETE", "/v2/keys/cosmos/MOCK", false, false, false},
-	{"DELETE", "/v2/keys/dkgsign/MOCK", false, false, false},
+	{"DELETE", "/v2/keys/starknet/MOCK", false, false, false},
+	{"DELETE", "/v2/keys/aptos/MOCK", false, false, false},
+	{"DELETE", "/v2/keys/stellar/MOCK", false, false, false},
+	{"DELETE", "/v2/keys/tron/MOCK", false, false, false},
+	{"DELETE", "/v2/keys/ton/MOCK", false, false, false},
 	{"POST", "/v2/keys/solana/import", false, false, false},
-	{"POST", "/v2/keys/cosmos/import", false, false, false},
-	{"POST", "/v2/keys/dkgsign/import", false, false, false},
+	{"POST", "/v2/keys/starknet/import", false, false, false},
+	{"POST", "/v2/keys/aptos/import", false, false, false},
+	{"POST", "/v2/keys/stellar/import", false, false, false},
+	{"POST", "/v2/keys/tron/import", false, false, false},
+	{"POST", "/v2/keys/ton/import", false, false, false},
 	{"POST", "/v2/keys/solana/export/MOCK", false, false, false},
-	{"POST", "/v2/keys/cosmos/export/MOCK", false, false, false},
-	{"POST", "/v2/keys/dkgsign/export/MOCK", false, false, false},
+	{"POST", "/v2/keys/starknet/export/MOCK", false, false, false},
+	{"POST", "/v2/keys/aptos/export/MOCK", false, false, false},
+	{"POST", "/v2/keys/stellar/export/MOCK", false, false, false},
+	{"POST", "/v2/keys/tron/export/MOCK", false, false, false},
+	{"POST", "/v2/keys/ton/export/MOCK", false, false, false},
 	{"GET", "/v2/keys/vrf", true, true, true},
 	{"POST", "/v2/keys/vrf", false, false, true},
 	{"DELETE", "/v2/keys/vrf/MOCK", false, false, false},
@@ -304,16 +325,15 @@ var routesRolesMap = [...]routeRules{
 	{"PATCH", "/v2/log", false, false, false},
 	{"GET", "/v2/chains/evm", true, true, true},
 	{"GET", "/v2/chains/solana", true, true, true},
-	{"GET", "/v2/chains/cosmos", true, true, true},
+	{"GET", "/v2/chains/stellar", true, true, true},
 	{"GET", "/v2/chains/evm/MOCK", true, true, true},
-	{"GET", "/v2/chains/cosmos/MOCK", true, true, true},
 	{"GET", "/v2/nodes/", true, true, true},
 	{"GET", "/v2/nodes/evm", true, true, true},
 	{"GET", "/v2/nodes/solana", true, true, true},
-	{"GET", "/v2/nodes/cosmos", true, true, true},
+	{"GET", "/v2/nodes/stellar", true, true, true},
 	{"GET", "/v2/chains/evm/MOCK/nodes", true, true, true},
 	{"GET", "/v2/chains/solana/MOCK/nodes", true, true, true},
-	{"GET", "/v2/chains/cosmos/MOCK/nodes", true, true, true},
+	{"GET", "/v2/chains/stellar/MOCK/nodes", true, true, true},
 	{"GET", "/v2/nodes/evm/forwarders", true, true, true},
 	{"POST", "/v2/nodes/evm/forwarders/track", false, false, true},
 	{"DELETE", "/v2/nodes/evm/forwarders/MOCK", false, false, true},
@@ -327,8 +347,9 @@ var routesRolesMap = [...]routeRules{
 // Iterate over the above routesRolesMap and assert each path is wrapped and
 // the user role is enforced with the correct middleware
 func TestRBAC_Routemap_Admin(t *testing.T) {
+	t.Parallel()
 	app := cltest.NewApplicationEVMDisabled(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	router := web.Router(t, app, nil)
 	ts := httptest.NewServer(router)
@@ -365,8 +386,9 @@ func TestRBAC_Routemap_Admin(t *testing.T) {
 }
 
 func TestRBAC_Routemap_Edit(t *testing.T) {
+	t.Parallel()
 	app := cltest.NewApplicationEVMDisabled(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	router := web.Router(t, app, nil)
 	ts := httptest.NewServer(router)
@@ -399,12 +421,13 @@ func TestRBAC_Routemap_Edit(t *testing.T) {
 			defer cleanup()
 
 			// If this route allows up to an edit role, don't expect an unauthorized response
-			if route.EditAllowed || route.editMinimalAllowed || route.viewOnlyAllowed {
+			switch {
+			case route.EditAllowed || route.editMinimalAllowed || route.viewOnlyAllowed:
 				assert.NotEqual(t, http.StatusUnauthorized, resp.StatusCode)
 				assert.NotEqual(t, http.StatusForbidden, resp.StatusCode)
-			} else if !route.EditAllowed {
+			case !route.EditAllowed:
 				assert.Equal(t, http.StatusForbidden, resp.StatusCode)
-			} else {
+			default:
 				assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 			}
 		}()
@@ -412,8 +435,9 @@ func TestRBAC_Routemap_Edit(t *testing.T) {
 }
 
 func TestRBAC_Routemap_Run(t *testing.T) {
+	t.Parallel()
 	app := cltest.NewApplicationEVMDisabled(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	router := web.Router(t, app, nil)
 	ts := httptest.NewServer(router)
@@ -446,12 +470,13 @@ func TestRBAC_Routemap_Run(t *testing.T) {
 			defer cleanup()
 
 			// If this route allows up to an edit minimal role, don't expect an unauthorized response
-			if route.editMinimalAllowed || route.viewOnlyAllowed {
+			switch {
+			case route.editMinimalAllowed || route.viewOnlyAllowed:
 				assert.NotEqual(t, http.StatusUnauthorized, resp.StatusCode)
 				assert.NotEqual(t, http.StatusForbidden, resp.StatusCode)
-			} else if !route.EditAllowed {
+			case !route.EditAllowed:
 				assert.Equal(t, http.StatusForbidden, resp.StatusCode)
-			} else {
+			default:
 				assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 			}
 		}()
@@ -459,8 +484,9 @@ func TestRBAC_Routemap_Run(t *testing.T) {
 }
 
 func TestRBAC_Routemap_ViewOnly(t *testing.T) {
+	t.Parallel()
 	app := cltest.NewApplicationEVMDisabled(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	router := web.Router(t, app, nil)
 	ts := httptest.NewServer(router)
@@ -472,8 +498,8 @@ func TestRBAC_Routemap_ViewOnly(t *testing.T) {
 
 	// Assert all view only routes
 	for i, route := range routesRolesMap {
-		route := route
 		t.Run(fmt.Sprintf("%d-%s-%s", i, route.verb, route.path), func(t *testing.T) {
+			t.Parallel()
 			var resp *http.Response
 			var cleanup func()
 
@@ -494,12 +520,13 @@ func TestRBAC_Routemap_ViewOnly(t *testing.T) {
 			defer cleanup()
 
 			// If this route only allows view only, don't expect an unauthorized response
-			if route.viewOnlyAllowed {
+			switch {
+			case route.viewOnlyAllowed:
 				assert.NotEqual(t, http.StatusUnauthorized, resp.StatusCode)
 				assert.NotEqual(t, http.StatusForbidden, resp.StatusCode)
-			} else if !route.EditAllowed {
+			case !route.EditAllowed:
 				assert.Equal(t, http.StatusForbidden, resp.StatusCode)
-			} else {
+			default:
 				assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 			}
 		})
@@ -507,7 +534,7 @@ func TestRBAC_Routemap_ViewOnly(t *testing.T) {
 }
 
 func mustRequest(t *testing.T, method, url string, body io.Reader) *http.Request {
-	ctx := testutils.Context(t)
+	ctx := t.Context()
 	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	require.NoError(t, err)
 	return req

@@ -1,0 +1,581 @@
+package v2_test
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/beholder/beholdertest"
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities"
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	"github.com/smartcontractkit/chainlink-common/pkg/contexts"
+	"github.com/smartcontractkit/chainlink-common/pkg/custmsg"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/cresettings"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/limits"
+	regmocks "github.com/smartcontractkit/chainlink-common/pkg/types/core/mocks"
+	"github.com/smartcontractkit/chainlink-common/pkg/workflows/wasm/host"
+	modulemocks "github.com/smartcontractkit/chainlink-common/pkg/workflows/wasm/host/mocks"
+	sdkpb "github.com/smartcontractkit/chainlink-protos/cre/go/sdk"
+	eventsv2 "github.com/smartcontractkit/chainlink-protos/workflows/go/v2"
+	capmocks "github.com/smartcontractkit/chainlink/v2/core/capabilities/mocks"
+	workflowEvents "github.com/smartcontractkit/chainlink/v2/core/services/workflows/events"
+	metmocks "github.com/smartcontractkit/chainlink/v2/core/services/workflows/metering/mocks"
+	"github.com/smartcontractkit/chainlink/v2/core/services/workflows/monitoring"
+	v2 "github.com/smartcontractkit/chainlink/v2/core/services/workflows/v2"
+	"github.com/smartcontractkit/chainlink/v2/core/services/workflows/v2/triggers"
+	"github.com/smartcontractkit/chainlink/v2/core/utils/matches"
+)
+
+const (
+	v2ExecutionStartedEntity  = "workflows.v2." + workflowEvents.WorkflowExecutionStarted
+	v2ExecutionFinishedEntity = "workflows.v2." + workflowEvents.WorkflowExecutionFinished
+	v2UserLogEntity           = "workflows.v2." + workflowEvents.WorkflowUserLog
+)
+
+// failingSettingsGetter stands in for a settings service that is down, so a real
+// limits.BoundLimiter exercises its own fallback path (compiled default + advisory error)
+// rather than a hand-rolled approximation of it.
+type failingSettingsGetter struct{}
+
+func (failingSettingsGetter) GetScoped(context.Context, settings.Scope, string) (string, error) {
+	return "", errors.New("settings getter unavailable")
+}
+
+// boundLimiterWithFailingReads returns a real BoundLimiter whose reads always fail, so it
+// hands back spec's compiled default alongside an (advisory, recoverable) error.
+func boundLimiterWithFailingReads[N limits.Number](t *testing.T, spec settings.IsSetting[N]) limits.BoundLimiter[N] {
+	t.Helper()
+	l, err := limits.MakeUpperBoundLimiter(limits.Factory{Settings: failingSettingsGetter{}}, spec)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, l.Close()) })
+	return l
+}
+
+// failAfterNBoundLimiter succeeds (returning ok, nil) for the first n calls to Limit,
+// then returns (ok, failErr) after that. Only needed for non-recoverable errors: a real
+// limiter emits ErrMissingTenant solely when CRE context is absent, which the engine always
+// populates, and an always-failing fake would fail Subscribe before startExecution is reached.
+type failAfterNBoundLimiter[N limits.Number] struct {
+	mu      sync.Mutex
+	calls   int
+	n       int
+	ok      N
+	failErr error
+}
+
+func (f *failAfterNBoundLimiter[N]) Limit(context.Context) (N, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.calls > f.n {
+		return f.ok, f.failErr // resolved value, not zero; err is advisory
+	}
+	return f.ok, nil
+}
+
+func (f *failAfterNBoundLimiter[N]) Check(context.Context, N) error { return nil }
+func (f *failAfterNBoundLimiter[N]) Close() error                   { return nil }
+
+// alwaysFailTimeLimiter fails every Limit/WithTimeout call. Safe to use unconditionally
+// for ExecutionTime, which is not read during trigger-subscription init.
+type alwaysFailTimeLimiter struct{ err error }
+
+func (f *alwaysFailTimeLimiter) Limit(context.Context) (time.Duration, error) { return 0, f.err }
+
+func (f *alwaysFailTimeLimiter) WithTimeout(context.Context) (context.Context, func(), error) {
+	return nil, nil, f.err
+}
+
+func (f *alwaysFailTimeLimiter) Close() error { return nil }
+
+// alwaysErrCheckLimiter fails every Check with a plain error, standing in for a settings
+// read failure rather than the bound actually being exceeded (which would be an
+// ErrorBoundLimited). Used to exercise the fail-open branches in processLogLine.
+//
+// Limit deliberately still succeeds: LogEvent.Limit is peeked during trigger-subscription
+// init to size the user-log channel, so failing it too would break engine startup before
+// the Check path under test is ever reached.
+type alwaysErrCheckLimiter[N limits.Number] struct {
+	ok  N
+	err error
+}
+
+func (f *alwaysErrCheckLimiter[N]) Limit(context.Context) (N, error) { return f.ok, nil }
+func (f *alwaysErrCheckLimiter[N]) Check(context.Context, N) error   { return f.err }
+func (f *alwaysErrCheckLimiter[N]) Close() error                     { return nil }
+
+// latestV2FinishedEvent returns the most recently emitted v2 WorkflowExecutionFinished
+// event, or ok=false if none has been emitted yet.
+func latestV2FinishedEvent(t *testing.T, rec *beholdertest.Recorder) (evt *eventsv2.WorkflowExecutionFinished, ok bool) {
+	t.Helper()
+	msgs := rec.Messages(t, "beholder_entity", v2ExecutionFinishedEntity)
+	if len(msgs) == 0 {
+		return nil, false
+	}
+	evt = &eventsv2.WorkflowExecutionFinished{}
+	require.NoError(t, proto.Unmarshal(msgs[len(msgs)-1].Body, evt))
+	return evt, true
+}
+
+// userLogLines returns every user log line emitted so far via WorkflowUserLog events.
+func userLogLines(t *testing.T, rec *beholdertest.Recorder) []string {
+	t.Helper()
+	var lines []string
+	for _, msg := range rec.Messages(t, "beholder_entity", v2UserLogEntity) {
+		var payload eventsv2.WorkflowUserLog
+		if err := proto.Unmarshal(msg.Body, &payload); err != nil {
+			continue
+		}
+		lines = append(lines, payload.Msg)
+	}
+	return lines
+}
+
+// dropPathMode selects which engine constructor a drop-path scenario runs against. The
+// scenarios below exercise baseEngine's startExecution machinery (limiters, log emission),
+// which both constructors share, so the same assertions must hold for either one.
+type dropPathMode string
+
+const (
+	// dropPathLegacy delivers the event through a registered trigger capability, the same
+	// way a real legacy engine receives it, so its own reader/admission code runs too.
+	dropPathLegacy dropPathMode = "legacy"
+	// dropPathCoordinated delivers the event by calling ExecuteTrigger directly: a
+	// coordinatedEngine registers no trigger of its own, so that call is its only entry
+	// point, same as coordinated_engine_test.go.
+	dropPathCoordinated dropPathMode = "coordinated"
+)
+
+// dropPathModes is every mode a drop-path scenario runs under, unless the scenario is
+// specific to one engine (see TestEngine_AdmissionDenial_StaysSilent).
+var dropPathModes = []dropPathMode{dropPathLegacy, dropPathCoordinated}
+
+// dropPathHarness is a minimal engine with a single trigger subscription (id_0), ready to
+// have a trigger event delivered through deliver to drive startExecution. Callers customize
+// cfg.LocalLimiters / cfg.ShardingEnabled / etc. via configure before the harness starts the
+// engine, and set up the second Module.Execute expectation (for the per-execution call, if
+// reached) themselves.
+type dropPathHarness struct {
+	module              *modulemocks.ModuleV2
+	deliver             func(ev capabilities.TriggerResponse)
+	executionFinishedCh chan string
+	rec                 *beholdertest.Recorder
+	ackCalls            atomic.Int32 // legacy only: dropPathCoordinated uses noopAcknowledger
+}
+
+func newDropPathHarness(t *testing.T, mode dropPathMode, billingClient *metmocks.BillingClient, configure func(cfg *v2.EngineConfig)) *dropPathHarness {
+	t.Helper()
+
+	module := modulemocks.NewModuleV2(t)
+	module.EXPECT().Start()
+	module.EXPECT().Close()
+	capreg := regmocks.NewCapabilitiesRegistry(t)
+	capreg.EXPECT().LocalNode(matches.AnyContext).Return(newNode(t), nil)
+
+	initDoneCh := make(chan error, 1)
+	executionFinishedCh := make(chan string, 1)
+
+	cfg := defaultTestConfig(t, nil)
+	cfg.Module = module
+	cfg.CapRegistry = capreg
+	cfg.BillingClient = billingClient
+	cfg.OrgResolver = &mockOrgResolver{orgID: "test-org-123"}
+	cfg.Hooks = v2.LifecycleHooks{
+		OnInitialized: func(err error) {
+			initDoneCh <- err
+		},
+		OnExecutionFinished: func(executionID, _ string) {
+			executionFinishedCh <- executionID
+		},
+	}
+	rec := beholdertest.NewRecorder()
+	cfg.EventEmitter = workflowEvents.NewEmitter(rec, workflowEvents.WithNoDurableEmit())
+	cfg.BeholderEmitter = custmsg.NewLabelerWithEmitter(rec)
+
+	if configure != nil {
+		configure(cfg)
+	}
+
+	h := &dropPathHarness{module: module, executionFinishedCh: executionFinishedCh, rec: rec}
+
+	switch mode {
+	case dropPathLegacy:
+		// Legacy registers its own triggers, so its subscription phase always calls
+		// Module.Execute once for the Subscribe request, regardless of what's under test
+		// below. coordinatedEngine has no subscription phase of its own (the coordinator
+		// registers triggers externally), so it must not expect this call.
+		module.EXPECT().Execute(matches.AnyContext, mock.Anything, mock.Anything).Return(newTriggerSubs(1), nil).Once()
+
+		subscribedToTriggersCh := make(chan []string, 1)
+		cfg.Hooks.OnSubscribedToTriggers = func(triggerIDs []string) {
+			subscribedToTriggersCh <- triggerIDs
+		}
+
+		trigger := capmocks.NewTriggerCapability(t)
+		capreg.EXPECT().GetTrigger(matches.AnyContext, "id_0").Return(trigger, nil)
+		eventCh := make(chan capabilities.TriggerResponse)
+		trigger.EXPECT().RegisterTrigger(matches.AnyContext, mock.Anything).Return(eventCh, nil).Once()
+		trigger.EXPECT().UnregisterTrigger(matches.AnyContext, mock.Anything).Return(nil).Once()
+		// Some drop paths return before the trigger event is ever ACKed, so this
+		// must not be a hard requirement across all harness users.
+		trigger.EXPECT().AckEvent(matches.AnyContext, mock.Anything, mock.Anything, mock.Anything).
+			Run(func(context.Context, string, string, string) { h.ackCalls.Add(1) }).Return(nil).Maybe()
+
+		engine, err := v2.NewEngine(cfg)
+		require.NoError(t, err)
+		require.NoError(t, engine.Start(t.Context()))
+		t.Cleanup(func() { require.NoError(t, engine.Close()) })
+
+		require.NoError(t, <-initDoneCh)
+		require.Equal(t, []string{"id_0"}, <-subscribedToTriggersCh)
+
+		h.deliver = func(ev capabilities.TriggerResponse) { eventCh <- ev }
+
+	case dropPathCoordinated:
+		cfg.TriggerAcknowledger = noopAcknowledger{}
+
+		engine, err := v2.NewCoordinatedEngine(cfg)
+		require.NoError(t, err)
+		require.NoError(t, engine.Start(t.Context()))
+		t.Cleanup(func() { require.NoError(t, engine.Close()) })
+
+		require.NoError(t, <-initDoneCh)
+
+		ctx := contexts.WithCRE(t.Context(), contexts.CRE{Owner: cfg.WorkflowOwner, Workflow: cfg.WorkflowID})
+		h.deliver = func(ev capabilities.TriggerResponse) {
+			go func() {
+				_ = engine.ExecuteTrigger(ctx, triggers.CoordinatedEvent{
+					WorkflowID:   cfg.WorkflowID,
+					TriggerCapID: "id_0",
+					ObservedAt:   time.Now(),
+					Event:        ev,
+				})
+			}()
+		}
+	}
+
+	return h
+}
+
+// TestEngine_LimitReadFallback_ExecutesAnyway covers: an execution proceeds to
+// completion (instead of being silently dropped) when a limit read fails,
+// falling back to the setting's static default.
+func TestEngine_LimitReadFallback_ExecutesAnyway(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]func(cfg *v2.EngineConfig){
+		"ExecutionTime": func(cfg *v2.EngineConfig) {
+			cfg.LocalLimiters.ExecutionTime = &alwaysFailTimeLimiter{err: errors.New("limit read boom")}
+		},
+		"LogEvent": func(cfg *v2.EngineConfig) {
+			cfg.LocalLimiters.LogEvent = boundLimiterWithFailingReads(t, cresettings.Default.PerWorkflow.LogEventLimit)
+		},
+		"ExecutionResponse": func(cfg *v2.EngineConfig) {
+			cfg.LocalLimiters.ExecutionResponse = boundLimiterWithFailingReads(t, cresettings.Default.PerWorkflow.ExecutionResponseLimit)
+		},
+	}
+
+	for _, mode := range dropPathModes {
+		for name, breakLimiter := range testCases {
+			t.Run(string(mode)+"/"+name, func(t *testing.T) {
+				t.Parallel()
+
+				billingClient := setupMockBillingClient(t)
+				harness := newDropPathHarness(t, mode, billingClient, breakLimiter)
+
+				harness.module.EXPECT().Execute(matches.AnyContext, mock.Anything, mock.Anything).Return(nil, nil).Once()
+				harness.deliver(capabilities.TriggerResponse{
+					Event: capabilities.TriggerEvent{TriggerType: "basic-trigger@1.0.0", ID: "event_" + name},
+				})
+
+				executionID := <-harness.executionFinishedCh
+				require.NotEmpty(t, executionID)
+
+				startedMsgs := harness.rec.Messages(t, "beholder_entity", v2ExecutionStartedEntity)
+				assert.NotEmpty(t, startedMsgs, "execution should still emit a Started event despite the limit read failure")
+
+				evt, ok := latestV2FinishedEvent(t, harness.rec)
+				require.True(t, ok, "execution should still emit a Finished event despite the limit read failure")
+				assert.Equal(t, eventsv2.ExecutionStatus_EXECUTION_STATUS_SUCCEEDED, evt.Status)
+			})
+		}
+	}
+}
+
+// TestEngine_LimitReadNonRecoverable_Drops is the counterpart to
+// TestEngine_LimitReadFallback_ExecutesAnyway. A limit read that leaves no usable value —
+// ErrMissingTenant, i.e. the CRE context was never populated — is a programming error rather
+// than a degraded settings service, so the engine must fail the execution loudly instead of
+// enforcing the zero value it got back.
+func TestEngine_LimitReadNonRecoverable_Drops(t *testing.T) {
+	t.Parallel()
+
+	missingTenant := limits.ErrMissingTenant{Scope: settings.ScopeWorkflow}
+	require.False(t, limits.IsErrRecoverable(missingTenant), "precondition")
+
+	// LogEvent and ExecutionResponse are also peeked once during the legacy subscription
+	// phase (getTriggerSubscriptions), which spends one call of the limiter's budget before
+	// startExecution's own peek ever runs. coordinatedEngine has no subscription phase of its
+	// own (the coordinator registers triggers externally), so its first and only peek is the
+	// one in startExecution: the budget that forces a failure there must be one call smaller.
+	testCases := func(mode dropPathMode) map[string]func(cfg *v2.EngineConfig) {
+		n := 1
+		if mode == dropPathCoordinated {
+			n = 0
+		}
+		return map[string]func(cfg *v2.EngineConfig){
+			"ExecutionTime": func(cfg *v2.EngineConfig) {
+				cfg.LocalLimiters.ExecutionTime = &alwaysFailTimeLimiter{err: missingTenant}
+			},
+			"LogEvent": func(cfg *v2.EngineConfig) {
+				cfg.LocalLimiters.LogEvent = &failAfterNBoundLimiter[int]{n: n, ok: 1000, failErr: missingTenant}
+			},
+			"ExecutionResponse": func(cfg *v2.EngineConfig) {
+				cfg.LocalLimiters.ExecutionResponse = &failAfterNBoundLimiter[commonconfig.Size]{n: n, ok: commonconfig.Size(10 * 1024 * 1024), failErr: missingTenant}
+			},
+		}
+	}
+
+	wantDropReason := map[string]string{
+		"ExecutionTime":     monitoring.TriggerDropReasonExecutionTimeLimitReadFailed,
+		"LogEvent":          monitoring.TriggerDropReasonLogEventLimitReadFailed,
+		"ExecutionResponse": monitoring.TriggerDropReasonExecutionResponseLimitReadFailed,
+	}
+
+	for _, mode := range dropPathModes {
+		for name, breakLimiter := range testCases(mode) {
+			t.Run(string(mode)+"/"+name, func(t *testing.T) {
+				t.Parallel()
+
+				// No module.Execute expectation: the execution must never reach WASM.
+				meter := newDropMeter(t)
+				harness := newDropPathHarness(t, mode, setupMockBillingClient(t), func(cfg *v2.EngineConfig) {
+					cfg.Meter = meter.meter
+					breakLimiter(cfg)
+				})
+
+				harness.deliver(capabilities.TriggerResponse{
+					Event: capabilities.TriggerEvent{TriggerType: "basic-trigger@1.0.0", ID: "event_nonrecoverable_" + name},
+				})
+
+				var evt *eventsv2.WorkflowExecutionFinished
+				require.EventuallyWithT(t, func(c *assert.CollectT) {
+					got, ok := latestV2FinishedEvent(t, harness.rec)
+					if !assert.True(c, ok) {
+						return
+					}
+					evt = got
+				}, 5*time.Second, 50*time.Millisecond)
+
+				assert.NotEmpty(t, harness.rec.Messages(t, "beholder_entity", v2ExecutionStartedEntity),
+					"the Started/Finished pair is what makes the drop visible; Finished alone is not enough")
+				assert.Equal(t, eventsv2.ExecutionStatus_EXECUTION_STATUS_FAILED, evt.Status,
+					"a programming error must not be papered over with the zero value")
+				assert.Equal(t, eventsv2.ClassifiedExecutionStatus_CLASSIFIED_EXECUTION_STATUS_SYSTEM_ERROR, evt.ClassifiedStatus,
+					"a missing tenant is our bug, not the user's")
+				meter.requireDrops(t, map[string]int64{wantDropReason[name]: 1})
+			})
+		}
+	}
+}
+
+// TestEngine_LimitReadFallback_UsesLimiterValue: on a read failure, the engine must use
+// whatever value the limiter returns, not substitute its own compiled default.
+func TestEngine_LimitReadFallback_UsesLimiterValue(t *testing.T) {
+	t.Parallel()
+
+	const resolvedValue = commonconfig.Size(12345)
+
+	// A real limiter whose own default differs from the engine-wide compiled default, so
+	// "used the limiter's value" and "substituted its own default" are distinguishable.
+	spec := cresettings.Default.PerWorkflow.ExecutionResponseLimit
+	spec.DefaultValue = resolvedValue
+	require.NotEqual(t, resolvedValue, cresettings.Default.PerWorkflow.ExecutionResponseLimit.DefaultValue)
+
+	for _, mode := range dropPathModes {
+		t.Run(string(mode), func(t *testing.T) {
+			t.Parallel()
+
+			harness := newDropPathHarness(t, mode, setupMockBillingClient(t), func(cfg *v2.EngineConfig) {
+				cfg.LocalLimiters.ExecutionResponse = boundLimiterWithFailingReads(t, spec)
+			})
+
+			var gotMaxResponseSize uint64
+			harness.module.EXPECT().Execute(matches.AnyContext, mock.Anything, mock.Anything).
+				Run(func(_ context.Context, req *sdkpb.ExecuteRequest, _ host.ExecutionHelper) {
+					gotMaxResponseSize = req.MaxResponseSize
+				}).
+				Return(nil, nil).Once()
+			harness.deliver(capabilities.TriggerResponse{
+				Event: capabilities.TriggerEvent{TriggerType: "basic-trigger@1.0.0", ID: "event_limiter_value"},
+			})
+
+			executionID := <-harness.executionFinishedCh
+			require.NotEmpty(t, executionID)
+
+			assert.Equal(t, uint64(resolvedValue), gotMaxResponseSize,
+				"engine must use the value the limiter returned, not fall back to its own compiled default")
+		})
+	}
+}
+
+// TestEngine_AdmissionDenial_StaysSilent is a regression guard: an admission layer (e.g.
+// shard failover) denies the event on every node that does not own the workflow, so emitting
+// Started/Finished there (unlike the other drop paths) would publish a DON-wide failure for a
+// run that actually succeeded on the owner. This must stay silent.
+func TestEngine_AdmissionDenial_StaysSilent(t *testing.T) {
+	t.Parallel()
+
+	billingClient := metmocks.NewBillingClient(t) // no billing calls expected: admission runs before metering
+
+	// OnTriggerAdmission is a legacy-only hook (coordinatedEngine.ExecuteTrigger never calls
+	// it; admission is the coordinator's job). So this scenario only applies to dropPathLegacy.
+	harness := newDropPathHarness(t, dropPathLegacy, billingClient, func(cfg *v2.EngineConfig) {
+		cfg.Hooks.OnTriggerAdmission = func(context.Context, triggers.CoordinatedEvent) error {
+			return errors.New("not owned by this node")
+		}
+	})
+
+	harness.deliver(capabilities.TriggerResponse{
+		Event: capabilities.TriggerEvent{TriggerType: "basic-trigger@1.0.0", ID: "event_admission_denied"},
+	})
+
+	// Verify no events were emitted.
+	require.Never(t, func() bool {
+		started := harness.rec.Messages(t, "beholder_entity", v2ExecutionStartedEntity)
+		finished := harness.rec.Messages(t, "beholder_entity", v2ExecutionFinishedEntity)
+		return len(started) > 0 || len(finished) > 0
+	}, 500*time.Millisecond, 25*time.Millisecond)
+
+	// A denied event must still be ACKed (engine.go): otherwise the trigger capability
+	// would redeliver it forever on a node that will never own this workflow.
+	require.Eventually(t, func() bool { return harness.ackCalls.Load() == 1 }, 2*time.Second, 25*time.Millisecond,
+		"an admission-denied event must still be ACKed")
+}
+
+// TestEngine_UserLog_LogLineCheck covers the LogLine Limit()->Check() swap: the bound is
+// now enforced by the limiter (so it records usage/denied), truncation is driven by the
+// bound carried on the returned ErrorBoundLimited, and a settings read failure fails open
+// by emitting the line untruncated instead of falling back to a hardcoded default.
+func TestEngine_UserLog_LogLineCheck(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range dropPathModes {
+		t.Run(string(mode), func(t *testing.T) {
+			t.Parallel()
+
+			t.Run("over-long message truncated to the bound", func(t *testing.T) {
+				t.Parallel()
+
+				harness := newDropPathHarness(t, mode, setupMockBillingClient(t), func(cfg *v2.EngineConfig) {
+					cfg.LocalLimiters.LogLine = limits.NewUpperBoundLimiter[commonconfig.Size](10)
+				})
+
+				harness.module.EXPECT().Execute(matches.AnyContext, mock.Anything, mock.Anything).
+					Run(func(_ context.Context, _ *sdkpb.ExecuteRequest, executor host.ExecutionHelper) {
+						require.NoError(t, executor.EmitUserLog("0123456789ABCDEF"))
+					}).
+					Return(nil, nil).Once()
+				harness.deliver(capabilities.TriggerResponse{
+					Event: capabilities.TriggerEvent{TriggerType: "basic-trigger@1.0.0", ID: "event_truncated"},
+				})
+
+				require.EventuallyWithT(t, func(c *assert.CollectT) {
+					assert.Contains(c, userLogLines(t, harness.rec), "0123456789 ...(truncated)")
+				}, 5*time.Second, 50*time.Millisecond)
+			})
+
+			t.Run("settings read failure emits untruncated", func(t *testing.T) {
+				t.Parallel()
+
+				harness := newDropPathHarness(t, mode, setupMockBillingClient(t), func(cfg *v2.EngineConfig) {
+					cfg.LocalLimiters.LogLine = &alwaysErrCheckLimiter[commonconfig.Size]{err: errors.New("settings unavailable")}
+				})
+
+				const message = "this message is not over any real bound"
+				harness.module.EXPECT().Execute(matches.AnyContext, mock.Anything, mock.Anything).
+					Run(func(_ context.Context, _ *sdkpb.ExecuteRequest, executor host.ExecutionHelper) {
+						require.NoError(t, executor.EmitUserLog(message))
+					}).
+					Return(nil, nil).Once()
+				harness.deliver(capabilities.TriggerResponse{
+					Event: capabilities.TriggerEvent{TriggerType: "basic-trigger@1.0.0", ID: "event_untruncated"},
+				})
+
+				require.EventuallyWithT(t, func(c *assert.CollectT) {
+					assert.Contains(c, userLogLines(t, harness.rec), message)
+				}, 5*time.Second, 50*time.Millisecond)
+			})
+		})
+	}
+}
+
+// TestEngine_UserLog_LogEventCheckFailure_KeepsDraining covers the fail-open fix in the
+// LogEvent.Check branch: a settings read failure (a plain error, not ErrorBoundLimited)
+// used to return false from processLogLine, which ended the emitUserLogs drain goroutine
+// and silently discarded every remaining user log for the execution. Both lines must land.
+func TestEngine_UserLog_LogEventCheckFailure_KeepsDraining(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range dropPathModes {
+		t.Run(string(mode), func(t *testing.T) {
+			t.Parallel()
+
+			harness := newDropPathHarness(t, mode, setupMockBillingClient(t), func(cfg *v2.EngineConfig) {
+				cfg.LocalLimiters.LogEvent = &alwaysErrCheckLimiter[int]{ok: 1000, err: errors.New("settings unavailable")}
+			})
+
+			harness.module.EXPECT().Execute(matches.AnyContext, mock.Anything, mock.Anything).
+				Run(func(_ context.Context, _ *sdkpb.ExecuteRequest, executor host.ExecutionHelper) {
+					require.NoError(t, executor.EmitUserLog("first line"))
+					require.NoError(t, executor.EmitUserLog("second line"))
+				}).
+				Return(nil, nil).Once()
+			harness.deliver(capabilities.TriggerResponse{
+				Event: capabilities.TriggerEvent{TriggerType: "basic-trigger@1.0.0", ID: "event_log_event_check_fails"},
+			})
+
+			require.EventuallyWithT(t, func(c *assert.CollectT) {
+				lines := userLogLines(t, harness.rec)
+				assert.Contains(c, lines, "first line")
+				assert.Contains(c, lines, "second line")
+			}, 5*time.Second, 50*time.Millisecond)
+		})
+	}
+}
+
+// TestAdmissionErrors_MatchTriggerSentinels asserts that the coordinator
+// recognises admission outcomes through the defined error sentinels.
+func TestAdmissionErrors_MatchTriggerSentinels(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		err        error
+		wantDenied bool
+		wantCached bool
+	}{
+		{name: "not owner is denied", err: v2.ErrShardDeniedNotOwner, wantDenied: true},
+		{name: "orchestrator error is denied", err: v2.ErrShardDeniedOrchestrator, wantDenied: true},
+		{name: "cache is cached", err: v2.ErrAdmissionCache, wantCached: true},
+		{name: "unrelated error is neither", err: v2.ErrEngineDraining},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.wantDenied, errors.Is(tc.err, triggers.ErrAdmissionDenied),
+				"errors.Is(%v, ErrAdmissionDenied)", tc.err)
+			assert.Equal(t, tc.wantCached, errors.Is(tc.err, triggers.ErrAdmissionCached),
+				"errors.Is(%v, ErrAdmissionCached)", tc.err)
+		})
+	}
+}

@@ -29,7 +29,7 @@ AllowSimplePasswords = false # Default
 ```toml
 URL = "postgresql://user:pass@localhost:5432/dbname?sslmode=disable" # Example
 ```
-URL is the PostgreSQL URI to connect to your database. Chainlink nodes require Postgres versions >= 11. See
+URL is the PostgreSQL URI to connect to your database. Chainlink nodes require Postgres versions >= 15. See
 [Running a Chainlink Node](https://docs.chain.link/docs/running-a-chainlink-node/#set-the-remote-database_url-config) for an example.
 
 Environment variable: `CL_DATABASE_URL`
@@ -50,6 +50,19 @@ AllowSimplePasswords = false # Default
 AllowSimplePasswords skips the password complexity check normally enforced on URL & BackupURL.
 
 Environment variable: `CL_DATABASE_ALLOW_SIMPLE_PASSWORDS`
+
+## WebServer.OIDC
+```toml
+[WebServer.OIDC]
+clientSecret = "secret" # Example
+```
+Optional OIDC config
+
+### clientSecret
+```toml
+clientSecret = "secret" # Example
+```
+clientSecret is the secret value sent to the OIDC provider to exchange authorization code for ID token
 
 ## WebServer.LDAP
 ```toml
@@ -179,3 +192,31 @@ ThresholdKeyShare = "A-Threshold-Decryption-Key-Share" # Example
 ```
 ThresholdKeyShare used by the threshold decryption OCR plugin
 
+## CRE.Streams
+```toml
+[CRE.Streams]
+ApiKey = "streams-api-key" # Example
+ApiSecret = "streams-api-secret" # Example
+```
+
+
+### ApiKey
+```toml
+ApiKey = "streams-api-key" # Example
+```
+ApiKey is the API key used for authenticating with the CLL Data Streams SDK.
+
+### ApiSecret
+```toml
+ApiSecret = "streams-api-secret" # Example
+```
+ApiSecret is the API secret used for authenticating with the CLL Data Streams SDK.
+
+## CRE.LocalSecretOverrides
+```toml
+[CRE.LocalSecretOverrides]
+```
+LocalSecretOverrides maps workflow owner to (secret id -> secret value) map.
+When non-empty, overrides are used as fallback when Vault calls fail.
+
+"0000000000000000000000000000000000000000" = { "my-secret-id" = "my-plaintext-value" } # Example

@@ -1,6 +1,8 @@
 package blockhashstore_test
 
 import (
+	"math"
+	"math/big"
 	"testing"
 	"time"
 
@@ -10,11 +12,13 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/client/mocks"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/logpoller"
-	mocklp "github.com/smartcontractkit/chainlink/v2/core/chains/evm/logpoller/mocks"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ethkey"
+	"github.com/smartcontractkit/chainlink-common/pkg/services/servicetest"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
+	"github.com/smartcontractkit/chainlink-evm/pkg/client"
+	"github.com/smartcontractkit/chainlink-evm/pkg/logpoller"
+	lpmocks "github.com/smartcontractkit/chainlink/v2/common/logpoller/mocks"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
@@ -25,21 +29,18 @@ import (
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
-	evmrelay "github.com/smartcontractkit/chainlink/v2/core/services/relay/evm"
 )
 
 func TestDelegate_JobType(t *testing.T) {
 	t.Parallel()
 
 	lggr := logger.TestLogger(t)
-	delegate := blockhashstore.NewDelegate(lggr, nil, nil)
+	delegate := blockhashstore.NewDelegate(nil, lggr, nil, nil)
 
 	assert.Equal(t, job.BlockhashStore, delegate.JobType())
 }
 
 type testData struct {
-	ethClient    *mocks.Client
 	ethKeyStore  keystore.Eth
 	legacyChains legacyevm.LegacyChainContainer
 	sendingKey   ethkey.KeyV2
@@ -50,30 +51,32 @@ func createTestDelegate(t *testing.T) (*blockhashstore.Delegate, *testData) {
 	t.Helper()
 
 	lggr, logs := logger.TestLoggerObserved(t, zapcore.DebugLevel)
-	ethClient := evmtest.NewEthClientMockWithDefaultChain(t)
+	ethClient := client.NewNullClient(big.NewInt(evmtest.NullClientChainID), logger.TestLogger(t))
 	cfg := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
 		c.Feature.LogPoller = func(b bool) *bool { return &b }(true)
 	})
 	db := pgtest.NewSqlxDB(t)
-	kst := cltest.NewKeyStore(t, db, cfg.Database()).Eth()
+	kst := cltest.NewKeyStore(t, db).Eth()
 	sendingKey, _ := cltest.MustInsertRandomKey(t, kst)
-	lp := &mocklp.LogPoller{}
-	lp.On("RegisterFilter", mock.Anything).Return(nil)
-	lp.On("LatestBlock", mock.Anything, mock.Anything).Return(logpoller.LogPollerBlock{}, nil)
+	lp := lpmocks.NewLogPoller(t)
+	servicetest.SetupNoOpMock(lp)
+	lp.On("RegisterFilter", mock.Anything, mock.Anything).Return(nil).Maybe()
+	lp.On("LatestBlock", mock.Anything).Return(logpoller.Block{}, nil).Maybe()
 
-	relayExtenders := evmtest.NewChainRelayExtenders(
+	legacyChains := evmtest.NewLegacyChains(
 		t,
 		evmtest.TestChainOpts{
-			DB:            db,
-			KeyStore:      kst,
-			GeneralConfig: cfg,
-			Client:        ethClient,
-			LogPoller:     lp,
+			ChainConfigs:   cfg.EVMConfigs(),
+			DatabaseConfig: cfg.Database(),
+			FeatureConfig:  cfg.Feature(),
+			ListenerConfig: cfg.Database().Listener(),
+			DB:             db,
+			KeyStore:       kst,
+			Client:         ethClient,
+			LogPoller:      lp,
 		},
 	)
-	legacyChains := evmrelay.NewLegacyChainsFromRelayerExtenders(relayExtenders)
-	return blockhashstore.NewDelegate(lggr, legacyChains, kst), &testData{
-		ethClient:    ethClient,
+	return blockhashstore.NewDelegate(cfg, lggr, legacyChains, kst), &testData{
 		ethKeyStore:  kst,
 		legacyChains: legacyChains,
 		sendingKey:   sendingKey,
@@ -87,29 +90,31 @@ func TestDelegate_ServicesForSpec(t *testing.T) {
 	delegate, testData := createTestDelegate(t)
 
 	require.NotEmpty(t, testData.legacyChains.Slice())
-	defaultWaitBlocks := (int32)(testData.legacyChains.Slice()[0].Config().EVM().FinalityDepth())
+	chain, ok := testData.legacyChains.Slice()[0].(legacyevm.Chain)
+	require.True(t, ok)
+	finalityDepth := chain.Config().EVM().FinalityDepth()
+	if finalityDepth > math.MaxInt32 {
+		t.Fatalf("finality depth overflows int32: %d", finalityDepth)
+	}
+	defaultWaitBlocks := int32(finalityDepth) //nolint:gosec // G115: guarded above by finalityDepth > math.MaxInt32
 
 	t.Run("happy", func(t *testing.T) {
-		spec := job.Job{BlockhashStoreSpec: &job.BlockhashStoreSpec{WaitBlocks: defaultWaitBlocks, EVMChainID: (*big.Big)(testutils.FixtureChainID)}}
-		services, err := delegate.ServicesForSpec(spec)
+		spec := job.Job{BlockhashStoreSpec: &job.BlockhashStoreSpec{WaitBlocks: defaultWaitBlocks, EVMChainID: (*sqlutil.Big)(testutils.FixtureChainID)}}
+		services, err := delegate.ServicesForSpec(t.Context(), spec)
 
 		require.NoError(t, err)
 		require.Len(t, services, 1)
 	})
 
 	t.Run("happy with coordinators", func(t *testing.T) {
-		coordinatorV1 := cltest.NewEIP55Address()
-		coordinatorV2 := cltest.NewEIP55Address()
 		coordinatorV2Plus := cltest.NewEIP55Address()
 
 		spec := job.Job{BlockhashStoreSpec: &job.BlockhashStoreSpec{
 			WaitBlocks:               defaultWaitBlocks,
-			CoordinatorV1Address:     &coordinatorV1,
-			CoordinatorV2Address:     &coordinatorV2,
 			CoordinatorV2PlusAddress: &coordinatorV2Plus,
-			EVMChainID:               (*big.Big)(testutils.FixtureChainID),
+			EVMChainID:               (*sqlutil.Big)(testutils.FixtureChainID),
 		}}
-		services, err := delegate.ServicesForSpec(spec)
+		services, err := delegate.ServicesForSpec(t.Context(), spec)
 
 		require.NoError(t, err)
 		require.Len(t, services, 1)
@@ -117,26 +122,27 @@ func TestDelegate_ServicesForSpec(t *testing.T) {
 
 	t.Run("missing BlockhashStoreSpec", func(t *testing.T) {
 		spec := job.Job{BlockhashStoreSpec: nil}
-		_, err := delegate.ServicesForSpec(spec)
+		_, err := delegate.ServicesForSpec(t.Context(), spec)
 		assert.Error(t, err)
 	})
 
 	t.Run("wrong EVMChainID", func(t *testing.T) {
 		spec := job.Job{BlockhashStoreSpec: &job.BlockhashStoreSpec{
-			EVMChainID: big.NewI(123),
+			EVMChainID: sqlutil.NewI(123),
 		}}
-		_, err := delegate.ServicesForSpec(spec)
+		_, err := delegate.ServicesForSpec(t.Context(), spec)
 		assert.Error(t, err)
 	})
 
 	t.Run("missing EnabledKeysForChain", func(t *testing.T) {
-		_, err := testData.ethKeyStore.Delete(testData.sendingKey.ID())
+		ctx := t.Context()
+		_, err := testData.ethKeyStore.Delete(ctx, testData.sendingKey.ID())
 		require.NoError(t, err)
 
 		spec := job.Job{BlockhashStoreSpec: &job.BlockhashStoreSpec{
 			WaitBlocks: defaultWaitBlocks,
 		}}
-		_, err = delegate.ServicesForSpec(spec)
+		_, err = delegate.ServicesForSpec(t.Context(), spec)
 		assert.Error(t, err)
 	})
 }
@@ -147,22 +153,29 @@ func TestDelegate_StartStop(t *testing.T) {
 	delegate, testData := createTestDelegate(t)
 
 	require.NotEmpty(t, testData.legacyChains.Slice())
-	defaultWaitBlocks := (int32)(testData.legacyChains.Slice()[0].Config().EVM().FinalityDepth())
+	chain, ok := testData.legacyChains.Slice()[0].(legacyevm.Chain)
+	require.True(t, ok)
+
+	finalityDepth := chain.Config().EVM().FinalityDepth()
+	if finalityDepth > math.MaxInt32 {
+		t.Fatalf("finality depth overflows int32: %d", finalityDepth)
+	}
+	defaultWaitBlocks := int32(finalityDepth) //nolint:gosec // G115: guarded above by finalityDepth > math.MaxInt32
 	spec := job.Job{BlockhashStoreSpec: &job.BlockhashStoreSpec{
 		WaitBlocks: defaultWaitBlocks,
 		PollPeriod: time.Second,
 		RunTimeout: testutils.WaitTimeout(t),
-		EVMChainID: (*big.Big)(testutils.FixtureChainID),
+		EVMChainID: (*sqlutil.Big)(testutils.FixtureChainID),
 	}}
-	services, err := delegate.ServicesForSpec(spec)
+	services, err := delegate.ServicesForSpec(t.Context(), spec)
 
 	require.NoError(t, err)
 	require.Len(t, services, 1)
 
-	err = services[0].Start(testutils.Context(t))
+	err = services[0].Start(t.Context())
 	require.NoError(t, err)
 
-	assert.Eventually(t, func() bool {
+	require.Eventually(t, func() bool {
 		return testData.logs.FilterMessage("Starting BHS feeder").Len() > 0 &&
 			testData.logs.FilterMessage("Running BHS feeder").Len() > 0 &&
 			testData.logs.FilterMessage("BHS feeder run completed successfully").Len() > 0

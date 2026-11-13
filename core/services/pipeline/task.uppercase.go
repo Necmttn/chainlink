@@ -2,12 +2,12 @@ package pipeline
 
 import (
 	"context"
+	stderrors "errors"
 	"strings"
 
 	"github.com/pkg/errors"
-	"go.uber.org/multierr"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 )
 
 // Return types:
@@ -32,7 +32,7 @@ func (t *UppercaseTask) Run(_ context.Context, _ logger.Logger, vars Vars, input
 
 	var input StringParam
 
-	err = multierr.Combine(
+	err = stderrors.Join(
 		errors.Wrap(ResolveParam(&input, From(VarExpr(t.Input, vars), NonemptyString(t.Input), Input(inputs, 0))), "input"),
 	)
 	if err != nil {

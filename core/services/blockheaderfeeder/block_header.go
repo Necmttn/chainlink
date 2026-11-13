@@ -30,13 +30,13 @@ func NewGethBlockHeaderProvider(client Client) *GethBlockHeaderProvider {
 // block header format is different from go-ethereum types.Header.
 // validation for invalid chain ID is done upstream in blockheaderfeeder.validate.go
 func (p *GethBlockHeaderProvider) RlpHeadersBatch(ctx context.Context, blockRange []*big.Int) ([][]byte, error) {
-	var reqs []rpc.BatchElem
+	reqs := make([]rpc.BatchElem, 0, len(blockRange))
 	for _, num := range blockRange {
 		parentBlockNum := big.NewInt(num.Int64() + 1)
 		req := rpc.BatchElem{
 			Method: "eth_getHeaderByNumber",
 			// Get child block since it's the one that has the parent hash in its header.
-			Args:   []interface{}{hexutil.EncodeBig(parentBlockNum)},
+			Args:   []any{hexutil.EncodeBig(parentBlockNum)},
 			Result: &types.Header{},
 		}
 		reqs = append(reqs, req)

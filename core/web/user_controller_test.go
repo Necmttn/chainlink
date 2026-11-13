@@ -2,7 +2,6 @@ package web_test
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/smartcontractkit/chainlink/v2/core/auth"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/sessions"
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
 )
@@ -23,7 +21,7 @@ func TestUserController_UpdatePassword(t *testing.T) {
 	t.Parallel()
 
 	app := cltest.NewApplicationEVMDisabled(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	u := cltest.User{}
 	client := app.NewHTTPClient(&u)
@@ -70,8 +68,9 @@ func TestUserController_UpdatePassword(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			resp, cleanup := client.Patch("/v2/user/password", bytes.NewBufferString(tc.reqBody))
 			t.Cleanup(cleanup)
 			errors := cltest.ParseJSONAPIErrors(t, resp.Body)
@@ -89,7 +88,7 @@ func TestUserController_CreateUser(t *testing.T) {
 	t.Parallel()
 
 	app := cltest.NewApplicationEVMDisabled(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	client := app.NewHTTPClient(nil)
 
@@ -165,8 +164,9 @@ func TestUserController_CreateUser(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			resp, cleanup := client.Post("/v2/users", bytes.NewBufferString(tc.reqBody))
 			t.Cleanup(cleanup)
 			errors := cltest.ParseJSONAPIErrors(t, resp.Body)
@@ -182,13 +182,14 @@ func TestUserController_CreateUser(t *testing.T) {
 
 func TestUserController_UpdateRole(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	app := cltest.NewApplicationEVMDisabled(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	client := app.NewHTTPClient(nil)
 	user := cltest.MustRandomUser(t)
-	err := app.AuthenticationProvider().CreateUser(&user)
+	err := app.AuthenticationProvider().CreateUser(ctx, &user)
 	require.NoError(t, err)
 
 	testCases := []struct {
@@ -212,8 +213,9 @@ func TestUserController_UpdateRole(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			resp, cleanup := client.Patch("/v2/users", bytes.NewBufferString(tc.reqBody))
 			t.Cleanup(cleanup)
 			errors := cltest.ParseJSONAPIErrors(t, resp.Body)
@@ -229,23 +231,24 @@ func TestUserController_UpdateRole(t *testing.T) {
 
 func TestUserController_DeleteUser(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	app := cltest.NewApplicationEVMDisabled(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	client := app.NewHTTPClient(nil)
 	user := cltest.MustRandomUser(t)
-	err := app.AuthenticationProvider().CreateUser(&user)
+	err := app.AuthenticationProvider().CreateUser(ctx, &user)
 	require.NoError(t, err)
 
-	resp, cleanup := client.Delete(fmt.Sprintf("/v2/users/%s", url.QueryEscape(user.Email)))
+	resp, cleanup := client.Delete("/v2/users/" + url.QueryEscape(user.Email))
 	t.Cleanup(cleanup)
 	errors := cltest.ParseJSONAPIErrors(t, resp.Body)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Empty(t, errors.Errors)
 
 	// second attempt would fail
-	resp, cleanup = client.Delete(fmt.Sprintf("/v2/users/%s", url.QueryEscape(user.Email)))
+	resp, cleanup = client.Delete("/v2/users/" + url.QueryEscape(user.Email))
 	t.Cleanup(cleanup)
 	errors = cltest.ParseJSONAPIErrors(t, resp.Body)
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -257,20 +260,16 @@ func TestUserController_NewAPIToken(t *testing.T) {
 	t.Parallel()
 
 	app := cltest.NewApplicationEVMDisabled(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	client := app.NewHTTPClient(nil)
-	req, err := json.Marshal(sessions.ChangeAuthTokenRequest{
-		Password: cltest.Password,
-	})
-	require.NoError(t, err)
-	resp, cleanup := client.Post("/v2/user/token", bytes.NewBuffer(req))
+	body := fmt.Sprintf(`{"password":"%s"}`, cltest.Password)
+	resp, cleanup := client.Post("/v2/user/token", bytes.NewBufferString(body))
 	defer cleanup()
 
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 	var authToken auth.Token
-	err = cltest.ParseJSONAPIResponse(t, resp, &authToken)
-	require.NoError(t, err)
+	cltest.ParseJSONAPIResponse(t, resp, &authToken)
 	assert.NotEmpty(t, authToken.AccessKey)
 	assert.NotEmpty(t, authToken.Secret)
 }
@@ -279,14 +278,11 @@ func TestUserController_NewAPIToken_unauthorized(t *testing.T) {
 	t.Parallel()
 
 	app := cltest.NewApplicationEVMDisabled(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	client := app.NewHTTPClient(nil)
-	req, err := json.Marshal(sessions.ChangeAuthTokenRequest{
-		Password: "wrong-password",
-	})
-	require.NoError(t, err)
-	resp, cleanup := client.Post("/v2/user/token", bytes.NewBuffer(req))
+	body := fmt.Sprintf(`{"password":"%s"}`, "wrong-password")
+	resp, cleanup := client.Post("/v2/user/token", bytes.NewBufferString(body))
 	defer cleanup()
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 }
@@ -295,14 +291,11 @@ func TestUserController_DeleteAPIKey(t *testing.T) {
 	t.Parallel()
 
 	app := cltest.NewApplicationEVMDisabled(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	client := app.NewHTTPClient(nil)
-	req, err := json.Marshal(sessions.ChangeAuthTokenRequest{
-		Password: cltest.Password,
-	})
-	require.NoError(t, err)
-	resp, cleanup := client.Post("/v2/user/token/delete", bytes.NewBuffer(req))
+	body := fmt.Sprintf(`{"password":"%s"}`, cltest.Password)
+	resp, cleanup := client.Post("/v2/user/token/delete", bytes.NewBufferString(body))
 	defer cleanup()
 
 	require.Equal(t, http.StatusNoContent, resp.StatusCode)
@@ -312,14 +305,11 @@ func TestUserController_DeleteAPIKey_unauthorized(t *testing.T) {
 	t.Parallel()
 
 	app := cltest.NewApplicationEVMDisabled(t)
-	require.NoError(t, app.Start(testutils.Context(t)))
+	require.NoError(t, app.Start(t.Context()))
 
 	client := app.NewHTTPClient(nil)
-	req, err := json.Marshal(sessions.ChangeAuthTokenRequest{
-		Password: "wrong-password",
-	})
-	require.NoError(t, err)
-	resp, cleanup := client.Post("/v2/user/token/delete", bytes.NewBuffer(req))
+	body := fmt.Sprintf(`{"password":"%s"}`, "wrong-password")
+	resp, cleanup := client.Post("/v2/user/token/delete", bytes.NewBufferString(body))
 	defer cleanup()
 
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)

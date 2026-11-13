@@ -12,34 +12,33 @@ import (
 	"github.com/lib/pq"
 	"gopkg.in/guregu/null.v4"
 
-	coreClient "github.com/smartcontractkit/chainlink/integration-tests/client"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink/deployment/environment/nodeclient"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
-	"github.com/smartcontractkit/chainlink/v2/core/store/models"
 )
 
-func BuildBootstrapSpec(verifierAddr common.Address, chainID int64, feedId [32]byte) *coreClient.OCR2TaskJobSpec {
-	hash := common.BytesToHash(feedId[:])
-	return &coreClient.OCR2TaskJobSpec{
-		Name:    fmt.Sprintf("bootstrap-%s", uuid.NewString()),
+func BuildBootstrapSpec(verifierAddr common.Address, chainID int64, feedID [32]byte) *nodeclient.OCR2TaskJobSpec {
+	hash := common.BytesToHash(feedID[:])
+	return &nodeclient.OCR2TaskJobSpec{
+		Name:    "bootstrap-" + uuid.NewString(),
 		JobType: "bootstrap",
 		OCR2OracleSpec: job.OCR2OracleSpec{
 			ContractID: verifierAddr.String(),
 			Relay:      "evm",
 			FeedID:     &hash,
-			RelayConfig: map[string]interface{}{
+			RelayConfig: map[string]any{
 				"chainID": int(chainID),
 			},
-			ContractConfigTrackerPollInterval: *models.NewInterval(time.Second * 15),
+			ContractConfigTrackerPollInterval: *sqlutil.NewInterval(time.Second * 15),
 		},
 	}
 }
 
 func BuildOCRSpec(
 	verifierAddr common.Address, chainID int64, fromBlock uint64,
-	feedId [32]byte, bridges []coreClient.BridgeTypeAttributes,
-	csaPubKey string, msRemoteUrl string, msPubKey string,
-	nodeOCRKey string, p2pV2Bootstrapper string, allowedFaults int) *coreClient.OCR2TaskJobSpec {
-
+	feedID [32]byte, bridges []nodeclient.BridgeTypeAttributes,
+	csaPubKey string, msRemoteURL string, msPubKey string,
+	nodeOCRKey string, p2pV2Bootstrapper string, allowedFaults int) *nodeclient.OCR2TaskJobSpec {
 	tmpl, err := template.New("os").Parse(`
 {{range $i, $b := .Bridges}}
 {{$b.Name}}_payload      [type=bridge name="{{$b.Name}}" timeout="50ms" requestData="{}"];
@@ -75,7 +74,7 @@ ask_price [type=median allowedFaults={{.AllowedFaults}} index=2];
 		panic(err)
 	}
 	data := struct {
-		Bridges       []coreClient.BridgeTypeAttributes
+		Bridges       []nodeclient.BridgeTypeAttributes
 		AllowedFaults int
 	}{
 		Bridges:       bridges,
@@ -88,24 +87,24 @@ ask_price [type=median allowedFaults={{.AllowedFaults}} index=2];
 	}
 	observationSource := buf.String()
 
-	hash := common.BytesToHash(feedId[:])
-	return &coreClient.OCR2TaskJobSpec{
-		Name:              fmt.Sprintf("ocr2-%s", uuid.NewString()),
+	hash := common.BytesToHash(feedID[:])
+	return &nodeclient.OCR2TaskJobSpec{
+		Name:              "ocr2-" + uuid.NewString(),
 		JobType:           "offchainreporting2",
 		MaxTaskDuration:   "1s",
 		ForwardingAllowed: false,
 		OCR2OracleSpec: job.OCR2OracleSpec{
 			PluginType: "mercury",
-			PluginConfig: map[string]interface{}{
-				"serverURL":    fmt.Sprintf("\"%s\"", msRemoteUrl),
+			PluginConfig: map[string]any{
+				"serverURL":    fmt.Sprintf("\"%s\"", msRemoteURL),
 				"serverPubKey": fmt.Sprintf("\"%s\"", msPubKey),
 			},
 			Relay: "evm",
-			RelayConfig: map[string]interface{}{
+			RelayConfig: map[string]any{
 				"chainID":   int(chainID),
 				"fromBlock": fromBlock,
 			},
-			ContractConfigTrackerPollInterval: *models.NewInterval(time.Second * 15),
+			ContractConfigTrackerPollInterval: *sqlutil.NewInterval(time.Second * 15),
 			ContractID:                        verifierAddr.String(),
 			FeedID:                            &hash,
 			OCRKeyBundleID:                    null.StringFrom(nodeOCRKey),
@@ -116,11 +115,11 @@ ask_price [type=median allowedFaults={{.AllowedFaults}} index=2];
 	}
 }
 
-func BuildBridges(eaUrls []*url.URL) []coreClient.BridgeTypeAttributes {
-	var bridges []coreClient.BridgeTypeAttributes
+func BuildBridges(eaUrls []*url.URL) []nodeclient.BridgeTypeAttributes {
+	bridges := make([]nodeclient.BridgeTypeAttributes, 0, len(eaUrls))
 	for _, url := range eaUrls {
-		bridges = append(bridges, coreClient.BridgeTypeAttributes{
-			Name:        fmt.Sprintf("bridge_%s", uuid.NewString()[0:6]),
+		bridges = append(bridges, nodeclient.BridgeTypeAttributes{
+			Name:        "bridge_" + uuid.NewString()[0:6],
 			URL:         url.String(),
 			RequestData: "{}",
 		})

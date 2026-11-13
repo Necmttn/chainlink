@@ -6,7 +6,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 )
@@ -16,7 +15,7 @@ func TestMemoTask(t *testing.T) {
 
 	tests := []struct {
 		name   string
-		input  interface{}
+		input  any
 		output string
 	}{
 		{"identity", pipeline.ObjectParam{Type: pipeline.BoolType, BoolValue: true}, "true"},
@@ -38,7 +37,6 @@ func TestMemoTask(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			vars := pipeline.NewVarsFrom(nil)
 			var value pipeline.ObjectParam
@@ -46,7 +44,7 @@ func TestMemoTask(t *testing.T) {
 			require.NoError(t, err)
 
 			task := pipeline.MemoTask{BaseTask: pipeline.NewBaseTask(0, "task", nil, nil, 0)}
-			result, _ := task.Run(testutils.Context(t), logger.TestLogger(t), vars, []pipeline.Result{{Value: test.input}})
+			result, _ := task.Run(t.Context(), logger.TestLogger(t), vars, []pipeline.Result{{Value: test.input}})
 			require.NoError(t, result.Error)
 			marshalledValue, err := result.Value.(pipeline.ObjectParam).Marshal()
 			require.NoError(t, err)

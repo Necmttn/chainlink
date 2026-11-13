@@ -2,20 +2,22 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 
+	jsonrpc "github.com/smartcontractkit/chainlink-common/pkg/jsonrpc2"
 	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/api"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 )
 
-//go:generate mockery --quiet --name Handler --output ./mocks/ --case=underscore
-//go:generate mockery --quiet --name DON --output ./mocks/ --case=underscore
-
-// UserCallbackPayload is a response to user request sent to HandleUserMessage().
+// UserCallbackPayload is a response to user request sent to HandleLegacyUserMessage()/HandleJSONRPCUserMessage().
 // Each message needs to receive at most one response on the provided channel.
 type UserCallbackPayload struct {
-	Msg     *api.Message
-	ErrCode api.ErrorCode
-	ErrMsg  string
+	RawResponse []byte
+	ErrorCode   api.ErrorCode
+}
+
+type Callback interface {
+	SendResponse(cb UserCallbackPayload) error
 }
 
 // Handler implements service-specific logic for managing messages from users and nodes.
@@ -32,14 +34,25 @@ type Handler interface {
 	// Each user request is processed by a separate goroutine, which:
 	//   1. calls HandleUserMessage
 	//   2. waits on callbackCh with a timeout
-	HandleUserMessage(ctx context.Context, msg *api.Message, callbackCh chan<- UserCallbackPayload) error
+	HandleLegacyUserMessage(ctx context.Context, msg *api.Message, callback Callback) error
 
-	// Handlers should not make any assumptions about goroutines calling HandleNodeMessage
-	HandleNodeMessage(ctx context.Context, msg *api.Message, nodeAddr string) error
+	// Each user request is processed by a separate goroutine, which:
+	//   1. calls HandleUserMessage
+	//   2. waits on callbackCh with a timeout
+	HandleJSONRPCUserMessage(ctx context.Context, jsonRequest jsonrpc.Request[json.RawMessage], callback Callback) error
+
+	// Handlers should not make any assumptions about goroutines calling HandleNodeMessage.
+	// should be non-blocking
+	// should validate the message inside the response
+	HandleNodeMessage(ctx context.Context, resp *jsonrpc.Response[json.RawMessage], nodeAddr string) error
+
+	// The methods support by this Handler.
+	// Should be globally unique across all handlers.
+	Methods() []string
 }
 
 // Representation of a DON from a Handler's perspective.
 type DON interface {
 	// Thread-safe
-	SendToNode(ctx context.Context, nodeAddress string, msg *api.Message) error
+	SendToNode(ctx context.Context, nodeAddress string, req *jsonrpc.Request[json.RawMessage]) error
 }

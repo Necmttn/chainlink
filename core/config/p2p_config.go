@@ -1,7 +1,7 @@
 package config
 
 import (
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/p2pkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/p2pkey"
 )
 
 type P2P interface {
@@ -10,5 +10,6 @@ type P2P interface {
 	IncomingMessageBufferSize() int
 	OutgoingMessageBufferSize() int
 	TraceLogging() bool
+	EnableExperimentalRageP2P() bool
 	Enabled() bool
 }

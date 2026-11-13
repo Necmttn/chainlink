@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,7 +19,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/tidwall/gjson"
 	"github.com/urfave/cli"
-	"go.uber.org/multierr"
 
 	"github.com/smartcontractkit/chainlink/v2/core/bridges"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
@@ -72,7 +72,7 @@ func initRemoteConfigSubCmds(s *Shell) []cli.Command {
 			Name:  "validate",
 			Usage: "DEPRECATED. Use `chainlink node validate`",
 			Before: func(c *cli.Context) error {
-				return s.errorOut(fmt.Errorf("Deprecated, use `chainlink node validate`"))
+				return s.errorOut(errors.New("Deprecated, use `chainlink node validate`"))
 			},
 			Hidden: true,
 		},
@@ -116,7 +116,7 @@ func (s *Shell) CreateExternalInitiator(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -137,14 +137,14 @@ func (s *Shell) DeleteExternalInitiator(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 	_, err = s.parseResponse(resp)
 	return err
 }
 
-func (s *Shell) getPage(requestURI string, page int, model interface{}) (err error) {
+func (s *Shell) getPage(requestURI string, page int, model any) (err error) {
 	uri, err := url.Parse(requestURI)
 	if err != nil {
 		return err
@@ -161,7 +161,7 @@ func (s *Shell) getPage(requestURI string, page int, model interface{}) (err err
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -200,7 +200,7 @@ func (s *Shell) Logout(_ *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 	err = s.CookieAuthenticator.Logout()
@@ -230,7 +230,7 @@ func (s *Shell) ChangePassword(_ *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -253,7 +253,7 @@ func (s *Shell) buildSessionRequest(flag string) (sessions.SessionRequest, error
 }
 
 func getTOMLString(s string) (string, error) {
-	var val interface{}
+	var val any
 	err := toml.Unmarshal([]byte(s), &val)
 	if err == nil {
 		return s, nil
@@ -263,7 +263,7 @@ func getTOMLString(s string) (string, error) {
 	if os.IsNotExist(err) {
 		return "", fmt.Errorf("invalid TOML or file not found '%s'", s)
 	} else if err != nil {
-		return "", fmt.Errorf("error reading from file '%s': %v", s, err)
+		return "", fmt.Errorf("error reading from file '%s': %w", s, err)
 	}
 	return buf.String(), nil
 }
@@ -271,11 +271,11 @@ func getTOMLString(s string) (string, error) {
 func (s *Shell) parseResponse(resp *http.Response) ([]byte, error) {
 	b, err := parseResponse(resp)
 	if errors.Is(err, errUnauthorized) {
-		return nil, s.errorOut(multierr.Append(err, fmt.Errorf("your credentials may be missing, invalid or you may need to login first using the CLI via 'chainlink admin login'")))
+		return nil, s.errorOut(stderrors.Join(err, errors.New("your credentials may be missing, invalid or you may need to login first using the CLI via 'chainlink admin login'")))
 	}
 
 	if errors.Is(err, errForbidden) {
-		return nil, s.errorOut(multierr.Append(err, fmt.Errorf("this action requires %s privileges. The current user %s has '%s' role and cannot perform this action, login with a user that has '%s' role via 'chainlink admin login'", resp.Header.Get("forbidden-required-role"), resp.Header.Get("forbidden-provided-email"), resp.Header.Get("forbidden-provided-role"), resp.Header.Get("forbidden-required-role"))))
+		return nil, s.errorOut(stderrors.Join(err, fmt.Errorf("this action requires %s privileges. The current user %s has '%s' role and cannot perform this action, login with a user that has '%s' role via 'chainlink admin login'", resp.Header.Get("forbidden-required-role"), resp.Header.Get("forbidden-provided-email"), resp.Header.Get("forbidden-provided-role"), resp.Header.Get("forbidden-required-role"))))
 	}
 	if err != nil {
 		return nil, s.errorOut(err)
@@ -293,7 +293,7 @@ func (s *Shell) printResponseBody(resp *http.Response) error {
 	return nil
 }
 
-func (s *Shell) renderAPIResponse(resp *http.Response, dst interface{}, headers ...string) error {
+func (s *Shell) renderAPIResponse(resp *http.Response, dst any, headers ...string) error {
 	var links jsonapi.Links
 	if err := s.deserializeAPIResponse(resp, dst, &links); err != nil {
 		return s.errorOut(err)
@@ -319,14 +319,14 @@ func (s *Shell) configV2Str(userOnly bool) (string, error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 	respPayload, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", s.errorOut(err)
 	}
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return "", s.errorOut(errors.Errorf("got HTTP status %d: %s", resp.StatusCode, respPayload))
 	}
 	var configV2Resource web.ConfigV2Resource
@@ -357,7 +357,7 @@ func (s *Shell) SetLogLevel(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -374,9 +374,9 @@ func (s *Shell) SetLogSQL(c *cli.Context) (err error) {
 	}
 
 	// Sets logSql to true || false based on the --enabled flag
-	logSql := c.Bool("enable")
+	logSQL := c.Bool("enable")
 
-	request := web.LogPatchRequest{SqlEnabled: &logSql}
+	request := web.LogPatchRequest{SQLEnabled: &logSQL}
 	requestData, err := json.Marshal(request)
 	if err != nil {
 		return s.errorOut(err)
@@ -389,7 +389,7 @@ func (s *Shell) SetLogSQL(c *cli.Context) (err error) {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -407,7 +407,7 @@ func getBufferFromJSON(s string) (*bytes.Buffer, error) {
 	if os.IsNotExist(err) {
 		return nil, fmt.Errorf("invalid JSON or file not found '%s'", s)
 	} else if err != nil {
-		return nil, fmt.Errorf("error reading from file '%s': %v", s, err)
+		return nil, fmt.Errorf("error reading from file '%s': %w", s, err)
 	}
 	return buf, nil
 }
@@ -425,7 +425,7 @@ func fromFile(arg string) (*bytes.Buffer, error) {
 }
 
 // deserializeAPIResponse is distinct from deserializeResponse in that it supports JSONAPI responses with Links
-func (s *Shell) deserializeAPIResponse(resp *http.Response, dst interface{}, links *jsonapi.Links) error {
+func (s *Shell) deserializeAPIResponse(resp *http.Response, dst any, links *jsonapi.Links) error {
 	b, err := s.parseResponse(resp)
 	if err != nil {
 		return errors.Wrap(err, "parseResponse error")
@@ -459,13 +459,14 @@ func parseErrorResponseBody(responseBody []byte) (string, error) {
 func parseResponse(resp *http.Response) ([]byte, error) {
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return b, multierr.Append(errors.New(resp.Status), err)
+		return b, stderrors.Join(errors.New(resp.Status), err)
 	}
-	if resp.StatusCode == http.StatusUnauthorized {
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized:
 		return b, errUnauthorized
-	} else if resp.StatusCode == http.StatusForbidden {
+	case resp.StatusCode == http.StatusForbidden:
 		return b, errForbidden
-	} else if resp.StatusCode >= http.StatusBadRequest {
+	case resp.StatusCode >= http.StatusBadRequest:
 		errorMessage, err2 := parseErrorResponseBody(b)
 		if err2 != nil {
 			return b, err2
@@ -481,6 +482,7 @@ func (s *Shell) checkRemoteBuildCompatibility(lggr logger.Logger, onlyWarn bool,
 		lggr.Warnw("Got error querying for version. Remote node version is unknown and CLI may behave in unexpected ways.", "err", err)
 		return nil
 	}
+	defer resp.Body.Close()
 	b, err := parseResponse(resp)
 	if err != nil {
 		lggr.Warnw("Got error parsing http response for remote version. Remote node version is unknown and CLI may behave in unexpected ways.", "resp", resp, "err", err)
@@ -507,7 +509,7 @@ func (s *Shell) checkRemoteBuildCompatibility(lggr logger.Logger, onlyWarn bool,
 		if err2 := s.CookieAuthenticator.Logout(); err2 != nil {
 			s.Logger.Debugw("CookieAuthenticator failed to logout", "err", err2)
 		}
-		return ErrIncompatible{CLIVersion: cliVersion, CLISha: cliSha, RemoteVersion: remoteVersion, RemoteSha: remoteSha}
+		return IncompatibleError{CLIVersion: cliVersion, CLISha: cliSha, RemoteVersion: remoteVersion, RemoteSha: remoteSha}
 	}
 	return nil
 }
@@ -517,10 +519,15 @@ func (s *Shell) Health(c *cli.Context) error {
 	if c.Bool("json") {
 		mime = gin.MIMEJSON
 	}
-	resp, err := s.HTTP.Get(s.ctx(), "/health", map[string]string{"Accept": mime})
+	u := "/health"
+	if c.Bool("failing") {
+		u += "?failing"
+	}
+	resp, err := s.HTTP.Get(s.ctx(), u, map[string]string{"Accept": mime})
 	if err != nil {
 		return s.errorOut(err)
 	}
+	defer resp.Body.Close()
 	b, err := parseResponse(resp)
 	if err != nil {
 		return s.errorOut(err)
@@ -529,12 +536,12 @@ func (s *Shell) Health(c *cli.Context) error {
 	return nil
 }
 
-// ErrIncompatible is returned when the cli and remote versions are not compatible.
-type ErrIncompatible struct {
+// IncompatibleError is returned when the cli and remote versions are not compatible.
+type IncompatibleError struct {
 	CLIVersion, CLISha       string
 	RemoteVersion, RemoteSha string
 }
 
-func (e ErrIncompatible) Error() string {
+func (e IncompatibleError) Error() string {
 	return fmt.Sprintf("error: CLI build (%s@%s) mismatches remote node build (%s@%s). You can set flag --bypass-version-check to bypass this", e.CLIVersion, e.CLISha, e.RemoteVersion, e.RemoteSha)
 }

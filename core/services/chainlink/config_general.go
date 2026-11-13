@@ -2,30 +2,27 @@ package chainlink
 
 import (
 	_ "embed"
+	stderrors "errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/pkg/errors"
-	"go.uber.org/multierr"
 	"go.uber.org/zap/zapcore"
 
-	coscfg "github.com/smartcontractkit/chainlink-cosmos/pkg/cosmos/config"
-	"github.com/smartcontractkit/chainlink-solana/pkg/solana"
-	starknet "github.com/smartcontractkit/chainlink-starknet/relayer/pkg/chainlink/config"
-
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/p2pkey"
 	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
-	evmcfg "github.com/smartcontractkit/chainlink/v2/core/chains/evm/config/toml"
-	"github.com/smartcontractkit/chainlink/v2/core/config"
+	"github.com/smartcontractkit/chainlink-data-streams/llo/transmitter/dataengine"
+	evmcfg "github.com/smartcontractkit/chainlink-evm/pkg/config/toml"
 	coreconfig "github.com/smartcontractkit/chainlink/v2/core/config"
 	"github.com/smartcontractkit/chainlink/v2/core/config/env"
 	"github.com/smartcontractkit/chainlink/v2/core/config/parse"
 	v2 "github.com/smartcontractkit/chainlink/v2/core/config/toml"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/p2pkey"
-	"github.com/smartcontractkit/chainlink/v2/core/store/models"
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
 )
 
@@ -51,7 +48,7 @@ type generalConfig struct {
 
 // GeneralConfigOpts holds configuration options for creating a coreconfig.GeneralConfig via New().
 //
-// See ParseTOML to initilialize Config and Secrets from TOML.
+// See ParseTOML to initialize Config and Secrets from TOML.
 type GeneralConfigOpts struct {
 	ConfigStrings  []string
 	SecretsStrings []string
@@ -65,7 +62,7 @@ type GeneralConfigOpts struct {
 	SkipEnv bool
 }
 
-func (o *GeneralConfigOpts) Setup(configFiles []string, secretsFiles []string) error {
+func (o *GeneralConfigOpts) Setup(configFiles, secretsFiles []string) error {
 	configs := []string{}
 	for _, fileName := range configFiles {
 		b, err := os.ReadFile(fileName)
@@ -95,9 +92,9 @@ func (o *GeneralConfigOpts) Setup(configFiles []string, secretsFiles []string) e
 }
 
 // parseConfig sets Config from the given TOML string, overriding any existing duplicate Config fields.
-func (o *GeneralConfigOpts) parseConfig(config string) error {
+func (o *GeneralConfigOpts) parseConfig(cfgStr string) error {
 	var c Config
-	if err2 := commonconfig.DecodeTOML(strings.NewReader(config), &c); err2 != nil {
+	if err2 := commonconfig.DecodeTOML(strings.NewReader(cfgStr), &c); err2 != nil {
 		return fmt.Errorf("failed to decode config TOML: %w", err2)
 	}
 
@@ -135,11 +132,11 @@ func (o GeneralConfigOpts) New() (GeneralConfig, error) {
 		return nil, err
 	}
 
-	_, warning := utils.MultiErrorList(o.Config.warnings())
+	_, warning := commonconfig.MultiErrorList(o.warnings())
 
 	o.Config.setDefaults()
 	if !o.SkipEnv {
-		err = o.Secrets.setEnv()
+		err = o.setEnv()
 		if err != nil {
 			return nil, err
 		}
@@ -167,7 +164,7 @@ func (o GeneralConfigOpts) New() (GeneralConfig, error) {
 		secrets:       &o.Secrets,
 		warning:       warning,
 	}
-	if lvl := o.Config.Log.Level; lvl != nil {
+	if lvl := o.Log.Level; lvl != nil {
 		cfg.logLevelDefault = zapcore.Level(*lvl)
 	}
 
@@ -176,37 +173,54 @@ func (o GeneralConfigOpts) New() (GeneralConfig, error) {
 
 func (o *GeneralConfigOpts) parse() (err error) {
 	for _, c := range o.ConfigStrings {
-		err := o.parseConfig(c)
-		if err != nil {
+		if err = o.parseConfig(c); err != nil {
 			return err
 		}
 	}
 
 	for _, s := range o.SecretsStrings {
-		err := o.parseSecrets(s)
-		if err != nil {
+		if err = o.parseSecrets(s); err != nil {
 			return err
 		}
 	}
 
 	o.Secrets.setDefaults()
-	return
+	return err
 }
 
 func (g *generalConfig) EVMConfigs() evmcfg.EVMConfigs {
+	if g.c.EVM == nil {
+		return evmcfg.EVMConfigs{} // return empty to pass nil check
+	}
 	return g.c.EVM
 }
 
-func (g *generalConfig) CosmosConfigs() coscfg.TOMLConfigs {
-	return g.c.Cosmos
-}
-
-func (g *generalConfig) SolanaConfigs() solana.TOMLConfigs {
+func (g *generalConfig) SolanaConfigs() RawConfigs {
 	return g.c.Solana
 }
 
-func (g *generalConfig) StarknetConfigs() starknet.TOMLConfigs {
+func (g *generalConfig) StarknetConfigs() RawConfigs {
 	return g.c.Starknet
+}
+
+func (g *generalConfig) AptosConfigs() RawConfigs {
+	return g.c.Aptos
+}
+
+func (g *generalConfig) TronConfigs() RawConfigs {
+	return g.c.Tron
+}
+
+func (g *generalConfig) TONConfigs() RawConfigs {
+	return g.c.TON
+}
+
+func (g *generalConfig) SuiConfigs() RawConfigs {
+	return g.c.Sui
+}
+
+func (g *generalConfig) StellarConfigs() RawConfigs {
+	return g.c.Stellar
 }
 
 func (g *generalConfig) Validate() error {
@@ -214,13 +228,13 @@ func (g *generalConfig) Validate() error {
 }
 
 func (g *generalConfig) validate(secretsValidationFn func() error) error {
-	err := multierr.Combine(
+	err := stderrors.Join(
 		validateEnv(),
 		g.c.Validate(),
 		secretsValidationFn(),
 	)
 
-	_, errList := utils.MultiErrorList(err)
+	_, errList := commonconfig.MultiErrorList(err)
 	return errList
 }
 
@@ -235,25 +249,25 @@ var emptyStringsEnv string
 func validateEnv() (err error) {
 	defer func() {
 		if err != nil {
-			_, err = utils.MultiErrorList(err)
+			_, err = commonconfig.MultiErrorList(err)
 			err = fmt.Errorf("invalid environment: %w", err)
 		}
 	}()
-	for _, kv := range strings.Split(emptyStringsEnv, "\n") {
+	for kv := range strings.SplitSeq(emptyStringsEnv, "\n") {
 		if strings.TrimSpace(kv) == "" {
 			continue
 		}
-		i := strings.Index(kv, "=")
-		if i == -1 {
+		before, _, ok := strings.Cut(kv, "=")
+		if !ok {
 			return errors.Errorf("malformed .env file line: %s", kv)
 		}
-		k := kv[:i]
-		_, ok := os.LookupEnv(k)
+		k := before
+		_, ok = os.LookupEnv(k)
 		if ok {
-			err = multierr.Append(err, fmt.Errorf("environment variable %s must not be set: %v", k, v2.ErrUnsupported))
+			err = stderrors.Join(err, fmt.Errorf("environment variable %s must not be set: %w", k, v2.ErrUnsupported))
 		}
 	}
-	return
+	return err
 }
 
 func (g *generalConfig) LogConfiguration(log, warn coreconfig.LogfFn) {
@@ -278,7 +292,7 @@ func (g *generalConfig) FeatureFeedsManager() bool {
 	return *g.c.Feature.FeedsManager
 }
 
-func (g *generalConfig) OCR() config.OCR {
+func (g *generalConfig) OCR() coreconfig.OCR {
 	return &ocrConfig{c: g.c.OCR}
 }
 
@@ -294,41 +308,16 @@ func (g *generalConfig) FeatureUICSAKeys() bool {
 	return *g.c.Feature.UICSAKeys
 }
 
-func (g *generalConfig) AutoPprof() config.AutoPprof {
+func (g *generalConfig) AutoPprof() coreconfig.AutoPprof {
 	return &autoPprofConfig{c: g.c.AutoPprof, rootDir: g.RootDir}
 }
 
 func (g *generalConfig) EVMEnabled() bool {
-	for _, c := range g.c.EVM {
-		if c.IsEnabled() {
-			return true
-		}
-	}
-	return false
-}
-
-func (g *generalConfig) EVMRPCEnabled() bool {
-	for _, c := range g.c.EVM {
-		if c.IsEnabled() {
-			if len(c.Nodes) > 0 {
-				return true
-			}
-		}
-	}
-	return false
+	return g.c.EVM.Enabled()
 }
 
 func (g *generalConfig) SolanaEnabled() bool {
 	for _, c := range g.c.Solana {
-		if c.IsEnabled() {
-			return true
-		}
-	}
-	return false
-}
-
-func (g *generalConfig) CosmosEnabled() bool {
-	for _, c := range g.c.Cosmos {
 		if c.IsEnabled() {
 			return true
 		}
@@ -345,7 +334,52 @@ func (g *generalConfig) StarkNetEnabled() bool {
 	return false
 }
 
-func (g *generalConfig) WebServer() config.WebServer {
+func (g *generalConfig) AptosEnabled() bool {
+	for _, c := range g.c.Aptos {
+		if c.IsEnabled() {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *generalConfig) TronEnabled() bool {
+	for _, c := range g.c.Tron {
+		if c.IsEnabled() {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *generalConfig) TONEnabled() bool {
+	for _, c := range g.c.TON {
+		if c.IsEnabled() {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *generalConfig) SuiEnabled() bool {
+	for _, c := range g.c.Sui {
+		if c.IsEnabled() {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *generalConfig) StellarEnabled() bool {
+	for _, c := range g.c.Stellar {
+		if c.IsEnabled() {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *generalConfig) WebServer() coreconfig.WebServer {
 	return &webServerConfig{c: g.c.WebServer, s: g.secrets.WebServer, rootDir: g.RootDir}
 }
 
@@ -397,16 +431,20 @@ func (g *generalConfig) AutoPprofProfileRoot() string {
 	return s
 }
 
+func (g *generalConfig) Capabilities() coreconfig.Capabilities {
+	return &capabilitiesConfig{c: g.c.Capabilities}
+}
+
+func (g *generalConfig) Workflows() coreconfig.Workflows {
+	return &workflowsConfig{c: g.c.Workflows}
+}
+
 func (g *generalConfig) Database() coreconfig.Database {
-	return &databaseConfig{c: g.c.Database, s: g.secrets.Secrets.Database, logSQL: g.logSQL}
+	return &databaseConfig{c: g.c.Database, s: g.secrets.Database, logSQL: g.logSQL}
 }
 
 func (g *generalConfig) ShutdownGracePeriod() time.Duration {
 	return g.c.ShutdownGracePeriod.Duration()
-}
-
-func (g *generalConfig) FluxMonitor() config.FluxMonitor {
-	return &fluxMonitorConfig{c: g.c.FluxMonitor}
 }
 
 func (g *generalConfig) InsecureFastScrypt() bool {
@@ -425,19 +463,15 @@ func (g *generalConfig) JobPipeline() coreconfig.JobPipeline {
 	return &jobPipelineConfig{c: g.c.JobPipeline}
 }
 
-func (g *generalConfig) Keeper() config.Keeper {
-	return &keeperConfig{c: g.c.Keeper}
-}
-
-func (g *generalConfig) Log() config.Log {
+func (g *generalConfig) Log() coreconfig.Log {
 	return &logConfig{c: g.c.Log, rootDir: g.RootDir, level: g.logLevel, defaultLevel: g.logLevelDefault}
 }
 
-func (g *generalConfig) OCR2() config.OCR2 {
+func (g *generalConfig) OCR2() coreconfig.OCR2 {
 	return &ocr2Config{c: g.c.OCR2}
 }
 
-func (g *generalConfig) P2P() config.P2P {
+func (g *generalConfig) P2P() coreconfig.P2P {
 	return &p2p{c: g.c.P2P}
 }
 
@@ -457,7 +491,7 @@ func (g *generalConfig) P2POutgoingMessageBufferSize() int {
 	return int(*g.c.P2P.OutgoingMessageBufferSize)
 }
 
-func (g *generalConfig) Pyroscope() config.Pyroscope {
+func (g *generalConfig) Pyroscope() coreconfig.Pyroscope {
 	return &pyroscopeConfig{c: g.c.Pyroscope, s: g.secrets.Pyroscope}
 }
 
@@ -480,12 +514,16 @@ func (g *generalConfig) AuditLogger() coreconfig.AuditLogger {
 	return auditLoggerConfig{c: g.c.AuditLogger}
 }
 
-func (g *generalConfig) Insecure() config.Insecure {
+func (g *generalConfig) Insecure() coreconfig.Insecure {
 	return &insecureConfig{c: g.c.Insecure}
 }
 
 func (g *generalConfig) Sentry() coreconfig.Sentry {
 	return sentryConfig{g.c.Sentry}
+}
+
+func (g *generalConfig) JobDistributor() coreconfig.JobDistributor {
+	return jobDistributorConfig{g.c.JobDistributor}
 }
 
 func (g *generalConfig) Password() coreconfig.Password {
@@ -496,7 +534,7 @@ func (g *generalConfig) Prometheus() coreconfig.Prometheus {
 	return &prometheusConfig{s: g.secrets.Prometheus}
 }
 
-func (g *generalConfig) Mercury() coreconfig.Mercury {
+func (g *generalConfig) Mercury() dataengine.Mercury {
 	return &mercuryConfig{c: g.c.Mercury, s: g.secrets.Mercury}
 }
 
@@ -504,8 +542,78 @@ func (g *generalConfig) Threshold() coreconfig.Threshold {
 	return &thresholdConfig{s: g.secrets.Threshold}
 }
 
+func (g *generalConfig) ImportedEthKeys() coreconfig.ImportableChainKeyLister {
+	return &importedEthKeyConfigs{s: g.secrets.EVM}
+}
+
+func (g *generalConfig) ImportedSolKeys() coreconfig.ImportableChainKeyLister {
+	return &importedSolKeyConfigs{s: g.secrets.Solana}
+}
+
+func (g *generalConfig) ImportedAptosKeys() coreconfig.ImportableChainKeyLister {
+	return &importedAptosKeyConfigs{s: g.secrets.Aptos}
+}
+
+func (g *generalConfig) ImportedStellarKeys() coreconfig.ImportableChainKeyLister {
+	return &importedStellarKeyConfigs{s: g.secrets.Stellar}
+}
+
+func (g *generalConfig) ImportedDKGRecipientKey() coreconfig.ImportableKey {
+	return &importedDKGRecipientKeyConfig{s: g.secrets.DKGRecipientKey}
+}
+
+func (g *generalConfig) ImportedP2PKey() coreconfig.ImportableKey {
+	return &importedP2PKeyConfig{s: g.secrets.P2PKey}
+}
+
 func (g *generalConfig) Tracing() coreconfig.Tracing {
 	return &tracingConfig{s: g.c.Tracing}
 }
 
-var zeroSha256Hash = models.Sha256Hash{}
+func (g *generalConfig) Telemetry() coreconfig.Telemetry {
+	return &telemetryConfig{s: g.c.Telemetry, sh: &shardingConfig{s: g.c.Sharding}}
+}
+
+func (g *generalConfig) ResourceAttributes() map[string]string {
+	attrs := g.Telemetry().ResourceAttributes()
+	if sharding := g.Sharding(); sharding != nil && sharding.ShardingEnabled() {
+		if _, ok := attrs["shardIndex"]; !ok {
+			attrs["shardIndex"] = strconv.FormatUint(uint64(sharding.ShardIndex()), 10)
+		}
+	}
+	return attrs
+}
+
+func (g *generalConfig) Metering() coreconfig.Metering {
+	return &meteringConfig{s: g.c.Metering}
+}
+
+func (g *generalConfig) CRE() coreconfig.CRE {
+	return &creConfig{s: g.secrets.CRE, c: g.c.CRE}
+}
+
+func (g *generalConfig) CCV() coreconfig.CCV {
+	return &ccvConfig{s: g.secrets.CCV}
+}
+
+func (g *generalConfig) Billing() coreconfig.Billing {
+	return &billingConfig{t: g.c.Billing}
+}
+
+func (g *generalConfig) BridgeStatusReporter() coreconfig.BridgeStatusReporter {
+	return &bridgeStatusReporterConfig{c: g.c.BridgeStatusReporter}
+}
+
+func (g *generalConfig) JobSpecReporter() coreconfig.JobSpecReporter {
+	return &jobSpecReporterConfig{c: g.c.JobSpecReporter}
+}
+
+func (g *generalConfig) Sharding() coreconfig.Sharding {
+	return &shardingConfig{s: g.c.Sharding}
+}
+
+func (g *generalConfig) LOOPP() coreconfig.LOOPP {
+	return &looppConfig{l: g.c.LOOPP}
+}
+
+var zeroSha256Hash = corekeys.Sha256Hash{}

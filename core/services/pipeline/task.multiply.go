@@ -2,12 +2,12 @@ package pipeline
 
 import (
 	"context"
+	stderrors "errors"
 	"math"
 
 	"github.com/pkg/errors"
-	"go.uber.org/multierr"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 )
 
 // Return types:
@@ -20,8 +20,8 @@ type MultiplyTask struct {
 }
 
 var (
-	_                  Task = (*MultiplyTask)(nil)
-	ErrMultiplyOverlow      = errors.New("multiply overflow")
+	_                   Task = (*MultiplyTask)(nil)
+	ErrMultiplyOverflow      = errors.New("multiply overflow")
 )
 
 func (t *MultiplyTask) Type() TaskType {
@@ -39,7 +39,7 @@ func (t *MultiplyTask) Run(_ context.Context, _ logger.Logger, vars Vars, inputs
 		b DecimalParam
 	)
 
-	err = multierr.Combine(
+	err = stderrors.Join(
 		errors.Wrap(ResolveParam(&a, From(VarExpr(t.Input, vars), NonemptyString(t.Input), Input(inputs, 0))), "input"),
 		errors.Wrap(ResolveParam(&b, From(VarExpr(t.Times, vars), NonemptyString(t.Times))), "times"),
 	)
@@ -49,7 +49,7 @@ func (t *MultiplyTask) Run(_ context.Context, _ logger.Logger, vars Vars, inputs
 
 	newExp := int64(a.Decimal().Exponent()) + int64(b.Decimal().Exponent())
 	if newExp > math.MaxInt32 || newExp < math.MinInt32 {
-		return Result{Error: ErrMultiplyOverlow}, runInfo
+		return Result{Error: ErrMultiplyOverflow}, runInfo
 	}
 
 	value := a.Decimal().Mul(b.Decimal())

@@ -3,14 +3,14 @@ package pipeline
 import (
 	"bytes"
 	"context"
-	"encoding/json"
-	"math/big"
+	stderrors "errors"
 	"strings"
 
+	"github.com/goccy/go-json"
 	"github.com/pkg/errors"
-	"go.uber.org/multierr"
 
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/utils/jsonserializable"
 )
 
 // Return types:
@@ -37,7 +37,7 @@ func (t *JSONParseTask) Type() TaskType {
 	return TaskTypeJSONParse
 }
 
-func (t *JSONParseTask) Run(_ context.Context, l logger.Logger, vars Vars, inputs []Result) (result Result, runInfo RunInfo) {
+func (t *JSONParseTask) Run(_ context.Context, _ logger.Logger, vars Vars, inputs []Result) (result Result, runInfo RunInfo) {
 	_, err := CheckInputs(inputs, 0, 1, 0)
 	if err != nil {
 		return Result{Error: errors.Wrap(err, "task inputs")}, runInfo
@@ -50,7 +50,7 @@ func (t *JSONParseTask) Run(_ context.Context, l logger.Logger, vars Vars, input
 		data BytesParam
 		lax  BoolParam
 	)
-	err = multierr.Combine(err,
+	err = stderrors.Join(err,
 		errors.Wrap(ResolveParam(&path, From(VarExpr(t.Path, vars), t.Path)), "path"),
 		errors.Wrap(ResolveParam(&data, From(VarExpr(t.Data, vars), Input(inputs, 0))), "data"),
 		errors.Wrap(ResolveParam(&lax, From(NonemptyString(t.Lax), false)), "lax"),
@@ -59,7 +59,7 @@ func (t *JSONParseTask) Run(_ context.Context, l logger.Logger, vars Vars, input
 		return Result{Error: err}, runInfo
 	}
 
-	var decoded interface{}
+	var decoded any
 	d := json.NewDecoder(bytes.NewReader(data))
 	d.UseNumber()
 	err = d.Decode(&decoded)
@@ -67,51 +67,14 @@ func (t *JSONParseTask) Run(_ context.Context, l logger.Logger, vars Vars, input
 		return Result{Error: err}, runInfo
 	}
 
-	for _, part := range path {
-		switch d := decoded.(type) {
-		case map[string]interface{}:
-			var exists bool
-			decoded, exists = d[part]
-			if !exists && bool(lax) {
-				decoded = nil
-				break
-			} else if !exists {
-				return Result{Error: errors.Wrapf(ErrKeypathNotFound, `could not resolve path ["%v"] in %s`, strings.Join(path, `","`), data)}, runInfo
-			}
-
-		case []interface{}:
-			bigindex, ok := big.NewInt(0).SetString(part, 10)
-			if !ok {
-				return Result{Error: errors.Wrapf(ErrKeypathNotFound, "JSONParse task error: %v is not a valid array index", part)}, runInfo
-			} else if !bigindex.IsInt64() {
-				if bool(lax) {
-					decoded = nil
-					break
-				}
-				return Result{Error: errors.Wrapf(ErrKeypathNotFound, `could not resolve path ["%v"] in %s`, strings.Join(path, `","`), data)}, runInfo
-			}
-			index := int(bigindex.Int64())
-			if index < 0 {
-				index = len(d) + index
-			}
-
-			exists := index >= 0 && index < len(d)
-			if !exists && bool(lax) {
-				decoded = nil
-				break
-			} else if !exists {
-				return Result{Error: errors.Wrapf(ErrKeypathNotFound, `could not resolve path ["%v"] in %s`, strings.Join(path, `","`), data)}, runInfo
-			}
-			decoded = d[index]
-
-		default:
-			return Result{Error: errors.Wrapf(ErrKeypathNotFound, `could not resolve path ["%v"] in %s`, strings.Join(path, `","`), data)}, runInfo
-		}
+	decoded, err = traverseJSONPath(decoded, path, bool(lax))
+	if err != nil {
+		return Result{Error: errors.Wrapf(err, `could not resolve path ["%v"] in %s`, strings.Join(path, `","`), data)}, runInfo
 	}
 
-	decoded, err = reinterpetJsonNumbers(decoded)
+	decoded, err = jsonserializable.ReinterpretJSONNumbers(decoded)
 	if err != nil {
-		return Result{Error: multierr.Combine(ErrBadInput, err)}, runInfo
+		return Result{Error: stderrors.Join(ErrBadInput, err)}, runInfo
 	}
 
 	return Result{Value: decoded}, runInfo

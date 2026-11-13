@@ -1,11 +1,13 @@
 package ocrcommon
 
 import (
+	"fmt"
 	"math/big"
 	"sync"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -15,15 +17,15 @@ import (
 	"github.com/smartcontractkit/libocr/offchainreporting2plus/types"
 
 	"github.com/smartcontractkit/chainlink-common/pkg/services/servicetest"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
 	"github.com/smartcontractkit/chainlink-common/pkg/types/mercury"
 	mercuryv1 "github.com/smartcontractkit/chainlink-common/pkg/types/mercury/v1"
 	mercuryv2 "github.com/smartcontractkit/chainlink-common/pkg/types/mercury/v2"
-
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils"
-	ubig "github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
+	mercuryv4 "github.com/smartcontractkit/chainlink-common/pkg/types/mercury/v4"
+	evmtypes "github.com/smartcontractkit/chainlink-evm/pkg/types"
+	"github.com/smartcontractkit/chainlink-evm/pkg/utils"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/job"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 	"github.com/smartcontractkit/chainlink/v2/core/services/synchronization"
 	"github.com/smartcontractkit/chainlink/v2/core/services/synchronization/mocks"
@@ -126,7 +128,7 @@ func TestGetContract(t *testing.T) {
 		job:  &j,
 		lggr: nil,
 	}
-	contractAddress := ethkey.EIP55Address(utils.RandomAddress().String())
+	contractAddress := evmtypes.EIP55Address(utils.RandomAddress().String())
 
 	j.Type = job.Type(pipeline.OffchainReportingJobType)
 	j.OCROracleSpec.ContractAddress = contractAddress
@@ -151,11 +153,11 @@ func TestGetChainID(t *testing.T) {
 	}
 
 	j.Type = job.Type(pipeline.OffchainReportingJobType)
-	j.OCROracleSpec.EVMChainID = (*ubig.Big)(big.NewInt(1234567890))
+	j.OCROracleSpec.EVMChainID = (*sqlutil.Big)(big.NewInt(1234567890))
 	assert.Equal(t, "1234567890", e.getChainID())
 
 	j.Type = job.Type(pipeline.OffchainReporting2JobType)
-	j.OCR2OracleSpec.RelayConfig = make(map[string]interface{})
+	j.OCR2OracleSpec.RelayConfig = make(map[string]any)
 	j.OCR2OracleSpec.RelayConfig["chainID"] = "foo"
 	assert.Equal(t, "foo", e.getChainID())
 
@@ -165,29 +167,121 @@ func TestGetChainID(t *testing.T) {
 
 func TestParseEATelemetry(t *testing.T) {
 	ea, err := parseEATelemetry([]byte(bridgeResponse))
-	assert.NoError(t, err)
-	assert.Equal(t, ea.DataSource, "data-source-name")
-	assert.Equal(t, ea.ProviderRequestedTimestamp, int64(92233720368547760))
-	assert.Equal(t, ea.ProviderReceivedTimestamp, int64(-92233720368547760))
-	assert.Equal(t, ea.ProviderDataStreamEstablished, int64(1))
-	assert.Equal(t, ea.ProviderIndicatedTime, int64(-123456789))
+	require.NoError(t, err)
+	assert.Equal(t, "data-source-name", ea.DataSource)
+	assert.Equal(t, int64(92233720368547760), ea.ProviderRequestedTimestamp)
+	assert.Equal(t, int64(-92233720368547760), ea.ProviderReceivedTimestamp)
+	assert.Equal(t, int64(1), ea.ProviderDataStreamEstablished)
+	assert.Equal(t, int64(-123456789), ea.ProviderIndicatedTime)
 
 	_, err = parseEATelemetry(nil)
 	assert.Error(t, err)
 }
 
 func TestGetJsonParsedValue(t *testing.T) {
-
-	resp := getJsonParsedValue(trrs[0], &trrs)
-	assert.Equal(t, 123456.123456789, *resp)
+	resp := getJSONParsedValue(trrs[0], &trrs)
+	assert.InEpsilon(t, 123456.123456789, *resp, 1e-9)
 
 	trrs[1].Result.Value = nil
-	resp = getJsonParsedValue(trrs[0], &trrs)
+	resp = getJSONParsedValue(trrs[0], &trrs)
 	assert.Nil(t, resp)
 
-	resp = getJsonParsedValue(trrs[1], &trrs)
+	resp = getJSONParsedValue(trrs[1], &trrs)
+	assert.Nil(t, resp)
+}
+
+func TestGetJsonParsedValueHexValues(t *testing.T) {
+	trrsHexData := pipeline.TaskRunResults{
+		pipeline.TaskRunResult{
+			Task: &pipeline.BridgeTask{
+				Name:     "test-bridge-1",
+				BaseTask: pipeline.NewBaseTask(0, "ds1", nil, nil, 0),
+			},
+			Result: pipeline.Result{
+				Value: bridgeResponse,
+			},
+		},
+		pipeline.TaskRunResult{
+			Task: &pipeline.JSONParseTask{
+				BaseTask: pipeline.NewBaseTask(1, "ds1_parse", nil, nil, 1),
+			},
+			Result: pipeline.Result{
+				Value: "0x1abcf",
+			},
+		},
+	}
+
+	resp := getJSONParsedValue(trrsHexData[0], &trrsHexData)
+	assert.InDelta(t, 109519.0, *resp, 0)
+
+	trrsHexData = pipeline.TaskRunResults{
+		pipeline.TaskRunResult{
+			Task: &pipeline.BridgeTask{
+				Name:     "test-bridge-2",
+				BaseTask: pipeline.NewBaseTask(0, "ds2", nil, nil, 0),
+			},
+			Result: pipeline.Result{
+				Value: bridgeResponse,
+			},
+		},
+		pipeline.TaskRunResult{
+			Task: &pipeline.JSONParseTask{
+				BaseTask: pipeline.NewBaseTask(1, "ds2_parse", nil, nil, 1),
+			},
+			Result: pipeline.Result{
+				Value: "1abcf",
+			},
+		},
+	}
+
+	resp = getJSONParsedValue(trrsHexData[0], &trrsHexData)
+	assert.InDelta(t, 109519.0, *resp, 0)
+
+	trrsHexData = pipeline.TaskRunResults{
+		pipeline.TaskRunResult{
+			Task: &pipeline.BridgeTask{
+				Name:     "test-bridge-3",
+				BaseTask: pipeline.NewBaseTask(0, "ds3", nil, nil, 0),
+			},
+			Result: pipeline.Result{
+				Value: bridgeResponse,
+			},
+		},
+		pipeline.TaskRunResult{
+			Task: &pipeline.JSONParseTask{
+				BaseTask: pipeline.NewBaseTask(1, "ds3_parse", nil, nil, 1),
+			},
+			Result: pipeline.Result{
+				Value: "0x1akbcf",
+			},
+		},
+	}
+
+	resp = getJSONParsedValue(trrsHexData[0], &trrsHexData)
 	assert.Nil(t, resp)
 
+	trrsHexData = pipeline.TaskRunResults{
+		pipeline.TaskRunResult{
+			Task: &pipeline.BridgeTask{
+				Name:     "test-bridge-4",
+				BaseTask: pipeline.NewBaseTask(0, "ds4", nil, nil, 0),
+			},
+			Result: pipeline.Result{
+				Value: bridgeResponse,
+			},
+		},
+		pipeline.TaskRunResult{
+			Task: &pipeline.JSONParseTask{
+				BaseTask: pipeline.NewBaseTask(1, "ds4_parse", nil, nil, 1),
+			},
+			Result: pipeline.Result{
+				Value: "1akbcf",
+			},
+		},
+	}
+
+	resp = getJSONParsedValue(trrsHexData[0], &trrsHexData)
+	assert.Nil(t, resp)
 }
 
 func TestSendEATelemetry(t *testing.T) {
@@ -208,9 +302,9 @@ func TestSendEATelemetry(t *testing.T) {
 	jb := job.Job{
 		Type: job.Type(pipeline.OffchainReportingJobType),
 		OCROracleSpec: &job.OCROracleSpec{
-			ContractAddress:    ethkey.EIP55AddressFromAddress(feedAddress),
+			ContractAddress:    evmtypes.EIP55AddressFromAddress(feedAddress),
 			CaptureEATelemetry: true,
-			EVMChainID:         (*ubig.Big)(big.NewInt(9)),
+			EVMChainID:         (*sqlutil.Big)(big.NewInt(9)),
 		},
 	}
 
@@ -237,7 +331,7 @@ func TestSendEATelemetry(t *testing.T) {
 		},
 	}
 	fr := pipeline.FinalResult{
-		Values:      []interface{}{"123456"},
+		Values:      []any{"123456"},
 		AllErrors:   nil,
 		FatalErrors: []error{nil},
 	}
@@ -275,7 +369,6 @@ func TestSendEATelemetry(t *testing.T) {
 	expectedMessage, _ := proto.Marshal(&expectedTelemetry)
 	wg.Wait()
 	assert.Equal(t, expectedMessage, sentMessage)
-	//enhancedTelemService.StopOnce("EnhancedTelemetryService", func() error { return nil })
 	doneCh <- struct{}{}
 }
 
@@ -292,18 +385,16 @@ func TestGetObservation(t *testing.T) {
 	}
 
 	obs := e.getObservation(&pipeline.FinalResult{})
-	assert.Equal(t, obs, int64(0))
-	assert.Equal(t, logs.Len(), 1)
-	assert.Contains(t, logs.All()[0].Message, "cannot get singular result")
+	assert.Equal(t, int64(0), obs)
+	assert.Equal(t, 0, logs.Len())
 
 	finalResult := &pipeline.FinalResult{
-		Values:      []interface{}{"123456"},
+		Values:      []any{"123456"},
 		AllErrors:   nil,
 		FatalErrors: []error{nil},
 	}
 	obs = e.getObservation(finalResult)
-	assert.Equal(t, obs, int64(123456))
-
+	assert.Equal(t, int64(123456), obs)
 }
 
 func TestCollectAndSend(t *testing.T) {
@@ -330,7 +421,7 @@ func TestCollectAndSend(t *testing.T) {
 	enhancedTelemService := NewEnhancedTelemetryService(&jb, enhancedTelemChan, doneCh, monitoringEndpoint, lggr.Named("Enhanced Telemetry"))
 	servicetest.Run(t, enhancedTelemService)
 	finalResult := &pipeline.FinalResult{
-		Values:      []interface{}{"123456"},
+		Values:      []any{"123456"},
 		AllErrors:   nil,
 		FatalErrors: []error{nil},
 	}
@@ -351,7 +442,8 @@ func TestCollectAndSend(t *testing.T) {
 			Result: pipeline.Result{
 				Value: bridgeResponse,
 			},
-		}}
+		},
+	}
 
 	observationTimestamp := ObservationTimestamp{
 		Round:        0,
@@ -366,8 +458,7 @@ func TestCollectAndSend(t *testing.T) {
 	}
 
 	wg.Wait()
-	assert.Equal(t, logs.Len(), 2)
-	assert.Contains(t, logs.All()[0].Message, "cannot parse bridge response from bridge task")
+	assert.Equal(t, 0, logs.Len())
 
 	badTrrs = &pipeline.TaskRunResults{
 		pipeline.TaskRunResult{
@@ -377,16 +468,15 @@ func TestCollectAndSend(t *testing.T) {
 			Result: pipeline.Result{
 				Value: "[]",
 			},
-		}}
+		},
+	}
 	enhancedTelemChan <- EnhancedTelemetryData{
 		TaskRunResults: *badTrrs,
 		FinalResults:   *finalResult,
 		RepTimestamp:   observationTimestamp,
 	}
 	wg.Wait()
-	assert.Equal(t, 2, logs.Len())
-	assert.Contains(t, logs.All()[0].Message, "cannot parse bridge response from bridge task")
-	assert.Contains(t, logs.All()[1].Message, "cannot get json parse value")
+	assert.Equal(t, 0, logs.Len())
 	doneCh <- struct{}{}
 }
 
@@ -448,36 +538,135 @@ var trrsMercuryV2 = pipeline.TaskRunResults{
 	},
 }
 
-func TestGetPricesFromResults(t *testing.T) {
-	lggr, logs := logger.TestLoggerObserved(t, zap.WarnLevel)
-	e := EnhancedTelemetryService[EnhancedTelemetryMercuryData]{
-		lggr: lggr,
-		job: &job.Job{
-			ID: 0,
+var trrsMercuryV4 = pipeline.TaskRunResults{
+	pipeline.TaskRunResult{
+		Task: &pipeline.BridgeTask{
+			Name:        "link-usd-test-bridge-v2",
+			BaseTask:    pipeline.NewBaseTask(0, "ds1", nil, nil, 0),
+			RequestData: `{"data":{"to":"LINK","from":"USD"}}`,
+		},
+		Result: pipeline.Result{
+			Value: bridgeResponse,
+		},
+	},
+	pipeline.TaskRunResult{
+		Task: &pipeline.JSONParseTask{
+			BaseTask: pipeline.NewBaseTask(1, "ds1_benchmark", nil, nil, 1),
+		},
+		Result: pipeline.Result{
+			Value: 123456.123456,
+		},
+	},
+	pipeline.TaskRunResult{
+		Task: &pipeline.BridgeTask{
+			Name:        "market-status-bridge",
+			BaseTask:    pipeline.NewBaseTask(2, "ds2", nil, nil, 2),
+			RequestData: `{"data":{"endpoint":"market-status","market":"forex"}}`,
+		},
+		Result: pipeline.Result{
+			Value: bridgeResponse,
+		},
+	},
+	pipeline.TaskRunResult{
+		Task: &pipeline.JSONParseTask{
+			BaseTask: pipeline.NewBaseTask(3, "market_status", nil, nil, 3),
+		},
+		Result: pipeline.Result{
+			Value: 2.0,
+		},
+	},
+}
+
+func TestGetPricesFromBridgeByTelemetryField(t *testing.T) {
+	lggr, _ := logger.TestLoggerObserved(t, zap.WarnLevel)
+	// These are intentionally out of order from the "legacy" method which expects order of `benchmark, bid, ask`
+	jsonParseTaskBid := pipeline.JSONParseTask{
+		BaseTask: pipeline.NewBaseTask(1, "json_parse_2", nil, nil, 2),
+	}
+	jsonParseTaskBid.Tags = `{"priceType": "bid"}`
+	jsonParseTaskAsk := pipeline.JSONParseTask{
+		BaseTask: pipeline.NewBaseTask(2, "json_parse_3", nil, nil, 3),
+	}
+	jsonParseTaskAsk.Tags = `{"priceType": "ask"}`
+	jsonParseTaskBenchmark := pipeline.JSONParseTask{
+		BaseTask: pipeline.NewBaseTask(3, "json_parse_1", nil, nil, 1),
+	}
+	jsonParseTaskBenchmark.Tags = `{"priceType": "benchmark"}`
+
+	bridgeOutputs := []pipeline.Task{&jsonParseTaskAsk, &jsonParseTaskBid, &jsonParseTaskBenchmark}
+
+	bridgeTask := pipeline.BridgeTask{
+		Name:     "bridge-task",
+		BaseTask: pipeline.NewBaseTask(0, "bridge", nil, bridgeOutputs, 0),
+	}
+
+	// Create task run results
+	taskRunResults := pipeline.TaskRunResults{
+		pipeline.TaskRunResult{
+			Task: &bridgeTask,
+			Result: pipeline.Result{
+				Value: bridgeResponse,
+			},
+		},
+		pipeline.TaskRunResult{
+			Task: &jsonParseTaskBenchmark,
+			Result: pipeline.Result{
+				Value: "123456.123456",
+			},
+		},
+		pipeline.TaskRunResult{
+			Task: &jsonParseTaskBid,
+			Result: pipeline.Result{
+				Value: "1234567.1234567",
+			},
+		},
+		pipeline.TaskRunResult{
+			Task: &jsonParseTaskAsk,
+			Result: pipeline.Result{
+				Value: "321123",
+			},
 		},
 	}
 
-	benchmarkPrice, bid, ask := e.getPricesFromResults(trrsMercuryV1[0], trrsMercuryV1, 1)
-	require.Equal(t, 123456.123456, benchmarkPrice)
-	require.Equal(t, 1234567.1234567, bid)
-	require.Equal(t, float64(321123), ask)
+	benchmarkPrice, bidPrice, askPrice := getPricesFromBridgeTask(lggr, taskRunResults[0], taskRunResults, 1)
 
-	benchmarkPrice, bid, ask = e.getPricesFromResults(trrsMercuryV1[0], pipeline.TaskRunResults{}, 1)
-	require.Equal(t, float64(0), benchmarkPrice)
-	require.Equal(t, float64(0), bid)
-	require.Equal(t, float64(0), ask)
-	require.Equal(t, 1, logs.Len())
-	require.Contains(t, logs.All()[0].Message, "cannot parse enhanced EA telemetry")
+	require.InEpsilon(t, 123456.123456, benchmarkPrice, 1e-9)
+	require.InEpsilon(t, 1234567.1234567, bidPrice, 1e-9)
+	require.InEpsilon(t, 321123.0, askPrice, 1e-9)
+
+	// now removing the TaskTags will throw off the parsed order - and we'll be parsing the "incorrect" prices
+	// according to the legacy ordering approach
+	jsonParseTaskAsk.Tags = ""
+	jsonParseTaskBid.Tags = ""
+	jsonParseTaskBenchmark.Tags = ""
+
+	wrongBenchmarkPrice, wrongBidPrice, wrongAskPrice := getPricesFromBridgeTask(lggr, taskRunResults[0], taskRunResults, 1)
+	require.InEpsilon(t, 1234567.1234567, wrongBenchmarkPrice, 1e-9)
+	require.InEpsilon(t, 321123.0, wrongBidPrice, 1e-9)
+	require.InEpsilon(t, 123456.123456, wrongAskPrice, 1e-9)
+}
+
+func TestGetPricesFromBridgeTaskByOrder(t *testing.T) {
+	lggr, logs := logger.TestLoggerObserved(t, zap.WarnLevel)
+
+	benchmarkPrice, bid, ask := getPricesFromBridgeTask(lggr, trrsMercuryV1[0], trrsMercuryV1, 1)
+	require.InEpsilon(t, 123456.123456, benchmarkPrice, 1e-9)
+	require.InEpsilon(t, 1234567.1234567, bid, 1e-9)
+	require.InEpsilon(t, float64(321123), ask, 1e-9)
+
+	benchmarkPrice, bid, ask = getPricesFromBridgeTask(lggr, trrsMercuryV1[0], pipeline.TaskRunResults{}, 1)
+	require.InDelta(t, float64(0), benchmarkPrice, 1e-9)
+	require.InDelta(t, float64(0), bid, 1e-9)
+	require.InDelta(t, float64(0), ask, 1e-9)
+	require.Equal(t, 0, logs.Len())
 
 	tt := trrsMercuryV1[:2]
-	e.getPricesFromResults(trrsMercuryV1[0], tt, 1)
-	require.Equal(t, 2, logs.Len())
-	require.Contains(t, logs.All()[1].Message, "cannot parse enhanced EA telemetry bid price, task is nil")
+	getPricesFromBridgeTask(lggr, trrsMercuryV1[0], tt, 1)
+	require.Equal(t, 0, logs.Len())
 
 	tt = trrsMercuryV1[:3]
-	e.getPricesFromResults(trrsMercuryV1[0], tt, 1)
-	require.Equal(t, 3, logs.Len())
-	require.Contains(t, logs.All()[2].Message, "cannot parse enhanced EA telemetry ask price, task is nil")
+	getPricesFromBridgeTask(lggr, trrsMercuryV1[0], tt, 1)
+	require.Equal(t, 0, logs.Len())
 
 	trrs2 := pipeline.TaskRunResults{
 		pipeline.TaskRunResult{
@@ -512,24 +701,21 @@ func TestGetPricesFromResults(t *testing.T) {
 			Result: pipeline.Result{
 				Value: nil,
 			},
-		}}
-	benchmarkPrice, bid, ask = e.getPricesFromResults(trrsMercuryV1[0], trrs2, 3)
-	require.Equal(t, benchmarkPrice, float64(0))
-	require.Equal(t, bid, float64(0))
-	require.Equal(t, ask, float64(0))
-	require.Equal(t, logs.Len(), 6)
-	require.Contains(t, logs.All()[3].Message, "cannot parse enhanced EA telemetry benchmark price")
-	require.Contains(t, logs.All()[4].Message, "cannot parse enhanced EA telemetry bid price")
-	require.Contains(t, logs.All()[5].Message, "cannot parse enhanced EA telemetry ask price")
+		},
+	}
+	benchmarkPrice, bid, ask = getPricesFromBridgeTask(lggr, trrsMercuryV1[0], trrs2, 3)
+	require.InDelta(t, float64(0), benchmarkPrice, 1e-9)
+	require.InDelta(t, float64(0), bid, 1e-9)
+	require.InDelta(t, float64(0), ask, 1e-9)
+	require.Equal(t, 0, logs.Len())
 
-	benchmarkPrice, bid, ask = e.getPricesFromResults(trrsMercuryV1[0], trrsMercuryV2, 2)
-	require.Equal(t, 123456.123456, benchmarkPrice)
-	require.Equal(t, float64(0), bid)
-	require.Equal(t, float64(0), ask)
+	benchmarkPrice, bid, ask = getPricesFromBridgeTask(lggr, trrsMercuryV1[0], trrsMercuryV2, 2)
+	require.InEpsilon(t, 123456.123456, benchmarkPrice, 1e-9)
+	require.InDelta(t, float64(0), bid, 1e-9)
+	require.InDelta(t, float64(0), ask, 1e-9)
 }
 
 func TestShouldCollectEnhancedTelemetryMercury(t *testing.T) {
-
 	j := job.Job{
 		Type: job.Type(pipeline.OffchainReporting2JobType),
 		OCR2OracleSpec: &job.OCR2OracleSpec{
@@ -537,19 +723,188 @@ func TestShouldCollectEnhancedTelemetryMercury(t *testing.T) {
 		},
 	}
 
-	require.Equal(t, ShouldCollectEnhancedTelemetryMercury(j), true)
+	require.True(t, ShouldCollectEnhancedTelemetryMercury(j))
 	j.OCR2OracleSpec.CaptureEATelemetry = false
-	require.Equal(t, ShouldCollectEnhancedTelemetryMercury(j), false)
+	require.False(t, ShouldCollectEnhancedTelemetryMercury(j))
 	j.OCR2OracleSpec.CaptureEATelemetry = true
 	j.Type = job.Type(pipeline.CronJobType)
-	require.Equal(t, ShouldCollectEnhancedTelemetryMercury(j), false)
+	require.False(t, ShouldCollectEnhancedTelemetryMercury(j))
 }
 
-func TestGetAssetSymbolFromRequestData(t *testing.T) {
-	e := EnhancedTelemetryService[EnhancedTelemetryMercuryData]{}
-	require.Equal(t, e.getAssetSymbolFromRequestData(""), "")
+func TestParseBridgeRequestData(t *testing.T) {
+	require.Equal(t, bridgeRequestData{}, parseBridgeRequestData("", 2))
+
 	reqData := `{"data":{"to":"LINK","from":"USD"}}`
-	require.Equal(t, e.getAssetSymbolFromRequestData(reqData), "USD/LINK")
+	require.Equal(t, bridgeRequestData{AssetSymbol: "USD/LINK"}, parseBridgeRequestData(reqData, 2))
+
+	reqData = `{"data":{"to":"LINK","from":"USD","market":"forex"}}`
+	require.Equal(t, bridgeRequestData{AssetSymbol: "USD/LINK"}, parseBridgeRequestData(reqData, 2))
+
+	reqData = `{"data":{"endpoint":"market-status","market":"forex"}}`
+	require.Equal(t, bridgeRequestData{AssetSymbol: "forex", IsMarketStatus: true}, parseBridgeRequestData(reqData, 4))
+
+	reqData = `{"data":{"market":"metals"}}`
+	require.Equal(t, bridgeRequestData{AssetSymbol: "metals", IsMarketStatus: true}, parseBridgeRequestData(reqData, 4))
+
+	viewFunctionReqData := `{"data":{"address":"0x12345678", "signature": "function stEthPerToken() view returns (int256)"}}`
+	require.Equal(t, bridgeRequestData{AssetSymbol: "0x12345678"}, parseBridgeRequestData(viewFunctionReqData, 3))
+}
+
+func getViewFunctionTaskRunResults() pipeline.TaskRunResults {
+	taskViewFunctionParseValue := func() pipeline.MultiplyTask {
+		task := pipeline.MultiplyTask{
+			BaseTask: pipeline.NewBaseTask(3, "ds1_parse", nil, nil, 3),
+			Times:    "1",
+		}
+		task.Tags = `{"priceType": "exchangeRate"}`
+		return task
+	}()
+
+	taskViewFunctionDecode := pipeline.ETHABIDecodeTask{
+		ABI:      "uint256 data",
+		BaseTask: pipeline.NewBaseTask(2, "ds1_decode", nil, []pipeline.Task{&taskViewFunctionParseValue}, 2),
+	}
+
+	taskViewFunctionJSONParse := pipeline.JSONParseTask{
+		BaseTask: pipeline.NewBaseTask(1, "ds1_parse", nil, []pipeline.Task{&taskViewFunctionDecode}, 1),
+	}
+
+	const viewFunctionBridgeResponse = `{
+		  "data": {
+			"result": "0x000000000000000000000000000000000000000000000000105ba6a589b23a81"
+		  },
+		  "statusCode": 200,
+		  "result": "0x000000000000000000000000000000000000000000000000105ba6a589b23a81",
+		  "timestamps": {
+			"providerDataRequestedUnixMs": 1726243598046,
+			"providerDataReceivedUnixMs": 1726243598341
+		  },
+		  "meta": {
+			"adapterName": "VIEW_FUNCTION"
+		  }
+		}`
+
+	taskViewFunctionBridgeRequest := pipeline.BridgeTask{
+		Name:        "bridge-view-function",
+		BaseTask:    pipeline.NewBaseTask(0, "ds1", nil, []pipeline.Task{&taskViewFunctionJSONParse}, 0),
+		RequestData: `{"data":{"address":"0x1234","signature":"function stEthPerToken() external view returns (uint256)"}}`,
+	}
+
+	return pipeline.TaskRunResults{
+		pipeline.TaskRunResult{
+			Task: &taskViewFunctionBridgeRequest,
+			Result: pipeline.Result{
+				Value: viewFunctionBridgeResponse,
+			},
+		},
+		pipeline.TaskRunResult{
+			Task: &taskViewFunctionJSONParse,
+			Result: pipeline.Result{
+				Value: `0x000000000000000000000000000000000000000000000000105ba6a589b23a81`,
+			},
+		},
+		pipeline.TaskRunResult{
+			Task: &taskViewFunctionDecode,
+			Result: pipeline.Result{
+				Value: map[string]any{
+					"data": big.NewInt(1178718957397490305),
+				},
+			},
+		},
+		pipeline.TaskRunResult{
+			Task: &taskViewFunctionParseValue,
+			Result: pipeline.Result{
+				Value: decimal.NewFromInt(1178718957397490305),
+			},
+		},
+	}
+}
+
+func TestCollectMercuryEnhancedTelemetryV1ViewFunction(t *testing.T) {
+	wg := sync.WaitGroup{}
+	ingressClient := mocks.NewTelemetryService(t)
+	ingressAgent := telemetry.NewIngressAgentWrapper(ingressClient)
+	monitoringEndpoint := ingressAgent.GenMonitoringEndpoint("test-network", "test-chainID", "0xa", synchronization.EnhancedEAMercury)
+
+	var sentMessage []byte
+	ingressClient.On("Send", mock.Anything, mock.AnythingOfType("[]uint8"), mock.AnythingOfType("string"), mock.AnythingOfType("TelemetryType")).Return().Run(func(args mock.Arguments) {
+		sentMessage = args[1].([]byte)
+		wg.Done()
+	})
+
+	lggr, _ := logger.TestLoggerObserved(t, zap.WarnLevel)
+	chTelem := make(chan EnhancedTelemetryMercuryData, 100)
+	chDone := make(chan struct{})
+	feedID := common.HexToHash("0x111")
+	e := EnhancedTelemetryService[EnhancedTelemetryMercuryData]{
+		chDone:  chDone,
+		chTelem: chTelem,
+		job: &job.Job{
+			Type: job.Type(pipeline.OffchainReporting2JobType),
+			OCR2OracleSpec: &job.OCR2OracleSpec{
+				CaptureEATelemetry: true,
+				FeedID:             &feedID,
+			},
+		},
+		lggr:               lggr,
+		monitoringEndpoint: monitoringEndpoint,
+	}
+	servicetest.Run(t, &e)
+
+	wg.Add(1)
+
+	taskRunResults := getViewFunctionTaskRunResults()
+
+	chTelem <- EnhancedTelemetryMercuryData{
+		TaskRunResults: taskRunResults,
+		V1Observation: &mercuryv1.Observation{
+			BenchmarkPrice:        mercury.ObsResult[*big.Int]{Val: big.NewInt(111111)},
+			Bid:                   mercury.ObsResult[*big.Int]{Val: big.NewInt(222222)},
+			Ask:                   mercury.ObsResult[*big.Int]{Val: big.NewInt(333333)},
+			CurrentBlockNum:       mercury.ObsResult[int64]{Val: 123456789},
+			CurrentBlockHash:      mercury.ObsResult[[]byte]{Val: common.HexToHash("0x123321").Bytes()},
+			CurrentBlockTimestamp: mercury.ObsResult[uint64]{Val: 987654321},
+		},
+		RepTimestamp: types.ReportTimestamp{
+			ConfigDigest: types.ConfigDigest{2},
+			Epoch:        11,
+			Round:        22,
+		},
+	}
+
+	expectedTelemetry := telem.EnhancedEAMercury{
+		DataSource:                      "VIEW_FUNCTION",
+		DpBenchmarkPrice:                1178718957397490400,
+		DpBid:                           1178718957397490400,
+		DpAsk:                           1178718957397490400,
+		CurrentBlockNumber:              123456789,
+		CurrentBlockHash:                common.HexToHash("0x123321").String(),
+		CurrentBlockTimestamp:           987654321,
+		BridgeTaskRunStartedTimestamp:   taskRunResults[0].CreatedAt.UnixMilli(),
+		BridgeTaskRunEndedTimestamp:     taskRunResults[0].FinishedAt.Time.UnixMilli(),
+		ProviderRequestedTimestamp:      1726243598046,
+		ProviderReceivedTimestamp:       1726243598341,
+		ProviderDataStreamEstablished:   0,
+		ProviderIndicatedTime:           0,
+		Feed:                            common.HexToHash("0x111").String(),
+		ObservationBenchmarkPrice:       111111,
+		ObservationBid:                  222222,
+		ObservationAsk:                  333333,
+		ConfigDigest:                    "0200000000000000000000000000000000000000000000000000000000000000",
+		Round:                           22,
+		Epoch:                           11,
+		BridgeRequestData:               `{"data":{"address":"0x1234","signature":"function stEthPerToken() external view returns (uint256)"}}`,
+		AssetSymbol:                     "0x1234",
+		ObservationBenchmarkPriceString: "111111",
+		ObservationBidString:            "222222",
+		ObservationAskString:            "333333",
+	}
+
+	expectedMessage, _ := proto.Marshal(&expectedTelemetry)
+	wg.Wait()
+	require.Equal(t, expectedMessage, sentMessage)
+
+	chDone <- struct{}{}
 }
 
 func TestCollectMercuryEnhancedTelemetryV1(t *testing.T) {
@@ -623,6 +978,7 @@ func TestCollectMercuryEnhancedTelemetryV1(t *testing.T) {
 		ConfigDigest:                    "0200000000000000000000000000000000000000000000000000000000000000",
 		Round:                           22,
 		Epoch:                           11,
+		BridgeRequestData:               `{"data":{"to":"LINK","from":"USD"}}`,
 		AssetSymbol:                     "USD/LINK",
 		ObservationBenchmarkPriceString: "111111",
 		ObservationBidString:            "222222",
@@ -635,13 +991,15 @@ func TestCollectMercuryEnhancedTelemetryV1(t *testing.T) {
 
 	chTelem <- EnhancedTelemetryMercuryData{
 		TaskRunResults: pipeline.TaskRunResults{
-			pipeline.TaskRunResult{Task: &pipeline.BridgeTask{
-				Name:     "test-mercury-bridge-1",
-				BaseTask: pipeline.NewBaseTask(0, "ds1", nil, nil, 0),
-			},
+			pipeline.TaskRunResult{
+				Task: &pipeline.BridgeTask{
+					Name:     "test-mercury-bridge-1",
+					BaseTask: pipeline.NewBaseTask(0, "ds1", nil, nil, 0),
+				},
 				Result: pipeline.Result{
 					Value: nil,
-				}},
+				},
+			},
 		},
 		V1Observation: &mercuryv1.Observation{},
 		RepTimestamp: types.ReportTimestamp{
@@ -663,9 +1021,8 @@ func TestCollectMercuryEnhancedTelemetryV1(t *testing.T) {
 	}
 
 	wg.Wait()
-	require.Equal(t, 2, logs.Len())
-	require.Contains(t, logs.All()[0].Message, `cannot get bridge response from bridge task, job=0, id=ds1, name="test-mercury-bridge-1"`)
-	require.Contains(t, logs.All()[1].Message, "cannot parse EA telemetry")
+	require.Equal(t, 1, logs.Len())
+	require.Contains(t, logs.All()[0].Message, "cannot parse EA telemetry")
 	chDone <- struct{}{}
 }
 
@@ -736,6 +1093,7 @@ func TestCollectMercuryEnhancedTelemetryV2(t *testing.T) {
 		ConfigDigest:                    "0200000000000000000000000000000000000000000000000000000000000000",
 		Round:                           22,
 		Epoch:                           11,
+		BridgeRequestData:               `{"data":{"to":"LINK","from":"USD"}}`,
 		AssetSymbol:                     "USD/LINK",
 		ObservationBenchmarkPriceString: "111111",
 		MaxFinalizedTimestamp:           321,
@@ -750,13 +1108,15 @@ func TestCollectMercuryEnhancedTelemetryV2(t *testing.T) {
 
 	chTelem <- EnhancedTelemetryMercuryData{
 		TaskRunResults: pipeline.TaskRunResults{
-			pipeline.TaskRunResult{Task: &pipeline.BridgeTask{
-				Name:     "test-mercury-bridge-2",
-				BaseTask: pipeline.NewBaseTask(0, "ds1", nil, nil, 0),
-			},
+			pipeline.TaskRunResult{
+				Task: &pipeline.BridgeTask{
+					Name:     "test-mercury-bridge-2",
+					BaseTask: pipeline.NewBaseTask(0, "ds1", nil, nil, 0),
+				},
 				Result: pipeline.Result{
 					Value: nil,
-				}},
+				},
+			},
 		},
 		V2Observation: &mercuryv2.Observation{},
 		RepTimestamp: types.ReportTimestamp{
@@ -778,10 +1138,86 @@ func TestCollectMercuryEnhancedTelemetryV2(t *testing.T) {
 	}
 
 	wg.Wait()
-	require.Equal(t, 4, logs.Len())
-	require.Contains(t, logs.All()[0].Message, "cannot parse enhanced EA telemetry bid price")
-	require.Contains(t, logs.All()[1].Message, "cannot get bridge response from bridge task")
-	require.Contains(t, logs.All()[2].Message, "cannot parse EA telemetry")
-	require.Contains(t, logs.All()[3].Message, "cannot parse enhanced EA telemetry bid price")
+	require.Equal(t, 1, logs.Len())
+	fmt.Println(logs.All())
+	require.Contains(t, logs.All()[0].Message, "cannot parse EA telemetry")
 	chDone <- struct{}{}
+}
+
+func TestCollectMercuryEnhancedTelemetryV4(t *testing.T) {
+	ingressClient := mocks.NewTelemetryService(t)
+	ingressAgent := telemetry.NewIngressAgentWrapper(ingressClient)
+	monitoringEndpoint := ingressAgent.GenMonitoringEndpoint("test-network", "test-chainID", "0xa", synchronization.EnhancedEAMercury)
+
+	sentMessageCh := make(chan []byte)
+	ingressClient.On("Send", mock.Anything, mock.AnythingOfType("[]uint8"), mock.AnythingOfType("string"), mock.AnythingOfType("TelemetryType")).Return().Run(func(args mock.Arguments) {
+		sentMessageCh <- args[1].([]byte)
+	})
+
+	lggr, _ := logger.TestLoggerObserved(t, zap.WarnLevel)
+	chTelem := make(chan EnhancedTelemetryMercuryData, 100)
+	chDone := make(chan struct{})
+	feedID := common.HexToHash("0x0004")
+	e := EnhancedTelemetryService[EnhancedTelemetryMercuryData]{
+		chDone:  chDone,
+		chTelem: chTelem,
+		job: &job.Job{
+			Type: job.Type(pipeline.OffchainReporting2JobType),
+			OCR2OracleSpec: &job.OCR2OracleSpec{
+				CaptureEATelemetry: true,
+				FeedID:             &feedID,
+			},
+		},
+		lggr:               lggr,
+		monitoringEndpoint: monitoringEndpoint,
+	}
+	servicetest.Run(t, &e)
+
+	chTelem <- EnhancedTelemetryMercuryData{
+		TaskRunResults: trrsMercuryV4,
+		FeedVersion:    4,
+		V4Observation: &mercuryv4.Observation{
+			BenchmarkPrice:        mercury.ObsResult[*big.Int]{Val: big.NewInt(111111)},
+			MarketStatus:          mercury.ObsResult[uint32]{Val: 2},
+			MaxFinalizedTimestamp: mercury.ObsResult[int64]{Val: 321},
+			LinkPrice:             mercury.ObsResult[*big.Int]{Val: big.NewInt(4321)},
+			NativePrice:           mercury.ObsResult[*big.Int]{Val: big.NewInt(54321)},
+		},
+		RepTimestamp: types.ReportTimestamp{
+			ConfigDigest: types.ConfigDigest{2},
+			Epoch:        11,
+			Round:        22,
+		},
+	}
+
+	expectedPricingTelemetry := telem.EnhancedEAMercury{
+		DataSource:                      "data-source-name",
+		DpBenchmarkPrice:                123456.123456,
+		BridgeTaskRunStartedTimestamp:   trrsMercuryV4[0].CreatedAt.UnixMilli(),
+		BridgeTaskRunEndedTimestamp:     trrsMercuryV4[0].FinishedAt.Time.UnixMilli(),
+		ProviderRequestedTimestamp:      92233720368547760,
+		ProviderReceivedTimestamp:       -92233720368547760,
+		ProviderDataStreamEstablished:   1,
+		ProviderIndicatedTime:           -123456789,
+		Feed:                            common.HexToHash("0x0004").String(),
+		ObservationBenchmarkPrice:       111111,
+		ObservationMarketStatus:         2,
+		ConfigDigest:                    "0200000000000000000000000000000000000000000000000000000000000000",
+		Round:                           22,
+		Epoch:                           11,
+		AssetSymbol:                     "USD/LINK",
+		ObservationBenchmarkPriceString: "111111",
+		MaxFinalizedTimestamp:           321,
+		LinkPrice:                       4321,
+		NativePrice:                     54321,
+		Version:                         4,
+		BridgeRequestData:               `{"data":{"to":"LINK","from":"USD"}}`,
+	}
+	expectedPricingMessage, _ := proto.Marshal(&expectedPricingTelemetry)
+	require.Equal(t, expectedPricingMessage, <-sentMessageCh)
+
+	chDone <- struct{}{}
+
+	// Verify that no other telemetry is sent.
+	require.Empty(t, sentMessageCh)
 }

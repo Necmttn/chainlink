@@ -1,0 +1,399 @@
+package remote
+
+import (
+	"context"
+	goerrors "errors"
+	"fmt"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/beholder"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/services"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/cresettings"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/limits"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities/remote/types"
+	"github.com/smartcontractkit/chainlink/v2/core/config"
+	p2ptypes "github.com/smartcontractkit/chainlink/v2/core/services/p2p/types"
+)
+
+var ErrReceiverExists = errors.New("receiver already exists")
+
+// dispatcher en/decodes messages and routes traffic between peers and capabilities
+// messageVersion is the version of the remote message schema.
+const messageVersion = 1
+
+type dispatcher struct {
+	cfg               config.Dispatcher
+	peerID            p2ptypes.PeerID
+	signer            p2ptypes.Signer
+	don2donSharedPeer p2ptypes.SharedPeer
+	limitsFactory     limits.Factory
+	globalRate        limits.RateLimiter
+	perSenderRateMu   sync.Mutex
+	perSenderRate     map[string]limits.RateLimiter
+	receivers         map[key]*receiver
+	mu                sync.RWMutex
+	stopCh            services.StopChan
+	wg                sync.WaitGroup
+	lggr              logger.Logger
+
+	metrics dispatcherMetrics
+}
+
+type dispatcherMetrics struct {
+	sharedPeerMsgsRcvdCounter  metric.Int64Counter
+	rateLimitedMsgsCounter     metric.Int64Counter
+	invalidMsgsCounter         metric.Int64Counter
+	unknownCapMsgsCounter      metric.Int64Counter
+	receiveChannelUsageGauge   metric.Float64Gauge
+	receiverDroppedMsgsCounter metric.Int64Counter
+	messagesSentCounter        metric.Int64Counter
+	sendErrorsCounter          metric.Int64Counter
+}
+
+var _ types.Dispatcher = &dispatcher{}
+
+type key struct {
+	capID      string
+	donID      uint32
+	methodName string
+}
+
+var _ services.Service = &dispatcher{}
+
+func NewDispatcher(cfg config.Dispatcher, don2donSharedPeer p2ptypes.SharedPeer, signer p2ptypes.Signer, lggr logger.Logger, lf limits.Factory) (*dispatcher, error) {
+	if don2donSharedPeer == nil {
+		return nil, errors.New("don2donSharedPeer is required")
+	}
+	globalRate, err := lf.MakeRateLimiter(cresettings.Default.DispatcherGlobalRate)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create dispatcher global rate limiter")
+	}
+	return &dispatcher{
+		cfg:               cfg,
+		signer:            signer,
+		limitsFactory:     lf,
+		globalRate:        globalRate,
+		perSenderRate:     make(map[string]limits.RateLimiter),
+		receivers:         make(map[key]*receiver),
+		stopCh:            make(services.StopChan),
+		lggr:              logger.Named(lggr, "Dispatcher"),
+		don2donSharedPeer: don2donSharedPeer,
+	}, nil
+}
+
+func (d *dispatcher) initMetrics() error {
+	var err error
+	d.metrics.sharedPeerMsgsRcvdCounter, err = beholder.GetMeter().Int64Counter("platform_don2don_dispatcher_shared_peer_msgs_rcvd_total")
+	if err != nil {
+		return fmt.Errorf("failed to register platform_don2don_dispatcher_shared_peer_msgs_rcvd_total): %w", err)
+	}
+	d.metrics.rateLimitedMsgsCounter, err = beholder.GetMeter().Int64Counter("platform_don2don_dispatcher_rate_limited_msgs_total")
+	if err != nil {
+		return fmt.Errorf("failed to register platform_don2don_dispatcher_rate_limited_msgs_total: %w", err)
+	}
+	d.metrics.invalidMsgsCounter, err = beholder.GetMeter().Int64Counter("platform_don2don_dispatcher_invalid_msgs_total")
+	if err != nil {
+		return fmt.Errorf("failed to register platform_don2don_dispatcher_invalid_msgs_total: %w", err)
+	}
+	d.metrics.unknownCapMsgsCounter, err = beholder.GetMeter().Int64Counter("platform_don2don_dispatcher_unknown_capability_msgs_total")
+	if err != nil {
+		return fmt.Errorf("failed to register platform_don2don_dispatcher_unknown_capability_msgs_total: %w", err)
+	}
+	d.metrics.receiveChannelUsageGauge, err = beholder.GetMeter().Float64Gauge("platform_don2don_dispatcher_receive_channel_usage")
+	if err != nil {
+		return fmt.Errorf("failed to register platform_don2don_dispatcher_receive_channel_usage: %w", err)
+	}
+	d.metrics.receiverDroppedMsgsCounter, err = beholder.GetMeter().Int64Counter("platform_don2don_dispatcher_receiver_dropped_msgs_total")
+	if err != nil {
+		return fmt.Errorf("failed to register platform_don2don_dispatcher_receiver_dropped_msgs_total: %w", err)
+	}
+	d.metrics.messagesSentCounter, err = beholder.GetMeter().Int64Counter("platform_don2don_dispatcher_messages_sent_total")
+	if err != nil {
+		return fmt.Errorf("failed to register platform_don2don_dispatcher_messages_sent_total: %w", err)
+	}
+	d.metrics.sendErrorsCounter, err = beholder.GetMeter().Int64Counter("platform_don2don_dispatcher_send_errors_total")
+	if err != nil {
+		return fmt.Errorf("failed to register platform_don2don_dispatcher_send_errors_total: %w", err)
+	}
+	return nil
+}
+
+func (d *dispatcher) Start(ctx context.Context) error {
+	d.peerID = d.don2donSharedPeer.ID()
+	err := d.signer.Initialize()
+	if err != nil {
+		return errors.Wrap(err, "failed to initialize signer")
+	}
+	if err = d.initMetrics(); err != nil {
+		return errors.Wrap(err, "failed to initialize metrics")
+	}
+	d.wg.Go(func() {
+		d.receive()
+	})
+
+	d.lggr.Info("dispatcher started")
+	return nil
+}
+
+func (d *dispatcher) Close() error {
+	close(d.stopCh)
+	d.wg.Wait()
+
+	err := d.globalRate.Close()
+	d.perSenderRateMu.Lock()
+	for _, rl := range d.perSenderRate {
+		err = goerrors.Join(err, rl.Close())
+	}
+	d.perSenderRateMu.Unlock()
+	if err != nil {
+		d.lggr.Errorw("failed to close rate limiters", "error", err)
+	}
+
+	d.lggr.Info("dispatcher closed")
+	return nil
+}
+
+type receiver struct {
+	cancel context.CancelFunc
+	ch     chan *types.MessageBody
+}
+
+func (d *dispatcher) SetReceiverForMethod(capabilityID string, donID uint32, method string, rec types.Receiver) error {
+	return d.setReceiver(key{capabilityID, donID, method}, rec)
+}
+
+func (d *dispatcher) SetReceiver(capabilityID string, donID uint32, rec types.Receiver) error {
+	return d.setReceiver(key{capabilityID, donID, ""}, rec) // empty method name
+}
+
+func (d *dispatcher) setReceiver(k key, rec types.Receiver) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, ok := d.receivers[k]
+	if ok {
+		return fmt.Errorf("%w: receiver already exists for capability %s, donID %d, method %s", ErrReceiverExists, k.capID, k.donID, k.methodName)
+	}
+	receiverCh := make(chan *types.MessageBody, d.cfg.ReceiverBufferSize())
+
+	ctx, cancelCtx := d.stopCh.NewCtx()
+	d.wg.Add(1)
+	go func() {
+		defer cancelCtx()
+		defer d.wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg := <-receiverCh:
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							d.lggr.Errorw("Recovered goroutine panic",
+								"panic", r,
+								"capabilityId", SanitizeLogString(k.capID),
+								"donId", k.donID,
+								"methodName", k.methodName,
+								"msgMethod", msg.Method,
+								"sender", msg.Sender,
+							)
+						}
+					}()
+					rec.Receive(ctx, msg)
+				}()
+			}
+		}
+	}()
+
+	d.receivers[k] = &receiver{
+		cancel: cancelCtx,
+		ch:     receiverCh,
+	}
+
+	d.lggr.Debugw("receiver set", "capabilityId", k.capID, "donId", k.donID, "methodName", k.methodName)
+	return nil
+}
+
+func (d *dispatcher) RemoveReceiverForMethod(capabilityID string, donID uint32, method string) {
+	d.removeReceiver(key{capabilityID, donID, method})
+}
+
+func (d *dispatcher) RemoveReceiver(capabilityID string, donID uint32) {
+	d.removeReceiver(key{capabilityID, donID, ""}) // empty method name
+}
+
+func (d *dispatcher) removeReceiver(k key) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if receiver, ok := d.receivers[k]; ok {
+		// NOTE: receiver.ch is not drained or closed - handle it if receivers are ever dynamically removed/re-added.
+		receiver.cancel()
+		delete(d.receivers, k)
+		d.lggr.Debugw("receiver removed", "capabilityId", k.capID, "donId", k.donID, "methodName", k.methodName)
+	}
+}
+
+func (d *dispatcher) Send(peerID p2ptypes.PeerID, msgBody *types.MessageBody) error {
+	msgBody.Version = messageVersion
+	msgBody.Sender = d.peerID[:]
+	msgBody.Receiver = peerID[:]
+	msgBody.Timestamp = time.Now().UnixMilli()
+	rawBody, err := proto.Marshal(msgBody)
+	if err != nil {
+		return err
+	}
+	signature, err := d.signer.Sign(rawBody)
+	if err != nil {
+		return err
+	}
+	msg := &types.Message{Signature: signature, Body: rawBody}
+	rawMsg, err := proto.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	sendErr := d.don2donSharedPeer.Send(peerID, rawMsg)
+
+	ctx, cancel := d.stopCh.NewCtx()
+	defer cancel()
+	methodAttr := attribute.String("method", msgBody.Method)
+	if sendErr != nil {
+		d.metrics.sendErrorsCounter.Add(ctx, 1, metric.WithAttributes(methodAttr))
+		return sendErr
+	}
+	d.metrics.messagesSentCounter.Add(ctx, 1, metric.WithAttributes(methodAttr))
+	return nil
+}
+
+func (d *dispatcher) receive() {
+	sharedPeerRecvCh := d.don2donSharedPeer.Receive()
+	ctx, cancel := d.stopCh.NewCtx()
+	defer cancel()
+	for {
+		select {
+		case <-d.stopCh:
+			d.lggr.Info("stopped - exiting receive")
+			return
+		case msg, ok := <-sharedPeerRecvCh:
+			if !ok {
+				d.lggr.Info("shared peer channel closed - exiting receive")
+				return
+			}
+			d.metrics.sharedPeerMsgsRcvdCounter.Add(ctx, 1)
+			d.handleMessage(ctx, &msg)
+		}
+	}
+}
+
+func (d *dispatcher) handleMessage(ctx context.Context, msg *p2ptypes.Message) {
+	sender := msg.Sender.String()
+	if !d.allow(ctx, sender) {
+		d.metrics.rateLimitedMsgsCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("sender", sender),
+		))
+		d.lggr.Errorw("rate limit exceeded, dropping message", "sender", msg.Sender)
+		return
+	}
+	body, err := ValidateMessage(msg, d.peerID)
+	if err != nil {
+		d.metrics.invalidMsgsCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("sender", sender),
+		))
+		d.lggr.Debugw("received invalid message", "error", err)
+		d.tryRespondWithError(msg.Sender, body, types.Error_VALIDATION_FAILED)
+		return
+	}
+	// CapabilityMethod will be empty for legacy "v1" messages
+	k := key{body.CapabilityId, body.CapabilityDonId, body.CapabilityMethod}
+	d.mu.RLock()
+	receiver, ok := d.receivers[k]
+	d.mu.RUnlock()
+	if !ok {
+		d.metrics.unknownCapMsgsCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("capabilityId", k.capID),
+			attribute.String("donId", strconv.FormatUint(uint64(k.donID), 10)),
+			attribute.String("method", k.methodName),
+		))
+		d.lggr.Debugw("received message for unknown capability or method", "capabilityId", SanitizeLogString(k.capID), "donId", k.donID, "method", k.methodName)
+		d.tryRespondWithError(msg.Sender, body, types.Error_CAPABILITY_NOT_FOUND)
+		return
+	}
+
+	receiverQueueUsage := float64(0)
+	if d.cfg.ReceiverBufferSize() > 0 {
+		receiverQueueUsage = float64(len(receiver.ch)) / float64(d.cfg.ReceiverBufferSize())
+	}
+	capAttrs := metric.WithAttributes(
+		attribute.String("capabilityId", k.capID),
+		attribute.String("donId", strconv.FormatUint(uint64(k.donID), 10)),
+		attribute.String("method", k.methodName),
+	)
+	d.metrics.receiveChannelUsageGauge.Record(ctx, receiverQueueUsage, capAttrs)
+	select {
+	case receiver.ch <- body:
+	default:
+		d.metrics.receiverDroppedMsgsCounter.Add(ctx, 1, capAttrs)
+		d.lggr.Errorw("receiver channel full, dropping message", "capabilityId", k.capID, "donId", k.donID)
+	}
+}
+
+// allow checks the per-sender and global rate limits, in that order. If the
+// global limit blocks, the per-sender token is credited back.
+func (d *dispatcher) allow(ctx context.Context, sender string) bool {
+	senderRate, err := d.senderRateLimiter(sender)
+	if err != nil {
+		d.lggr.Errorw("failed to create per-sender rate limiter", "sender", sender, "error", err)
+		return false
+	}
+	return limits.MultiRateLimiter{senderRate, d.globalRate}.Allow(ctx)
+}
+
+func (d *dispatcher) senderRateLimiter(sender string) (limits.RateLimiter, error) {
+	d.perSenderRateMu.Lock()
+	defer d.perSenderRateMu.Unlock()
+	if rl, ok := d.perSenderRate[sender]; ok {
+		return rl, nil
+	}
+	rl, err := d.limitsFactory.MakeRateLimiter(cresettings.Default.DispatcherPerSenderRate)
+	if err != nil {
+		return nil, err
+	}
+	d.perSenderRate[sender] = rl
+	return rl, nil
+}
+
+func (d *dispatcher) tryRespondWithError(peerID p2ptypes.PeerID, body *types.MessageBody, errType types.Error) {
+	if body == nil {
+		return
+	}
+	if body.Error != types.Error_OK {
+		d.lggr.Debug("received an invalid message with error field set - not responding to avoid an infinite loop")
+		return
+	}
+	body.Error = errType
+	// clear payload to reduce message size
+	body.Payload = nil
+	err := d.Send(peerID, body)
+	if err != nil {
+		d.lggr.Debugw("failed to send error response", "error", err)
+	}
+}
+
+func (d *dispatcher) Ready() error {
+	return nil
+}
+
+func (d *dispatcher) HealthReport() map[string]error {
+	return nil
+}
+
+func (d *dispatcher) Name() string {
+	return d.lggr.Name()
+}

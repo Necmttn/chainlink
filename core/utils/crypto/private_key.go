@@ -8,14 +8,14 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts/keystore"
 
-	"github.com/smartcontractkit/chainlink/v2/core/utils"
+	commonkeystore "github.com/smartcontractkit/chainlink-common/keystore"
 )
 
 type EncryptedPrivateKey struct {
 	keystore.CryptoJSON
 }
 
-func NewEncryptedPrivateKey(data []byte, passphrase string, scryptParams utils.ScryptParams) (*EncryptedPrivateKey, error) {
+func NewEncryptedPrivateKey(data []byte, passphrase string, scryptParams commonkeystore.ScryptParams) (*EncryptedPrivateKey, error) {
 	cryptoJSON, err := keystore.EncryptDataV3(data, []byte(passphrase), scryptParams.N, scryptParams.P)
 	if err != nil {
 		return nil, fmt.Errorf("could not encrypt key: %w", err)
@@ -33,7 +33,7 @@ func (k EncryptedPrivateKey) Decrypt(passphrase string) (privkey []byte, err err
 	return privkey, nil
 }
 
-func (k *EncryptedPrivateKey) Scan(value interface{}) error {
+func (k *EncryptedPrivateKey) Scan(value any) error {
 	b, ok := value.([]byte)
 	if !ok {
 		return errors.New("type assertion to []byte failed")

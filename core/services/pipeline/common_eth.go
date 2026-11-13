@@ -27,7 +27,7 @@ var (
 	commaDelim      = []byte(",")
 )
 
-func ParseETHABIArgsString(theABI []byte, isLog bool) (args abi.Arguments, indexedArgs abi.Arguments, _ error) {
+func ParseETHABIArgsString(theABI []byte, isLog bool) (args, indexedArgs abi.Arguments, _ error) {
 	var argStrs [][]byte
 	if len(bytes.TrimSpace(theABI)) > 0 {
 		argStrs = bytes.Split(theABI, commaDelim)
@@ -67,11 +67,12 @@ func ParseETHABIArgsString(theABI []byte, isLog bool) (args abi.Arguments, index
 			argName = argParts[1]
 
 		case 3:
-			if !isLog {
+			switch {
+			case !isLog:
 				return nil, nil, errors.Errorf("bad ABI specification, too many components in argument: %s", theABI)
-			} else if bytes.Equal(argParts[0], indexedKeyword) || bytes.Equal(argParts[2], indexedKeyword) {
+			case bytes.Equal(argParts[0], indexedKeyword) || bytes.Equal(argParts[2], indexedKeyword):
 				return nil, nil, errors.Errorf("bad ABI specification, 'indexed' keyword must appear between argument type and name: %s", theABI)
-			} else if !bytes.Equal(argParts[1], indexedKeyword) {
+			case !bytes.Equal(argParts[1], indexedKeyword):
 				return nil, nil, errors.Errorf("bad ABI specification, unknown keyword '%v' between argument type and name: %s", string(argParts[1]), theABI)
 			}
 			typeStr = argParts[0]
@@ -93,7 +94,7 @@ func ParseETHABIArgsString(theABI []byte, isLog bool) (args abi.Arguments, index
 	return args, indexedArgs, nil
 }
 
-func parseETHABIString(theABI []byte, isLog bool) (name string, args abi.Arguments, indexedArgs abi.Arguments, err error) {
+func parseETHABIString(theABI []byte, isLog bool) (name string, args, indexedArgs abi.Arguments, err error) {
 	matches := ethABIRegex.FindAllSubmatch(theABI, -1)
 	if len(matches) != 1 || len(matches[0]) != 3 {
 		return "", nil, nil, errors.Errorf("bad ABI specification: %s", theABI)
@@ -103,7 +104,7 @@ func parseETHABIString(theABI []byte, isLog bool) (name string, args abi.Argumen
 	return name, args, indexedArgs, err
 }
 
-func convertToETHABIType(val interface{}, abiType abi.Type) (interface{}, error) {
+func convertToETHABIType(val any, abiType abi.Type) (any, error) {
 	srcVal := reflect.ValueOf(val)
 
 	if abiType.GetType() == srcVal.Type() {
@@ -167,7 +168,7 @@ func convertToETHABIType(val interface{}, abiType abi.Type) (interface{}, error)
 
 	case abi.SliceTy:
 		dest := reflect.MakeSlice(abiType.GetType(), srcVal.Len(), srcVal.Len())
-		for i := 0; i < dest.Len(); i++ {
+		for i := range dest.Len() {
 			elem, err := convertToETHABIType(srcVal.Index(i).Interface(), *abiType.Elem)
 			if err != nil {
 				return nil, err
@@ -184,7 +185,7 @@ func convertToETHABIType(val interface{}, abiType abi.Type) (interface{}, error)
 		}
 
 		dest := reflect.New(abiType.GetType()).Elem()
-		for i := 0; i < dest.Len(); i++ {
+		for i := range dest.Len() {
 			elem, err := convertToETHABIType(srcVal.Index(i).Interface(), *abiType.Elem)
 			if err != nil {
 				return nil, err
@@ -195,12 +196,11 @@ func convertToETHABIType(val interface{}, abiType abi.Type) (interface{}, error)
 
 	case abi.TupleTy:
 		return convertToETHABITuple(abiType, srcVal)
-
 	}
 	return nil, errors.Wrapf(ErrBadInput, "cannot convert %v to %v", srcVal.Type(), abiType)
 }
 
-func convertToETHABITuple(abiType abi.Type, srcVal reflect.Value) (interface{}, error) {
+func convertToETHABITuple(abiType abi.Type, srcVal reflect.Value) (any, error) {
 	size := len(abiType.TupleElems)
 	if srcVal.Len() != size {
 		return nil, errors.Wrapf(ErrBadInput, "incorrect length: expected %v, got %v", size, srcVal.Len())
@@ -237,7 +237,7 @@ func convertToETHABITuple(abiType abi.Type, srcVal reflect.Value) (interface{}, 
 	}
 }
 
-func convertToETHABIBytes(destType reflect.Type, srcVal reflect.Value, length int) (interface{}, error) {
+func convertToETHABIBytes(destType reflect.Type, srcVal reflect.Value, length int) (any, error) {
 	switch srcVal.Type().Kind() {
 	case reflect.Slice:
 		if destType.Len() != length {
@@ -294,7 +294,7 @@ func convertToETHABIBytes(destType reflect.Type, srcVal reflect.Value, length in
 
 var ErrOverflow = errors.New("overflow")
 
-func convertToETHABIInteger(val interface{}, abiType abi.Type) (interface{}, error) {
+func convertToETHABIInteger(val any, abiType abi.Type) (any, error) {
 	d, err := utils.ToDecimal(val)
 	if err != nil {
 		return nil, err
@@ -326,7 +326,7 @@ func convertToETHABIInteger(val interface{}, abiType abi.Type) (interface{}, err
 		// could hold it. Unsure of why this decision was taken.
 		// See https://github.com/ethereum/go-ethereum/blob/master/accounts/abi/reflect.go#L61 for
 		// the relevant code.
-		if ty == reflect.TypeOf(&big.Int{}) {
+		if ty == reflect.TypeFor[*big.Int]() {
 			return i, nil
 		}
 		return nil, fmt.Errorf("unknown Go type %+v for abi type %+v", ty.String(), abiType)

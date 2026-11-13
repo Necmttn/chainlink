@@ -5,24 +5,26 @@ import (
 	"testing"
 	"time"
 
-	commonassets "github.com/smartcontractkit/chainlink-common/pkg/assets"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/assets"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/manyminds/api2go/jsonapi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ethkey"
+	commonassets "github.com/smartcontractkit/chainlink-common/pkg/assets"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
+	"github.com/smartcontractkit/chainlink-evm/pkg/types"
 )
 
 func TestETHKeyResource(t *testing.T) {
+	t.Parallel()
 	var (
 		now        = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 		addressStr = "0x2aCFF2ec69aa9945Ed84f4F281eCCF6911A3B0eD"
 		address    = common.HexToAddress(addressStr)
 	)
-	eip55address, err := ethkey.NewEIP55Address(addressStr)
+	eip55address, err := types.NewEIP55Address(addressStr)
 	require.NoError(t, err)
 	key := ethkey.KeyV2{
 		Address:      address,
@@ -31,7 +33,7 @@ func TestETHKeyResource(t *testing.T) {
 
 	state := ethkey.State{
 		ID:         1,
-		EVMChainID: *big.NewI(42),
+		EVMChainID: *sqlutil.NewI(42),
 		Address:    eip55address,
 		CreatedAt:  now,
 		UpdatedAt:  now,
@@ -41,12 +43,12 @@ func TestETHKeyResource(t *testing.T) {
 	r := NewETHKeyResource(key, state,
 		SetETHKeyEthBalance(assets.NewEth(1)),
 		SetETHKeyLinkBalance(commonassets.NewLinkFromJuels(1)),
-		SetETHKeyMaxGasPriceWei(big.NewI(12345)),
+		SetETHKeyMaxGasPriceWei(sqlutil.NewI(12345)),
 	)
 
 	assert.Equal(t, assets.NewEth(1), r.EthBalance)
 	assert.Equal(t, commonassets.NewLinkFromJuels(1), r.LinkBalance)
-	assert.Equal(t, big.NewI(12345), r.MaxGasPriceWei)
+	assert.Equal(t, sqlutil.NewI(12345), r.MaxGasPriceWei)
 
 	b, err := jsonapi.Marshal(r)
 	require.NoError(t, err)
@@ -55,7 +57,7 @@ func TestETHKeyResource(t *testing.T) {
 	{
 		"data":{
 		   "type":"eTHKeys",
-		   "id":"%s",
+		   "id":"42/%s",
 		   "attributes":{
 			  "address":"%s",
 			  "evmChainID":"42",
@@ -84,7 +86,7 @@ func TestETHKeyResource(t *testing.T) {
 	{
 		"data": {
 			"type":"eTHKeys",
-			"id":"%s",
+			"id":"42/%s",
 			"attributes":{
 				"address":"%s",
 			  	"evmChainID":"42",

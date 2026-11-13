@@ -2,11 +2,12 @@ package common
 
 import (
 	"context"
-	"crypto/ecdsa"
+	"crypto/tls"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"math/big"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -22,9 +23,10 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/shopspring/decimal"
+	"github.com/umbracle/fastrlp"
 
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/link_token_interface"
-	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/mock_v3_aggregator_contract"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/generated/link_token_interface"
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/generated/mock_v3_aggregator_contract"
 )
 
 type Environment struct {
@@ -43,9 +45,9 @@ func DeployLinkToken(e Environment) common.Address {
 }
 
 func DeployLinkEthFeed(e Environment, linkAddress string, weiPerUnitLink *big.Int) common.Address {
-	_, tx, _, err :=
-		mock_v3_aggregator_contract.DeployMockV3AggregatorContract(
-			e.Owner, e.Ec, 18, weiPerUnitLink)
+	_, tx, _, err := mock_v3_aggregator_contract.DeployMockV3AggregatorContract(
+		e.Owner, e.Ec, 18, weiPerUnitLink,
+	)
 	PanicErr(err)
 	return ConfirmContractDeployed(context.Background(), e.Ec, tx, e.ChainID)
 }
@@ -69,30 +71,25 @@ func SetupEnv(overrideNonce bool) Environment {
 		panic("need account key")
 	}
 
-	ec, err := ethclient.Dial(ethURL)
+	insecureSkipVerify := os.Getenv("INSECURE_SKIP_VERIFY") == "true"
+	tr := &http.Transport{
+		// User enables this at their own risk!
+		// #nosec G402
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureSkipVerify},
+	}
+	httpClient := &http.Client{Transport: tr}
+	rpcConfig := rpc.WithHTTPClient(httpClient)
+	jsonRPCClient, err := rpc.DialOptions(context.Background(), ethURL, rpcConfig)
 	PanicErr(err)
-
-	jsonRPCClient, err := rpc.Dial(ethURL)
-	PanicErr(err)
+	ec := ethclient.NewClient(jsonRPCClient)
 
 	chainID, err := strconv.ParseInt(chainIDEnv, 10, 64)
 	PanicErr(err)
 
 	// Owner key. Make sure it has eth
-	b, err := hex.DecodeString(accountKey)
+	privateKey, err := crypto.HexToECDSA(accountKey)
 	PanicErr(err)
-	d := new(big.Int).SetBytes(b)
-
-	pkX, pkY := crypto.S256().ScalarBaseMult(d.Bytes())
-	privateKey := ecdsa.PrivateKey{
-		PublicKey: ecdsa.PublicKey{
-			Curve: crypto.S256(),
-			X:     pkX,
-			Y:     pkY,
-		},
-		D: d,
-	}
-	owner, err := bind.NewKeyedTransactorWithChainID(&privateKey, big.NewInt(chainID))
+	owner, err := bind.NewKeyedTransactorWithChainID(privateKey, big.NewInt(chainID))
 	PanicErr(err)
 	// Explicitly set gas price to ensure non-eip 1559
 	gp, err := ec.SuggestGasPrice(context.Background())
@@ -103,7 +100,7 @@ func SetupEnv(overrideNonce bool) Environment {
 	if set {
 		parsedGasLimit, err := strconv.ParseUint(gasLimit, 10, 64)
 		if err != nil {
-			panic(fmt.Sprintf("Failure while parsing GAS_LIMIT: %s", gasLimit))
+			panic("Failure while parsing GAS_LIMIT: " + gasLimit)
 		}
 		owner.GasLimit = parsedGasLimit
 	}
@@ -112,10 +109,10 @@ func SetupEnv(overrideNonce bool) Environment {
 		block, err := ec.BlockNumber(context.Background())
 		PanicErr(err)
 
-		nonce, err := ec.NonceAt(context.Background(), owner.From, big.NewInt(int64(block)))
+		nonce, err := ec.NonceAt(context.Background(), owner.From, new(big.Int).SetUint64(block))
 		PanicErr(err)
 
-		owner.Nonce = big.NewInt(int64(nonce))
+		owner.Nonce = new(big.Int).SetUint64(nonce)
 	}
 	owner.GasPrice = gp.Mul(gp, big.NewInt(2))
 	fmt.Println("Modified Gas Price that will be set:", owner.GasPrice, "wei")
@@ -213,55 +210,14 @@ func explorerLinkPrefix(chainID int64) (prefix string) {
 	case 324: // zkSync mainnet
 		prefix = "https://explorer.zksync.io"
 
+	case RoninChainID:
+		prefix = "https://app.roninchain.com"
+	case RoninSaigonChainID:
+		prefix = "https://saigon-app.roninchain.com"
 	default: // Unknown chain, return prefix as-is
 		prefix = ""
 	}
-	return
-}
-
-func automationExplorerNetworkName(chainID int64) (prefix string) {
-	switch chainID {
-	case 1: // ETH mainnet
-		prefix = "mainnet"
-	case 5: // Goerli
-		prefix = "goerli"
-	case 11155111: // Sepolia
-		prefix = "sepolia"
-
-	case 420: // Optimism Goerli
-		prefix = "optimism-goerli"
-
-	case ArbitrumGoerliChainID: // Arbitrum Goerli
-		prefix = "arbitrum-goerli"
-	case ArbitrumOneChainID: // Arbitrum mainnet
-		prefix = "arbitrum"
-	case ArbitrumSepoliaChainID: // Arbitrum Sepolia
-		prefix = "arbitrum-sepolia"
-
-	case 56: // BSC mainnet
-		prefix = "bsc"
-	case 97: // BSC testnet
-		prefix = "bnb-chain-testnet"
-
-	case 137: // Polygon mainnet
-		prefix = "polygon"
-	case 80001: // Polygon Mumbai testnet
-		prefix = "mumbai"
-
-	case 250: // Fantom mainnet
-		prefix = "fantom"
-	case 4002: // Fantom testnet
-		prefix = "fantom-testnet"
-
-	case 43114: // Avalanche mainnet
-		prefix = "avalanche"
-	case 43113: // Avalanche testnet
-		prefix = "fuji"
-
-	default: // Unknown chain, return prefix as-is
-		prefix = "<NOT IMPLEMENTED>"
-	}
-	return
+	return prefix
 }
 
 // ExplorerLink creates a block explorer link for the given transaction hash. If the chain ID is
@@ -285,18 +241,23 @@ func ContractExplorerLink(chainID int64, contractAddress common.Address) string 
 }
 
 func TenderlySimLink(simID string) string {
-	return fmt.Sprintf("https://dashboard.tenderly.co/simulator/%s", simID)
+	return "https://dashboard.tenderly.co/simulator/" + simID
 }
 
 // ConfirmTXMined confirms that the given transaction is mined and prints useful execution information.
 func ConfirmTXMined(context context.Context, client *ethclient.Client, transaction *types.Transaction, chainID int64, txInfo ...string) (receipt *types.Receipt) {
+	if transaction == nil {
+		fmt.Println("No transaction to confirm")
+		return receipt
+	}
+
 	fmt.Println("Executing TX", ExplorerLink(chainID, transaction.Hash()), txInfo)
 	receipt, err := bind.WaitMined(context, client, transaction)
 	PanicErr(err)
 	fmt.Println("TX", receipt.TxHash, "mined. \nBlock Number:", receipt.BlockNumber,
 		"\nGas Used: ", receipt.GasUsed,
 		"\nBlock hash: ", receipt.BlockHash.String())
-	return
+	return receipt
 }
 
 // ConfirmContractDeployed confirms that the given contract deployment transaction completed and prints useful execution information.
@@ -333,7 +294,7 @@ func ConfirmCodeAt(ctx context.Context, client *ethclient.Client, addr common.Ad
 // of *big.Int objects.
 func ParseBigIntSlice(arg string) (ret []*big.Int) {
 	parts := strings.Split(arg, ",")
-	ret = []*big.Int{}
+	ret = make([]*big.Int, 0, len(parts))
 	for _, part := range parts {
 		ret = append(ret, decimal.RequireFromString(part).BigInt())
 	}
@@ -343,8 +304,8 @@ func ParseBigIntSlice(arg string) (ret []*big.Int) {
 // ParseIntSlice parses the given comma-separated string of integers into a slice
 // of int.
 func ParseIntSlice(arg string) (ret []int) {
-	parts := strings.Split(arg, ",")
-	for _, part := range parts {
+	parts := strings.SplitSeq(arg, ",")
+	for part := range parts {
 		num, err := strconv.Atoi(part)
 		PanicErr(err)
 		ret = append(ret, num)
@@ -356,30 +317,30 @@ func ParseIntSlice(arg string) (ret []int) {
 // of common.Address objects.
 func ParseAddressSlice(arg string) (ret []common.Address) {
 	parts := strings.Split(arg, ",")
-	ret = []common.Address{}
+	ret = make([]common.Address, 0, len(parts))
 	for _, part := range parts {
 		ret = append(ret, common.HexToAddress(part))
 	}
-	return
+	return ret
 }
 
 // ParseHashSlice parses the given comma-separated string of hashes into a slice of
 // common.Hash objects.
 func ParseHashSlice(arg string) (ret []common.Hash) {
 	parts := strings.Split(arg, ",")
-	ret = []common.Hash{}
+	ret = make([]common.Hash, 0, len(parts))
 	for _, part := range parts {
 		ret = append(ret, common.HexToHash(part))
 	}
-	return
+	return ret
 }
 
 func ParseHexSlice(arg string) (ret [][]byte) {
-	parts := strings.Split(arg, ",")
-	for _, part := range parts {
+	parts := strings.SplitSeq(arg, ",")
+	for part := range parts {
 		ret = append(ret, hexutil.MustDecode(part))
 	}
-	return
+	return ret
 }
 
 func FundNodes(e Environment, transmitters []string, fundingAmount *big.Int) {
@@ -392,7 +353,7 @@ func FundNode(e Environment, address string, fundingAmount *big.Int) {
 	block, err := e.Ec.BlockNumber(context.Background())
 	PanicErr(err)
 
-	nonce, err := e.Ec.NonceAt(context.Background(), e.Owner.From, big.NewInt(int64(block)))
+	nonce, err := e.Ec.NonceAt(context.Background(), e.Owner.From, new(big.Int).SetUint64(block))
 	PanicErr(err)
 	// Special case for Arbitrum since gas estimation there is different.
 
@@ -419,7 +380,8 @@ func FundNode(e Environment, address string, fundingAmount *big.Int) {
 			To:       &toAddress,
 			Value:    fundingAmount,
 			Data:     nil,
-		})
+		},
+	)
 
 	signedTx, err := e.Owner.Signer(e.Owner.From, tx)
 	PanicErr(err)
@@ -462,75 +424,118 @@ func BinarySearch(top, bottom *big.Int, test func(amount *big.Int) bool) *big.In
 // Makes RPC network call eth_getBlockByNumber to blockchain RPC node
 // to fetch header info
 func GetRlpHeaders(env Environment, blockNumbers []*big.Int, getParentBlocks bool) (headers [][]byte, hashes []string, err error) {
-
-	hashes = make([]string, 0)
+	headers = make([][]byte, len(blockNumbers))
+	hashes = make([]string, len(blockNumbers))
 
 	offset := big.NewInt(0)
 	if getParentBlocks {
 		offset = big.NewInt(1)
 	}
 
-	headers = [][]byte{}
-	var rlpHeader []byte
-	for _, blockNum := range blockNumbers {
-		// Avalanche block headers are special, handle them by using the avalanche rpc client
-		// rather than the regular go-ethereum ethclient.
-		if IsAvaxNetwork(env.ChainID) {
-			var h AvaHeader
+	batchElems := make([]rpc.BatchElem, len(blockNumbers))
+	switch {
+	case IsAvaxNetwork(env.ChainID):
+		return getRlpHeaders[*AvaHeader](env, blockNumbers, offset)
+	case IsAvaxSubnet(env.ChainID) &&
+		// For some reason, Nexon chain does not work with AvaSubnetHeader
+		!IsNexonChain(env.ChainID):
+		return getRlpHeaders[*AvaSubnetHeader](env, blockNumbers, offset)
+	case IsPolygonEdgeNetwork(env.ChainID):
+		hs := make([]*PolygonEdgeHeader, len(blockNumbers))
+		for i, blockNum := range blockNumbers {
 			// Get child block since it's the one that has the parent hash in its header.
 			nextBlockNum := new(big.Int).Set(blockNum).Add(blockNum, offset)
-			err2 := env.Jc.CallContext(context.Background(), &h, "eth_getBlockByNumber", hexutil.EncodeBig(nextBlockNum), false)
-			if err2 != nil {
-				return nil, hashes, fmt.Errorf("failed to get header: %+v", err2)
+			batchElems[i] = rpc.BatchElem{
+				Method: "eth_getBlockByNumber",
+				Args:   []any{"0x" + nextBlockNum.Text(16), false},
+				Result: &hs[i],
 			}
-			// We can still use vanilla go-ethereum rlp.EncodeToBytes, see e.g
-			// https://github.com/ava-labs/coreth/blob/e3ca41bf5295a9a7ca1aeaf29d541fcbb94f79b1/core/types/hashing.go#L49-L57.
-			rlpHeader, err2 = rlp.EncodeToBytes(h)
-			if err2 != nil {
-				return nil, hashes, fmt.Errorf("failed to encode rlp: %+v", err2)
-			}
-
-			hashes = append(hashes, h.Hash().String())
-
-			// Sanity check - can be un-commented if storeVerifyHeader is failing due to unexpected
-			// blockhash.
-			//bh := crypto.Keccak256Hash(rlpHeader)
-			//fmt.Println("Calculated BH:", bh.String(),
-			//	"fetched BH:", h.Hash(),
-			//	"block number:", new(big.Int).Set(blockNum).Add(blockNum, offset).String())
-
-		} else if IsPolygonEdgeNetwork(env.ChainID) {
-
-			// Get child block since it's the one that has the parent hash in its header.
-			nextBlockNum := new(big.Int).Set(blockNum).Add(blockNum, offset)
-			var hash string
-			rlpHeader, hash, err = GetPolygonEdgeRLPHeader(env.Jc, nextBlockNum)
-			if err != nil {
-				return nil, hashes, fmt.Errorf("failed to encode rlp: %+v", err)
-			}
-
-			hashes = append(hashes, hash)
-
-		} else {
-			// Get child block since it's the one that has the parent hash in its header.
-			h, err2 := env.Ec.HeaderByNumber(
-				context.Background(),
-				new(big.Int).Set(blockNum).Add(blockNum, offset),
-			)
-			if err2 != nil {
-				return nil, hashes, fmt.Errorf("failed to get header: %+v", err2)
-			}
-			rlpHeader, err2 = rlp.EncodeToBytes(h)
-			if err2 != nil {
-				return nil, hashes, fmt.Errorf("failed to encode rlp: %+v", err2)
-			}
-
-			hashes = append(hashes, h.Hash().String())
 		}
+		err := batchCallContext(context.Background(), env.Jc, batchElems)
+		if err != nil {
+			return nil, hashes, fmt.Errorf("failed to get header: %w", err)
+		}
+		for i, h := range hs {
+			ar := &fastrlp.Arena{}
+			val, err := MarshalRLPWith(ar, h)
+			if err != nil {
+				return nil, hashes, fmt.Errorf("failed to encode rlp: %w", err)
+			}
 
-		headers = append(headers, rlpHeader)
+			rlpHeader := make([]byte, 0)
+			rlpHeader = val.MarshalTo(rlpHeader)
+
+			hashes[i] = h.Hash.String()
+			headers[i] = rlpHeader
+		}
+		return headers, hashes, nil
+	case IsRoninChain(env.ChainID):
+		return getRlpHeaders[*RoninHeader](env, blockNumbers, offset)
+	default:
+		return getRlpHeaders[*types.Header](env, blockNumbers, offset)
 	}
-	return
+}
+
+type Hashable interface {
+	Hash() common.Hash
+}
+
+func getRlpHeaders[HEADER Hashable](env Environment, blockNumbers []*big.Int, offset *big.Int) (headers [][]byte, hashes []string, err error) {
+	headers = make([][]byte, len(blockNumbers))
+	hashes = make([]string, len(blockNumbers))
+
+	batchElems := make([]rpc.BatchElem, len(blockNumbers))
+	hs := make([]HEADER, len(blockNumbers))
+	for i, blockNum := range blockNumbers {
+		// Get child block since it's the one that has the parent hash in its header.
+		nextBlockNum := new(big.Int).Set(blockNum).Add(blockNum, offset)
+		batchElems[i] = rpc.BatchElem{
+			Method: "eth_getBlockByNumber",
+			Args:   []any{hexutil.EncodeBig(nextBlockNum), false},
+			Result: &hs[i],
+		}
+	}
+	err = batchCallContext(context.Background(), env.Jc, batchElems)
+	if err != nil {
+		return nil, hashes, fmt.Errorf("failed to get header: %w", err)
+	}
+	for i, h := range hs {
+		rlpHeader, err := rlp.EncodeToBytes(h)
+		if err != nil {
+			return nil, hashes, fmt.Errorf("failed to encode rlp: %w", err)
+		}
+		hashes[i] = h.Hash().String()
+		headers[i] = rlpHeader
+	}
+	return headers, hashes, err
+}
+
+// batchCallContext is a wrapper around rpc.Client.BatchCallContext that deals with RPC node batch size limitations.
+func batchCallContext(ctx context.Context, client *rpc.Client, batchElems []rpc.BatchElem) error {
+	err := client.BatchCallContext(ctx, batchElems)
+	if err != nil {
+		// Try again with a batch size of 1
+		err = client.BatchCallContext(ctx, batchElems[0:1])
+		if err != nil {
+			// The error is unlikely to be due to a batch size issue, so return it.
+			return err
+		}
+		// If we got here, the batch size of 1 worked, so we can try to find the maximum batch size that works.
+		loBatchSize := 1
+		hiBatchSize := len(batchElems)
+		for start := 1; start < len(batchElems); {
+			batchSize := (hiBatchSize + loBatchSize) / 2
+			end := min(start+batchSize, len(batchElems))
+			err = client.BatchCallContext(ctx, batchElems[start:end])
+			if err != nil {
+				hiBatchSize = batchSize
+			} else {
+				loBatchSize = batchSize
+				start += batchSize
+			}
+		}
+	}
+	return err
 }
 
 // IsPolygonEdgeNetwork returns true if the given chain ID corresponds to an Pologyon Edge network.
@@ -540,19 +545,21 @@ func IsPolygonEdgeNetwork(chainID int64) bool {
 }
 
 func CalculateLatestBlockHeader(env Environment, blockNumberInput int) (err error) {
-	blockNumber := uint64(blockNumberInput)
+	var blockNumber uint64
 	if blockNumberInput == -1 {
 		blockNumber, err = env.Ec.BlockNumber(context.Background())
 		if err != nil {
-			return fmt.Errorf("failed to fetch latest block: %+v", err)
+			return fmt.Errorf("failed to fetch latest block: %w", err)
 		}
+	} else {
+		blockNumber = uint64(blockNumberInput) //nolint:gosec // block number fits in uint64
 	}
 
 	// GetRLPHeaders method increments the blockNum sent by 1 and then fetches
 	// block headers for the child block.
-	blockNumber = blockNumber - 1
+	blockNumber--
 
-	blockNumberBigInts := []*big.Int{big.NewInt(int64(blockNumber))}
+	blockNumberBigInts := []*big.Int{new(big.Int).SetUint64(blockNumber)}
 	headers, hashes, err := GetRlpHeaders(env, blockNumberBigInts, true)
 	if err != nil {
 		fmt.Println(err)
@@ -570,14 +577,8 @@ func CalculateLatestBlockHeader(env Environment, blockNumberInput int) (err erro
 	return err
 }
 
-// IsAvaxNetwork returns true if the given chain ID corresponds to an avalanche network or subnet.
+// IsAvaxNetwork returns true if the given chain ID corresponds to an avalanche network.
 func IsAvaxNetwork(chainID int64) bool {
 	return chainID == 43114 || // C-chain mainnet
-		chainID == 43113 || // Fuji testnet
-		chainID == 335 || // DFK testnet
-		chainID == 53935 // DFK mainnet
-}
-
-func UpkeepLink(chainID int64, upkeepID *big.Int) string {
-	return fmt.Sprintf("https://automation.chain.link/%s/%s", automationExplorerNetworkName(chainID), upkeepID.String())
+		chainID == 43113 // Fuji testnet
 }

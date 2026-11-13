@@ -5,14 +5,13 @@ import (
 	"time"
 
 	"github.com/onsi/gomega"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/logger/audit"
 	"github.com/smartcontractkit/chainlink/v2/core/sessions"
 	"github.com/smartcontractkit/chainlink/v2/core/sessions/localauth"
@@ -33,10 +32,10 @@ func TestSessionReaper_ReapSessions(t *testing.T) {
 
 	db := pgtest.NewSqlxDB(t)
 	config := sessionReaperConfig{}
-	lggr := logger.TestLogger(t)
-	orm := localauth.NewORM(db, config.SessionTimeout().Duration(), lggr, pgtest.NewQConfig(true), audit.NoopLogger)
+	lggr := logger.TestSugared(t)
+	orm := localauth.NewORM(db, config.SessionTimeout().Duration(), lggr, audit.NoopLogger)
 
-	r := localauth.NewSessionReaper(db.DB, config, lggr)
+	r := localauth.NewSessionReaper(db, config, lggr)
 	t.Cleanup(func() {
 		assert.NoError(t, r.Stop())
 	})
@@ -55,6 +54,7 @@ func TestSessionReaper_ReapSessions(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			ctx := t.Context()
 			t.Cleanup(func() {
 				_, err2 := db.Exec("DELETE FROM sessions where email = $1", cltest.APIEmailAdmin)
 				require.NoError(t, err2)
@@ -67,13 +67,13 @@ func TestSessionReaper_ReapSessions(t *testing.T) {
 
 			if test.wantReap {
 				gomega.NewWithT(t).Eventually(func() []sessions.Session {
-					sessions, err := orm.Sessions(0, 10)
+					sessions, err := orm.Sessions(ctx, 0, 10)
 					assert.NoError(t, err)
 					return sessions
-				}).Should(gomega.HaveLen(0))
+				}).Should(gomega.BeEmpty())
 			} else {
 				gomega.NewWithT(t).Consistently(func() []sessions.Session {
-					sessions, err := orm.Sessions(0, 10)
+					sessions, err := orm.Sessions(ctx, 0, 10)
 					assert.NoError(t, err)
 					return sessions
 				}).Should(gomega.HaveLen(1))

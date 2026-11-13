@@ -6,6 +6,7 @@ import (
 
 	"github.com/manyminds/api2go/jsonapi"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestApi_ParsePaginatedRequest(t *testing.T) {
@@ -31,11 +32,12 @@ func TestApi_ParsePaginatedRequest(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			size, page, offset, err := ParsePaginatedRequest(test.sizeParam, test.pageParam)
 			if test.err {
-				assert.Error(t, err)
+				require.Error(t, err)
 			} else {
-				assert.NoError(t, err)
+				require.NoError(t, err)
 			}
 			assert.Equal(t, test.size, size)
 			assert.Equal(t, test.page, page)
@@ -65,38 +67,44 @@ func TestApi_NewPaginatedResponse(t *testing.T) {
 		size     int
 		page     int
 		count    int
-		resource interface{}
+		resource any
 		err      bool
 		output   string
 	}{
 		{
 			"a single resource",
-			"/v2/index", 1, 0, 0, TestResource{Title: "Item"},
+			"/v2/index", 1, 0, 0,
+			TestResource{Title: "Item"},
 			false, `{"data":{"type":"testResources","id":"1","attributes":{"Title":"Item"}},"meta":{"count":0}}`,
 		},
 		{
 			"a resource collection",
-			"/v2/index", 1, 0, 0, []TestResource{{Title: "Item 1"}, {Title: "Item 2"}},
+			"/v2/index", 1, 0, 0,
+			[]TestResource{{Title: "Item 1"}, {Title: "Item 2"}},
 			false, `{"data":[{"type":"testResources","id":"1","attributes":{"Title":"Item 1"}},{"type":"testResources","id":"1","attributes":{"Title":"Item 2"}}],"meta":{"count":0}}`,
 		},
 		{
 			"first page of collection results",
-			"/v2/index", 5, 1, 7, []TestResource{{Title: "Item 1"}},
+			"/v2/index", 5, 1, 7,
+			[]TestResource{{Title: "Item 1"}},
 			false, `{"links":{"next":"/v2/index?page=2\u0026size=5"},"data":[{"type":"testResources","id":"1","attributes":{"Title":"Item 1"}}],"meta":{"count":7}}`,
 		},
 		{
 			"middle page of collection results",
-			"/v2/index", 5, 2, 13, []TestResource{{Title: "Item 2"}},
+			"/v2/index", 5, 2, 13,
+			[]TestResource{{Title: "Item 2"}},
 			false, `{"links":{"next":"/v2/index?page=3\u0026size=5","prev":"/v2/index?page=1\u0026size=5"},"data":[{"type":"testResources","id":"1","attributes":{"Title":"Item 2"}}],"meta":{"count":13}}`,
 		},
 		{
 			"end page of collection results",
-			"/v2/index", 5, 3, 13, []TestResource{{Title: "Item 3"}},
+			"/v2/index", 5, 3, 13,
+			[]TestResource{{Title: "Item 3"}},
 			false, `{"links":{"prev":"/v2/index?page=2\u0026size=5"},"data":[{"type":"testResources","id":"1","attributes":{"Title":"Item 3"}}],"meta":{"count":13}}`,
 		},
 		{
 			"path with existing query",
-			"/v2/index?authToken=3123", 1, 0, 2, []TestResource{{Title: "Item 1"}},
+			"/v2/index?authToken=3123", 1, 0, 2,
+			[]TestResource{{Title: "Item 1"}},
 			false, `{"links":{"next":"/v2/index?authToken=3123\u0026page=1\u0026size=1"},"data":[{"type":"testResources","id":"1","attributes":{"Title":"Item 1"}}],"meta":{"count":2}}`,
 		},
 		{
@@ -108,13 +116,14 @@ func TestApi_NewPaginatedResponse(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			url, err := url.Parse(test.path)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			buffer, err := NewPaginatedResponse(*url, test.size, test.page, test.count, test.resource)
 			if test.err {
-				assert.Error(t, err)
+				require.Error(t, err)
 			} else {
-				assert.NoError(t, err)
+				require.NoError(t, err)
 			}
 			assert.Equal(t, test.output, string(buffer))
 		})
@@ -128,16 +137,16 @@ func TestPagination_ParsePaginatedResponse(t *testing.T) {
 	var links jsonapi.Links
 
 	err := ParsePaginatedResponse([]byte(`{"data":[{"type":"testResources","id":"1","attributes":{"Title":"album 1"}}]}`), &docs, &links)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, "album 1", docs[0].Title)
 
 	// Typo in "type"
 	err = ParsePaginatedResponse([]byte(`{"data":[{"type":"testNotResources","id":"1","attributes":{}}]}`), &docs, &links)
-	assert.Error(t, err)
+	require.Error(t, err)
 
 	// Typo in "links"
 	err = ParsePaginatedResponse([]byte(`{"links":[],"data":[{"type":"testResources","id":"1","attributes":{}}]}`), &docs, &links)
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 type DummyResource struct {
@@ -153,11 +162,11 @@ func TestNewJSONAPIResponse(t *testing.T) {
 	t.Parallel()
 
 	buffer, err := NewJSONAPIResponse(12981)
-	assert.Error(t, err)
-	assert.Len(t, buffer, 0)
+	require.Error(t, err)
+	assert.Empty(t, buffer)
 
 	r := DummyResource{ID: "782"}
 	buffer, err = NewJSONAPIResponse(&r)
-	assert.NoError(t, err)
-	assert.Equal(t, `{"data":{"type":"dummyResources","id":"782","attributes":{"ID":"782"}}}`, string(buffer))
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"data":{"type":"dummyResources","id":"782","attributes":{"ID":"782"}}}`, string(buffer))
 }

@@ -10,11 +10,11 @@ import (
 	"github.com/gin-contrib/sessions"
 
 	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
-	"github.com/smartcontractkit/chainlink/v2/core/config"
+	coreconfig "github.com/smartcontractkit/chainlink/v2/core/config"
 	"github.com/smartcontractkit/chainlink/v2/core/config/toml"
 )
 
-var _ config.WebServer = (*webServerConfig)(nil)
+var _ coreconfig.WebServer = (*webServerConfig)(nil)
 
 type tlsConfig struct {
 	c       toml.WebServerTLS
@@ -102,20 +102,24 @@ type webServerConfig struct {
 	rootDir func() string
 }
 
-func (w *webServerConfig) TLS() config.TLS {
+func (w *webServerConfig) TLS() coreconfig.TLS {
 	return &tlsConfig{c: w.c.TLS, rootDir: w.rootDir}
 }
 
-func (w *webServerConfig) RateLimit() config.RateLimit {
+func (w *webServerConfig) RateLimit() coreconfig.RateLimit {
 	return &rateLimitConfig{c: w.c.RateLimit}
 }
 
-func (w *webServerConfig) MFA() config.MFA {
+func (w *webServerConfig) MFA() coreconfig.MFA {
 	return &mfaConfig{c: w.c.MFA}
 }
 
-func (w *webServerConfig) LDAP() config.LDAP {
+func (w *webServerConfig) LDAP() coreconfig.LDAP {
 	return &ldapConfig{c: w.c.LDAP, s: w.s.LDAP}
+}
+
+func (w *webServerConfig) OIDC() coreconfig.OIDC {
+	return &oidcConfig{c: w.c.OIDC, s: w.s.OIDC}
 }
 
 func (w *webServerConfig) AuthenticationMethod() string {
@@ -138,7 +142,7 @@ func (w *webServerConfig) BridgeCacheTTL() time.Duration {
 }
 
 func (w *webServerConfig) HTTPMaxSize() int64 {
-	return int64(*w.c.HTTPMaxSize)
+	return int64(*w.c.HTTPMaxSize) //nolint:gosec // G115: HTTP request size limit is far below math.MaxInt64
 }
 
 func (w *webServerConfig) StartTimeout() time.Duration {
@@ -293,7 +297,7 @@ func (l *ldapConfig) ReadUserGroupCN() string {
 	return *l.c.ReadUserGroupCN
 }
 
-func (l *ldapConfig) UserApiTokenEnabled() bool {
+func (l *ldapConfig) UserApiTokenEnabled() bool { //nolint:revive // method name required by core/config.LDAP interface
 	if l.c.UserApiTokenEnabled == nil {
 		return false
 	}
@@ -312,4 +316,93 @@ func (l *ldapConfig) UpstreamSyncRateLimit() commonconfig.Duration {
 		return commonconfig.Duration{}
 	}
 	return *l.c.UpstreamSyncRateLimit
+}
+
+type oidcConfig struct {
+	c toml.WebServerOIDC
+	s toml.WebServerOIDCSecrets
+}
+
+func (l *oidcConfig) ClientID() string {
+	if l.c.ClientID == nil {
+		return ""
+	}
+	return *l.c.ClientID
+}
+
+func (l *oidcConfig) ClientSecret() string {
+	if l.s.ClientSecret == nil {
+		return ""
+	}
+	return string(*l.s.ClientSecret)
+}
+
+func (l *oidcConfig) ProviderURL() string {
+	if l.c.ProviderURL == nil {
+		return ""
+	}
+	return *l.c.ProviderURL
+}
+
+func (l *oidcConfig) RedirectURL() string {
+	if l.c.RedirectURL == nil {
+		return ""
+	}
+	return *l.c.RedirectURL
+}
+
+func (l *oidcConfig) ClaimName() string {
+	if l.c.ClaimName == nil {
+		return ""
+	}
+	return *l.c.ClaimName
+}
+
+func (l *oidcConfig) AdminClaim() string {
+	if l.c.AdminClaim == nil {
+		return ""
+	}
+	return *l.c.AdminClaim
+}
+
+func (l *oidcConfig) EditClaim() string {
+	if l.c.EditClaim == nil {
+		return ""
+	}
+	return *l.c.EditClaim
+}
+
+func (l *oidcConfig) RunClaim() string {
+	if l.c.RunClaim == nil {
+		return ""
+	}
+	return *l.c.RunClaim
+}
+
+func (l *oidcConfig) ReadClaim() string {
+	if l.c.ReadClaim == nil {
+		return ""
+	}
+	return *l.c.ReadClaim
+}
+
+func (l *oidcConfig) SessionTimeout() commonconfig.Duration {
+	if l.c.SessionTimeout == nil {
+		return commonconfig.Duration{}
+	}
+	return *l.c.SessionTimeout
+}
+
+func (l *oidcConfig) UserAPITokenEnabled() bool {
+	if l.c.UserAPITokenEnabled == nil {
+		return false
+	}
+	return *l.c.UserAPITokenEnabled
+}
+
+func (l *oidcConfig) UserAPITokenDuration() commonconfig.Duration {
+	if l.c.UserAPITokenDuration == nil {
+		return commonconfig.Duration{}
+	}
+	return *l.c.UserAPITokenDuration
 }

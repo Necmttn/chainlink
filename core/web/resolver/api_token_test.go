@@ -1,12 +1,15 @@
 package resolver
 
 import (
+	"context"
 	"testing"
 
 	gqlerrors "github.com/graph-gophers/graphql-go/errors"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
 	"github.com/smartcontractkit/chainlink/v2/core/auth"
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
 	webauth "github.com/smartcontractkit/chainlink/v2/core/web/auth"
@@ -34,13 +37,13 @@ func TestResolver_CreateAPIToken(t *testing.T) {
 				}
 			}
 		}`
-	variables := map[string]interface{}{
-		"input": map[string]interface{}{
+	variables := map[string]any{
+		"input": map[string]any{
 			"password": defaultPassword,
 		},
 	}
-	variablesIncorrect := map[string]interface{}{
-		"input": map[string]interface{}{
+	variablesIncorrect := map[string]any{
+		"input": map[string]any{
 			"password": "wrong-password",
 		},
 	}
@@ -51,19 +54,19 @@ func TestResolver_CreateAPIToken(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				session, ok := webauth.GetGQLAuthenticatedSession(f.Ctx)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				session, ok := webauth.GetGQLAuthenticatedSession(ctx)
 				require.True(t, ok)
 				require.NotNil(t, session)
 
 				pwd, err := utils.HashPassword(defaultPassword)
 				require.NoError(t, err)
 
-				session.User.HashedPassword = pwd
+				session.User.HashedPassword = *commonconfig.NewSecretString(pwd)
 
-				f.Mocks.authProvider.On("FindUser", session.User.Email).Return(*session.User, nil)
-				f.Mocks.authProvider.On("TestPassword", session.User.Email, defaultPassword).Return(nil)
-				f.Mocks.authProvider.On("CreateAndSetAuthToken", session.User).Return(&auth.Token{
+				f.Mocks.authProvider.On("FindUser", mock.Anything, session.User.Email).Return(*session.User, nil)
+				f.Mocks.authProvider.On("TestPassword", mock.Anything, session.User.Email, defaultPassword).Return(nil)
+				f.Mocks.authProvider.On("CreateAndSetAuthToken", mock.Anything, session.User).Return(&auth.Token{
 					Secret:    "new-secret",
 					AccessKey: "new-access-key",
 				}, nil)
@@ -84,13 +87,13 @@ func TestResolver_CreateAPIToken(t *testing.T) {
 		{
 			name:          "input errors",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				session, ok := webauth.GetGQLAuthenticatedSession(f.Ctx)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				session, ok := webauth.GetGQLAuthenticatedSession(ctx)
 				require.True(t, ok)
 				require.NotNil(t, session)
 
-				f.Mocks.authProvider.On("FindUser", session.User.Email).Return(*session.User, nil)
-				f.Mocks.authProvider.On("TestPassword", session.User.Email, "wrong-password").Return(gError)
+				f.Mocks.authProvider.On("FindUser", mock.Anything, session.User.Email).Return(*session.User, nil)
+				f.Mocks.authProvider.On("TestPassword", mock.Anything, session.User.Email, "wrong-password").Return(gError)
 				f.App.On("AuthenticationProvider").Return(f.Mocks.authProvider)
 			},
 			query:     mutation,
@@ -109,17 +112,17 @@ func TestResolver_CreateAPIToken(t *testing.T) {
 		{
 			name:          "failed to find user",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				session, ok := webauth.GetGQLAuthenticatedSession(f.Ctx)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				session, ok := webauth.GetGQLAuthenticatedSession(ctx)
 				require.True(t, ok)
 				require.NotNil(t, session)
 
 				pwd, err := utils.HashPassword(defaultPassword)
 				require.NoError(t, err)
 
-				session.User.HashedPassword = pwd
+				session.User.HashedPassword = *commonconfig.NewSecretString(pwd)
 
-				f.Mocks.authProvider.On("FindUser", session.User.Email).Return(*session.User, gError)
+				f.Mocks.authProvider.On("FindUser", mock.Anything, session.User.Email).Return(*session.User, gError)
 				f.App.On("AuthenticationProvider").Return(f.Mocks.authProvider)
 			},
 			query:     mutation,
@@ -129,7 +132,7 @@ func TestResolver_CreateAPIToken(t *testing.T) {
 				{
 					Extensions:    nil,
 					ResolverError: gError,
-					Path:          []interface{}{"createAPIToken"},
+					Path:          []any{"createAPIToken"},
 					Message:       "error",
 				},
 			},
@@ -137,19 +140,19 @@ func TestResolver_CreateAPIToken(t *testing.T) {
 		{
 			name:          "failed to generate token",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				session, ok := webauth.GetGQLAuthenticatedSession(f.Ctx)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				session, ok := webauth.GetGQLAuthenticatedSession(ctx)
 				require.True(t, ok)
 				require.NotNil(t, session)
 
 				pwd, err := utils.HashPassword(defaultPassword)
 				require.NoError(t, err)
 
-				session.User.HashedPassword = pwd
+				session.User.HashedPassword = *commonconfig.NewSecretString(pwd)
 
-				f.Mocks.authProvider.On("FindUser", session.User.Email).Return(*session.User, nil)
-				f.Mocks.authProvider.On("TestPassword", session.User.Email, defaultPassword).Return(nil)
-				f.Mocks.authProvider.On("CreateAndSetAuthToken", session.User).Return(nil, gError)
+				f.Mocks.authProvider.On("FindUser", mock.Anything, session.User.Email).Return(*session.User, nil)
+				f.Mocks.authProvider.On("TestPassword", mock.Anything, session.User.Email, defaultPassword).Return(nil)
+				f.Mocks.authProvider.On("CreateAndSetAuthToken", mock.Anything, session.User).Return(nil, gError)
 				f.App.On("AuthenticationProvider").Return(f.Mocks.authProvider)
 			},
 			query:     mutation,
@@ -159,7 +162,7 @@ func TestResolver_CreateAPIToken(t *testing.T) {
 				{
 					Extensions:    nil,
 					ResolverError: gError,
-					Path:          []interface{}{"createAPIToken"},
+					Path:          []any{"createAPIToken"},
 					Message:       "error",
 				},
 			},
@@ -190,13 +193,13 @@ func TestResolver_DeleteAPIToken(t *testing.T) {
 				}
 			}
 		}`
-	variables := map[string]interface{}{
-		"input": map[string]interface{}{
+	variables := map[string]any{
+		"input": map[string]any{
 			"password": defaultPassword,
 		},
 	}
-	variablesIncorrect := map[string]interface{}{
-		"input": map[string]interface{}{
+	variablesIncorrect := map[string]any{
+		"input": map[string]any{
 			"password": "wrong-password",
 		},
 	}
@@ -207,21 +210,21 @@ func TestResolver_DeleteAPIToken(t *testing.T) {
 		{
 			name:          "success",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				session, ok := webauth.GetGQLAuthenticatedSession(f.Ctx)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				session, ok := webauth.GetGQLAuthenticatedSession(ctx)
 				require.True(t, ok)
 				require.NotNil(t, session)
 
 				pwd, err := utils.HashPassword(defaultPassword)
 				require.NoError(t, err)
 
-				session.User.HashedPassword = pwd
+				session.User.HashedPassword = *commonconfig.NewSecretString(pwd)
 				err = session.User.TokenKey.UnmarshalText([]byte("new-access-key"))
 				require.NoError(t, err)
 
-				f.Mocks.authProvider.On("FindUser", session.User.Email).Return(*session.User, nil)
-				f.Mocks.authProvider.On("TestPassword", session.User.Email, defaultPassword).Return(nil)
-				f.Mocks.authProvider.On("DeleteAuthToken", session.User).Return(nil)
+				f.Mocks.authProvider.On("FindUser", mock.Anything, session.User.Email).Return(*session.User, nil)
+				f.Mocks.authProvider.On("TestPassword", mock.Anything, session.User.Email, defaultPassword).Return(nil)
+				f.Mocks.authProvider.On("DeleteAuthToken", mock.Anything, session.User).Return(nil)
 				f.App.On("AuthenticationProvider").Return(f.Mocks.authProvider)
 			},
 			query:     mutation,
@@ -238,13 +241,13 @@ func TestResolver_DeleteAPIToken(t *testing.T) {
 		{
 			name:          "input errors",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				session, ok := webauth.GetGQLAuthenticatedSession(f.Ctx)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				session, ok := webauth.GetGQLAuthenticatedSession(ctx)
 				require.True(t, ok)
 				require.NotNil(t, session)
 
-				f.Mocks.authProvider.On("FindUser", session.User.Email).Return(*session.User, nil)
-				f.Mocks.authProvider.On("TestPassword", session.User.Email, "wrong-password").Return(gError)
+				f.Mocks.authProvider.On("FindUser", mock.Anything, session.User.Email).Return(*session.User, nil)
+				f.Mocks.authProvider.On("TestPassword", mock.Anything, session.User.Email, "wrong-password").Return(gError)
 				f.App.On("AuthenticationProvider").Return(f.Mocks.authProvider)
 			},
 			query:     mutation,
@@ -263,17 +266,17 @@ func TestResolver_DeleteAPIToken(t *testing.T) {
 		{
 			name:          "failed to find user",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				session, ok := webauth.GetGQLAuthenticatedSession(f.Ctx)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				session, ok := webauth.GetGQLAuthenticatedSession(ctx)
 				require.True(t, ok)
 				require.NotNil(t, session)
 
 				pwd, err := utils.HashPassword(defaultPassword)
 				require.NoError(t, err)
 
-				session.User.HashedPassword = pwd
+				session.User.HashedPassword = *commonconfig.NewSecretString(pwd)
 
-				f.Mocks.authProvider.On("FindUser", session.User.Email).Return(*session.User, gError)
+				f.Mocks.authProvider.On("FindUser", mock.Anything, session.User.Email).Return(*session.User, gError)
 				f.App.On("AuthenticationProvider").Return(f.Mocks.authProvider)
 			},
 			query:     mutation,
@@ -283,7 +286,7 @@ func TestResolver_DeleteAPIToken(t *testing.T) {
 				{
 					Extensions:    nil,
 					ResolverError: gError,
-					Path:          []interface{}{"deleteAPIToken"},
+					Path:          []any{"deleteAPIToken"},
 					Message:       "error",
 				},
 			},
@@ -291,19 +294,19 @@ func TestResolver_DeleteAPIToken(t *testing.T) {
 		{
 			name:          "failed to delete token",
 			authenticated: true,
-			before: func(f *gqlTestFramework) {
-				session, ok := webauth.GetGQLAuthenticatedSession(f.Ctx)
+			before: func(ctx context.Context, f *gqlTestFramework) {
+				session, ok := webauth.GetGQLAuthenticatedSession(ctx)
 				require.True(t, ok)
 				require.NotNil(t, session)
 
 				pwd, err := utils.HashPassword(defaultPassword)
 				require.NoError(t, err)
 
-				session.User.HashedPassword = pwd
+				session.User.HashedPassword = *commonconfig.NewSecretString(pwd)
 
-				f.Mocks.authProvider.On("FindUser", session.User.Email).Return(*session.User, nil)
-				f.Mocks.authProvider.On("TestPassword", session.User.Email, defaultPassword).Return(nil)
-				f.Mocks.authProvider.On("DeleteAuthToken", session.User).Return(gError)
+				f.Mocks.authProvider.On("FindUser", mock.Anything, session.User.Email).Return(*session.User, nil)
+				f.Mocks.authProvider.On("TestPassword", mock.Anything, session.User.Email, defaultPassword).Return(nil)
+				f.Mocks.authProvider.On("DeleteAuthToken", mock.Anything, session.User).Return(gError)
 				f.App.On("AuthenticationProvider").Return(f.Mocks.authProvider)
 			},
 			query:     mutation,
@@ -313,7 +316,7 @@ func TestResolver_DeleteAPIToken(t *testing.T) {
 				{
 					Extensions:    nil,
 					ResolverError: gError,
-					Path:          []interface{}{"deleteAPIToken"},
+					Path:          []any{"deleteAPIToken"},
 					Message:       "error",
 				},
 			},

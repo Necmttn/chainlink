@@ -51,7 +51,7 @@ func NewJobProposalSpec(spec *feeds.JobProposalSpec) *JobProposalSpecResolver {
 
 // NewJobProposalSpecs creates a slice of JobProposalSpecResolvers.
 func NewJobProposalSpecs(specs []feeds.JobProposalSpec) []*JobProposalSpecResolver {
-	var resolvers []*JobProposalSpecResolver
+	resolvers := make([]*JobProposalSpecResolver, 0, len(specs))
 
 	for i := range specs {
 		resolvers = append(resolvers, NewJobProposalSpec(&specs[i]))
@@ -80,7 +80,7 @@ func (r *JobProposalSpecResolver) Status() SpecStatus {
 	return ToSpecStatus(r.spec.Status)
 }
 
-// StatusUpdatedAt resolves to the the last timestamp that the spec status was
+// StatusUpdatedAt resolves to the last timestamp that the spec status was
 // updated.
 func (r *JobProposalSpecResolver) StatusUpdatedAt() graphql.Time {
 	return graphql.Time{Time: r.spec.StatusUpdatedAt}

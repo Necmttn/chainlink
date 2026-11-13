@@ -4,49 +4,32 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/pkg/errors"
-	mapper "github.com/scylladb/go-reflectx"
-
 	"github.com/jmoiron/sqlx"
-
-	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/scylladb/go-reflectx"
 )
 
+// Queryer is deprecated.
+//
+// Deprecated: use sqlutil.DataSource instead.
 type Queryer interface {
 	sqlx.Ext
 	sqlx.ExtContext
 	sqlx.Preparer
 	sqlx.PreparerContext
 	sqlx.Queryer
-	Select(dest interface{}, query string, args ...interface{}) error
-	SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+	Select(dest any, query string, args ...any) error
+	SelectContext(ctx context.Context, dest any, query string, args ...any) error
 	PrepareNamed(query string) (*sqlx.NamedStmt, error)
-	QueryRow(query string, args ...interface{}) *sql.Row
-	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
-	Get(dest interface{}, query string, args ...interface{}) error
-	GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
-	NamedExec(query string, arg interface{}) (sql.Result, error)
-	NamedQuery(query string, arg interface{}) (*sqlx.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	Get(dest any, query string, args ...any) error
+	GetContext(ctx context.Context, dest any, query string, args ...any) error
+	NamedExec(query string, arg any) (sql.Result, error)
+	NamedQuery(query string, arg any) (*sqlx.Rows, error)
 }
 
 func WrapDbWithSqlx(rdb *sql.DB) *sqlx.DB {
 	db := sqlx.NewDb(rdb, "postgres")
-	db.MapperFunc(mapper.CamelToSnakeASCII)
+	db.MapperFunc(reflectx.CamelToSnakeASCII)
 	return db
-}
-
-func SqlxTransaction(ctx context.Context, q Queryer, lggr logger.Logger, fc func(q Queryer) error, txOpts ...TxOption) (err error) {
-	switch db := q.(type) {
-	case *sqlx.Tx:
-		// nested transaction: just use the outer transaction
-		err = fc(db)
-	case *sqlx.DB:
-		err = sqlxTransactionQ(ctx, db, lggr, fc, txOpts...)
-	case Q:
-		err = sqlxTransactionQ(ctx, db.db, lggr, fc, txOpts...)
-	default:
-		err = errors.Errorf("invalid db type: %T", q)
-	}
-
-	return
 }

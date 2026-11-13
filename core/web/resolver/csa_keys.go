@@ -1,13 +1,13 @@
 package resolver
 
 import (
-	"fmt"
+	"math"
 
 	"github.com/graph-gophers/graphql-go"
 	"github.com/pkg/errors"
 
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/csakey"
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/csakey"
 )
 
 // CSAKeyResolver resolves the single CSA Key object
@@ -26,11 +26,17 @@ func (r *CSAKeyResolver) ID() graphql.ID {
 
 // PubKey resolves the CSA Key public key string.
 func (r *CSAKeyResolver) PublicKey() string {
-	return fmt.Sprintf("csa_%s", r.key.PublicKeyString())
+	return "csa_" + r.key.PublicKeyString()
 }
 
 // Version resolves the CSA Key version number.
 func (r *CSAKeyResolver) Version() int32 {
+	if r.key.Version > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if r.key.Version < math.MinInt32 {
+		return math.MinInt32
+	}
 	return int32(r.key.Version)
 }
 
@@ -49,7 +55,7 @@ func (r *CSAKeysPayloadResolver) Results() []*CSAKeyResolver {
 }
 
 func NewCSAKeys(keys []csakey.KeyV2) []*CSAKeyResolver {
-	var resolvers []*CSAKeyResolver
+	resolvers := make([]*CSAKeyResolver, 0, len(keys))
 
 	for _, k := range keys {
 		resolvers = append(resolvers, NewCSAKey(k))

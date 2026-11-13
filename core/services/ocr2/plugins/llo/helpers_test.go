@@ -1,0 +1,695 @@
+package llo_test
+
+import (
+	"context"
+	"crypto"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"reflect"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/shopspring/decimal"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
+
+	"github.com/smartcontractkit/wsrpc/credentials"
+
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/csakey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ocr2key"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/p2pkey"
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	"github.com/smartcontractkit/chainlink-data-streams/rpc"
+	"github.com/smartcontractkit/chainlink-data-streams/rpc/mtls"
+	evmtypes "github.com/smartcontractkit/chainlink-evm/pkg/types"
+	"github.com/smartcontractkit/chainlink/v2/core/bridges"
+	"github.com/smartcontractkit/chainlink/v2/core/config/toml"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/keystest"
+	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ocr2/validate"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ocrbootstrap"
+	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline/bridgeconn/streamspb"
+	"github.com/smartcontractkit/chainlink/v2/core/services/streams"
+	"github.com/smartcontractkit/chainlink/v2/core/store/models"
+	"github.com/smartcontractkit/chainlink/v2/core/utils/testutils/heavyweight"
+)
+
+type mercuryServer struct {
+	rpc.UnimplementedTransmitterServer
+	csaSigner crypto.Signer
+	packetsCh chan *packet
+	t         *testing.T
+}
+
+func startMercuryServer(t *testing.T, srv *mercuryServer, pubKeys []ed25519.PublicKey) (serverURL string) {
+	// Set up the grpc server
+	var lc net.ListenConfig
+	lis, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err, "[MAIN] failed to listen")
+	serverURL = lis.Addr().String()
+	sMtls, err := mtls.NewTransportSigner(srv.csaSigner, pubKeys)
+	require.NoError(t, err, "[MAIN] failed to create transport signer")
+	s := grpc.NewServer(grpc.Creds(sMtls),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             time.Second,
+			PermitWithoutStream: true,
+		}))
+
+	// Register mercury implementation with the wsrpc server
+	rpc.RegisterTransmitterServer(s, srv)
+
+	// Start serving
+	go func() {
+		s.Serve(lis) //nolint:errcheck // don't care about this error in tests
+	}()
+
+	t.Cleanup(s.Stop)
+
+	return serverURL
+}
+
+//nolint:containedctx // it's just to pass the context back for testing
+type packet struct {
+	req *rpc.TransmitRequest
+	ctx context.Context
+}
+
+func NewMercuryServer(t *testing.T, csaSigner crypto.Signer, packetsCh chan *packet) *mercuryServer {
+	return &mercuryServer{rpc.UnimplementedTransmitterServer{}, csaSigner, packetsCh, t}
+}
+
+func (s *mercuryServer) Transmit(ctx context.Context, req *rpc.TransmitRequest) (*rpc.TransmitResponse, error) {
+	select {
+	case s.packetsCh <- &packet{
+		req: req,
+		ctx: ctx,
+	}:
+
+	default:
+	}
+
+	return &rpc.TransmitResponse{
+		Code:  1,
+		Error: "",
+	}, nil
+}
+
+func (s *mercuryServer) LatestReport(ctx context.Context, lrr *rpc.LatestReportRequest) (*rpc.LatestReportResponse, error) {
+	panic("should not be called")
+}
+
+type Node struct {
+	App          chainlink.Application
+	ClientPubKey credentials.StaticSizedPublicKey
+	KeyBundle    ocr2key.KeyBundle
+	ObservedLogs *observer.ObservedLogs
+}
+
+func (node *Node) AddStreamJob(t *testing.T, spec string) (id int32) {
+	job, err := streams.ValidatedStreamSpec(spec)
+	require.NoError(t, err)
+	err = node.App.AddJobV2(t.Context(), &job)
+	require.NoError(t, err)
+	return job.ID
+}
+
+func (node *Node) DeleteJob(t *testing.T, id int32) {
+	err := node.App.DeleteJob(t.Context(), id)
+	require.NoError(t, err)
+}
+
+func (node *Node) AddLLOJob(t *testing.T, spec string) (id int32) {
+	c := node.App.GetConfig()
+	job, err := validate.ValidatedOracleSpecToml(t.Context(), c.OCR2(), c.Insecure(), spec, nil)
+	require.NoError(t, err)
+	err = node.App.AddJobV2(t.Context(), &job)
+	require.NoError(t, err)
+	return job.ID
+}
+
+func (node *Node) AddBootstrapJob(t *testing.T, spec string) {
+	job, err := ocrbootstrap.ValidatedBootstrapSpecToml(spec)
+	require.NoError(t, err)
+	err = node.App.AddJobV2(t.Context(), &job)
+	require.NoError(t, err)
+}
+
+func setupNode(
+	t *testing.T,
+	port int,
+	dbName string,
+	backend evmtypes.Backend,
+	csaKey csakey.KeyV2,
+	f func(*chainlink.Config),
+	deps ...any,
+) (app chainlink.Application, peerID string, clientPubKey credentials.StaticSizedPublicKey, ocr2kb ocr2key.KeyBundle, observedLogs *observer.ObservedLogs) {
+	app, peerID, clientPubKey, ocr2kb, observedLogs, _ = setupRestartableNode(t, port, dbName, backend, csaKey, f, deps...)
+	return app, peerID, clientPubKey, ocr2kb, observedLogs
+}
+
+// setupRestartableNode is setupNode plus a restart hook. restart stops the
+// application, runs whileDown (if any), then starts a new one on the same
+// config, database, keys and key-value store root, which is a process restart
+// with every piece of persisted state left in place: jobs, and the OCR3.1
+// (llo/v31) pebble store.
+func setupRestartableNode(
+	t *testing.T,
+	port int,
+	dbName string,
+	backend evmtypes.Backend,
+	csaKey csakey.KeyV2,
+	f func(*chainlink.Config),
+	deps ...any,
+) (app chainlink.Application, peerID string, clientPubKey credentials.StaticSizedPublicKey, ocr2kb ocr2key.KeyBundle, observedLogs *observer.ObservedLogs, restart func(t *testing.T, whileDown func()) chainlink.Application) {
+	k := big.NewInt(int64(port)) // keys unique to port
+	p2pKey := p2pkey.MustNewV2XXXTestingOnly(k)
+	rdr := keystest.NewRandReaderFromSeed(int64(port))
+	ocr2kb = ocr2key.MustNewInsecure(rdr, corekeys.EVM)
+
+	p2paddresses := []string{fmt.Sprintf("127.0.0.1:%d", port)}
+
+	config, _ := heavyweight.FullTestDBV2(t, func(c *chainlink.Config, s *chainlink.Secrets) {
+		// [JobPipeline]
+		c.JobPipeline.MaxSuccessfulRuns = new(uint64(0))
+		c.JobPipeline.VerboseLogging = new(true)
+
+		// [Feature]
+		c.Feature.UICSAKeys = new(true)
+		c.Feature.LogPoller = new(true)
+		c.Feature.FeedsManager = new(false)
+
+		// [OCR]
+		c.OCR.Enabled = new(false)
+
+		// [OCR2]
+		c.OCR2.Enabled = new(true)
+		c.OCR2.ContractPollInterval = commonconfig.MustNewDuration(100 * time.Millisecond)
+		// Unique per-node root for the OCR3.1 (llo/v31) pebble key-value store so the
+		// nodes in this process don't share state and nothing is written to ~/.chainlink-data.
+		c.OCR2.KeyValueStoreRootDir = new(t.TempDir())
+
+		// [P2P]
+		c.P2P.PeerID = new(p2pKey.PeerID())
+		c.P2P.TraceLogging = new(true)
+		// Required for OCR3.1 (llo/v31) networking (the "2" endpoint factory needs
+		// the experimental ragep2p host). Backward-compatible with OCR3.0.
+		c.P2P.EnableExperimentalRageP2P = new(true)
+
+		// [P2P.V2]
+		c.P2P.V2.Enabled = new(true)
+		c.P2P.V2.AnnounceAddresses = &p2paddresses
+		c.P2P.V2.ListenAddresses = &p2paddresses
+		c.P2P.V2.DeltaDial = commonconfig.MustNewDuration(500 * time.Millisecond)
+		c.P2P.V2.DeltaReconcile = commonconfig.MustNewDuration(5 * time.Second)
+
+		// [Mercury]
+		c.Mercury.VerboseLogging = new(true)
+
+		// [Log]
+		c.Log.Level = new(toml.LogLevel(zapcore.DebugLevel)) // generally speaking we want debug level for logs unless overridden
+
+		// [CRE]
+		c.CRE.UseLocalTimeProvider = new(true)
+
+		// [EVM.Transactions]
+		for _, evmCfg := range c.EVM {
+			evmCfg.Transactions.Enabled = new(false) // don't need txmgr
+			// The simulated backend only mines on Commit, so the 15s default
+			// stalls config and channel definition pickup by a full interval.
+			evmCfg.LogPollInterval = commonconfig.MustNewDuration(100 * time.Millisecond)
+		}
+
+		// Optional overrides
+		if f != nil {
+			f(c)
+		}
+	})
+
+	lggr, observedLogs := logger.TestLoggerObserved(t, config.Log().Level())
+	// newApp builds and starts an application over the config above. Start
+	// registers its own cleanup, which tolerates an application this test
+	// already stopped.
+	newApp := func(t *testing.T) chainlink.Application {
+		var a chainlink.Application
+		if backend != nil {
+			a = cltest.NewApplicationWithConfigV2OnSimulatedBlockchain(t, config, backend, append([]any{p2pKey, ocr2kb, csaKey, lggr.Named(dbName)}, deps...)...)
+		} else {
+			a = cltest.NewApplicationWithConfig(t, config, append([]any{p2pKey, ocr2kb, csaKey, lggr.Named(dbName)}, deps...)...)
+		}
+		require.NoError(t, a.Start(t.Context()))
+		return a
+	}
+
+	app = newApp(t)
+	current := app
+	restart = func(t *testing.T, whileDown func()) chainlink.Application {
+		require.NoError(t, current.Stop())
+		if whileDown != nil {
+			whileDown()
+		}
+		current = newApp(t)
+		return current
+	}
+
+	return app, p2pKey.PeerID().Raw(), csaKey.StaticSizedPublicKey(), ocr2kb, observedLogs, restart
+}
+
+// receiveWithTimeout receives from the packet channel with a timeout.
+// It returns the packet if a packet was received or an error if the timeout is reached
+// or the channel is closed unexpectedly.
+func receiveWithTimeout(t *testing.T, ch <-chan *packet, timeout time.Duration) (*packet, error) {
+	t.Helper()
+	select {
+	case pckt, ok := <-ch:
+		if !ok {
+			return nil, errors.New("packet channel closed unexpectedly")
+		}
+		return pckt, nil
+	case <-time.After(timeout):
+		return nil, errors.New("timed out waiting on channel")
+	}
+}
+
+func addSingleDecimalStreamJob(
+	t *testing.T,
+	node Node,
+	streamID uint32,
+	bridgeName string,
+) (id int32) {
+	return node.AddStreamJob(t, fmt.Sprintf(`
+type = "stream"
+schemaVersion = 1
+name = "strm-spec-%d"
+streamID = %d
+observationSource = """
+	// Benchmark Price
+	price1          [type=bridge name="%s" timeout="10s" requestData="{\\"data\\":{\\"data\\":\\"foo\\"}}"];
+	price1_parse    [type=jsonparse path="result"];
+
+	price1 -> price1_parse;
+"""
+
+		`,
+		streamID,
+		streamID,
+		bridgeName,
+	))
+}
+
+func addStreamSpec(
+	t *testing.T,
+	node Node,
+	name string,
+	streamID *uint32,
+	observationSource string,
+) (id int32) {
+	optionalStreamID := ""
+	if streamID != nil {
+		optionalStreamID = fmt.Sprintf("streamID = %d\n", *streamID)
+	}
+	specTOML := fmt.Sprintf(`
+type = "stream"
+schemaVersion = 1
+name = "%s"
+%s
+observationSource = """
+%s
+"""
+`, name, optionalStreamID, observationSource)
+	return node.AddStreamJob(t, specTOML)
+}
+
+func addQuoteStreamJob(
+	t *testing.T,
+	node Node,
+	streamID uint32,
+	benchmarkBridgeName string,
+	bidBridgeName string,
+	askBridgeName string,
+) (id int32) {
+	return node.AddStreamJob(t, fmt.Sprintf(`
+type = "stream"
+schemaVersion = 1
+name = "strm-spec-%d"
+streamID = %d
+observationSource = """
+	// Benchmark Price
+	price1          [type=bridge name="%s" timeout="10s" requestData="{\\"data\\":{\\"data\\":\\"foo\\"}}"];
+	price1_parse    [type=jsonparse path="result" index=0];
+
+	price1 -> price1_parse;
+
+	// Bid
+	price2          [type=bridge name="%s" timeout="10s" requestData="{\\"data\\":{\\"data\\":\\"foo\\"}}"];
+	price2_parse    [type=jsonparse path="result" index=1];
+
+	price2 -> price2_parse;
+
+	// Ask
+	price3          [type=bridge name="%s" timeout="10s" requestData="{\\"data\\":{\\"data\\":\\"foo\\"}}"];
+	price3_parse    [type=jsonparse path="result" index=2];
+
+	price3 -> price3_parse;
+"""
+
+		`,
+		streamID,
+		streamID,
+		benchmarkBridgeName,
+		bidBridgeName,
+		askBridgeName,
+	))
+}
+
+func addBootstrapJob(t *testing.T, bootstrapNode Node, configuratorAddress common.Address, name, relayType, relayConfig string) {
+	bootstrapNode.AddBootstrapJob(t, fmt.Sprintf(`
+type                              = "bootstrap"
+relay                             = "%s"
+schemaVersion                     = 1
+name                              = "boot-%s"
+contractID                        = "%s"
+contractConfigTrackerPollInterval = "1s"
+
+[relayConfig]
+%s
+providerType = "llo"`, relayType, name, configuratorAddress.Hex(), relayConfig))
+}
+
+func addLLOJob(
+	t *testing.T,
+	node Node,
+	configuratorAddr common.Address,
+	bootstrapPeerID string,
+	bootstrapNodePort int,
+	clientPubKey ed25519.PublicKey,
+	jobName string,
+	pluginConfig,
+	relayType,
+	relayConfig string,
+) (id int32) {
+	return addLLOJobWithBootstrapper(t, node, configuratorAddr, fmt.Sprintf("%s@127.0.0.1:%d", bootstrapPeerID, bootstrapNodePort), clientPubKey, jobName, pluginConfig, relayType, relayConfig)
+}
+
+// addLLOJobWithBootstrapper is addLLOJob with the bootstrapper locator given
+// in full, for nodes whose p2p address is not 127.0.0.1.
+func addLLOJobWithBootstrapper(
+	t *testing.T,
+	node Node,
+	configuratorAddr common.Address,
+	bootstrapper string,
+	clientPubKey ed25519.PublicKey,
+	jobName string,
+	pluginConfig,
+	relayType,
+	relayConfig string,
+) (id int32) {
+	return node.AddLLOJob(t, fmt.Sprintf(`
+type = "offchainreporting2"
+schemaVersion = 1
+name = "%s"
+forwardingAllowed = false
+maxTaskDuration = "10s"
+contractID = "%s"
+contractConfigTrackerPollInterval = "1s"
+ocrKeyBundleID = "%s"
+p2pv2Bootstrappers = [
+  "%s"
+]
+relay = "%s"
+pluginType = "llo"
+transmitterID = "%x"
+
+[pluginConfig]
+%s
+
+[relayConfig]
+%s`,
+		jobName,
+		configuratorAddr.Hex(),
+		node.KeyBundle.ID(),
+		bootstrapper,
+		relayType,
+		clientPubKey,
+		pluginConfig,
+		relayConfig,
+	))
+}
+
+func createSingleDecimalBridge(t *testing.T, name string, i int, p decimal.Decimal, borm bridges.ORM) (bridgeName string) {
+	ctx := t.Context()
+	bridge := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		b, err := io.ReadAll(req.Body)
+		if !assert.NoError(t, err) {
+			return
+		}
+		if !assert.JSONEq(t, `{"data":{"data":"foo"}}`, string(b)) {
+			return
+		}
+
+		res.WriteHeader(http.StatusOK)
+		val := p.String()
+		resp := fmt.Sprintf(`{"result": %s}`, val)
+		_, err = res.Write([]byte(resp))
+		if !assert.NoError(t, err) {
+			return
+		}
+	}))
+	t.Cleanup(bridge.Close)
+	u, _ := url.Parse(bridge.URL)
+	bridgeName = fmt.Sprintf("bridge-%s-%d", name, i)
+	require.NoError(t, borm.CreateBridgeType(ctx, &bridges.BridgeType{
+		Name: bridges.BridgeName(bridgeName),
+		URL:  models.WebURL(*u),
+	}))
+	return bridgeName
+}
+
+// createSingleDecimalCountingBridge is like createSingleDecimalBridge but increments callCount on each bridge request.
+func createSingleDecimalCountingBridge(t *testing.T, name string, i int, p decimal.Decimal, borm bridges.ORM, callCount *atomic.Uint64) (bridgeName string) {
+	ctx := t.Context()
+	wantBody := map[string]any{"data": map[string]any{"data": "foo"}}
+	bridge := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		callCount.Add(1)
+		b, err := io.ReadAll(req.Body)
+		if err != nil {
+			http.Error(res, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		var gotBody any
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			http.Error(res, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if !reflect.DeepEqual(gotBody, wantBody) {
+			http.Error(res, "unexpected request body", http.StatusBadRequest)
+			return
+		}
+
+		res.WriteHeader(http.StatusOK)
+		val := p.String()
+		resp := fmt.Sprintf(`{"result": %s}`, val)
+		_, _ = res.Write([]byte(resp))
+	}))
+	t.Cleanup(bridge.Close)
+	u, _ := url.Parse(bridge.URL)
+	bridgeName = fmt.Sprintf("bridge-%s-%d", name, i)
+	require.NoError(t, borm.CreateBridgeType(ctx, &bridges.BridgeType{
+		Name: bridges.BridgeName(bridgeName),
+		URL:  models.WebURL(*u),
+	}))
+
+	return bridgeName
+}
+
+// grpcStreamBridgeServer is a minimal stand-in for a streams-adapter EA: it
+// implements the streamspb.StreamServiceServer side of BridgeConnManager's
+// protocol and, for every subscription it receives, immediately replies with a
+// fixed price under the payload hash BridgeConnManager expects to find in its
+// observation cache (see bridgeConnManager.bridgeObservationCacheKey).
+type grpcStreamBridgeServer struct {
+	streamspb.UnimplementedStreamServiceServer
+	bridgeName string // trimmed of the "bridge-" prefix, matching bridgeConnManager's own trimming
+	price      decimal.Decimal
+}
+
+func (s *grpcStreamBridgeServer) Subscribe(stream streamspb.StreamService_SubscribeServer) error {
+	for {
+		req, err := stream.Recv()
+		if err != nil {
+			return nil //nolint:nilerr // client closing the stream ends the test happy-path; no error to report
+		}
+		for _, sub := range req.GetSubscriptions() {
+			hash, err := grpcStreamBridgeObservationHash(s.bridgeName, sub.GetData().AsMap())
+			if err != nil {
+				return err
+			}
+			resp := &streamspb.SubscribeResponse{
+				Timestamp:       time.Now().UTC().Format(time.RFC3339),
+				ObservationJson: fmt.Appendf(nil, `{"result": %s}`, s.price.String()),
+				PayloadHash:     hash[:],
+			}
+			if err := stream.Send(resp); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// grpcStreamBridgeObservationHash mirrors bridgeConnManager's
+// bridgeObservationCacheKey so this fake EA's responses land in the real cache.
+func grpcStreamBridgeObservationHash(bridgeName string, data map[string]any) ([32]byte, error) {
+	lookupBytes, err := json.Marshal(data)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	b := make([]byte, 0, len(bridgeName)+len(lookupBytes))
+	b = append(b, bridgeName...)
+	b = append(b, lookupBytes...)
+	return sha256.Sum256(b), nil
+}
+
+// createGRPCStreamBridge starts a plaintext gRPC server implementing the
+// streams-adapter side of BridgeConnManager's protocol and registers a bridge
+// with UseConnectionManager=true pointing at it, so BridgeTask.Run reads
+// observations from BridgeConnManager's cache instead of making an HTTP call.
+func createGRPCStreamBridge(t *testing.T, name string, i int, p decimal.Decimal, borm bridges.ORM) (bridgeName string) {
+	ctx := t.Context()
+	trimmedName := fmt.Sprintf("%s-%d", name, i)
+	bridgeName = "bridge-" + trimmedName
+
+	var lc net.ListenConfig
+	lis, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	s := grpc.NewServer()
+	streamspb.RegisterStreamServiceServer(s, &grpcStreamBridgeServer{bridgeName: trimmedName, price: p})
+	go func() {
+		_ = s.Serve(lis)
+	}()
+	t.Cleanup(s.Stop)
+
+	u, err := url.Parse("http://" + lis.Addr().String())
+	require.NoError(t, err)
+	require.NoError(t, borm.CreateBridgeType(ctx, &bridges.BridgeType{
+		Name:                 bridges.BridgeName(bridgeName),
+		URL:                  models.WebURL(*u),
+		UseConnectionManager: true,
+	}))
+	return bridgeName
+}
+
+func createBridge(t *testing.T, bridgeName, responseJSON string, borm bridges.ORM) {
+	ctx := t.Context()
+	bridge := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		res.WriteHeader(http.StatusOK)
+		_, err := res.Write([]byte(responseJSON))
+		if err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	t.Cleanup(bridge.Close)
+	u, _ := url.Parse(bridge.URL)
+	require.NoError(t, borm.CreateBridgeType(ctx, &bridges.BridgeType{
+		Name: bridges.BridgeName(bridgeName),
+		URL:  models.WebURL(*u),
+	}))
+}
+
+func addMemoStreamSpecs(t *testing.T, node Node, streams []Stream) {
+	for _, strm := range streams {
+		addStreamSpec(t, node, fmt.Sprintf("memo-%d", strm.id), &strm.id, fmt.Sprintf(`
+	value         [type=memo value="%s"];
+	multiply 	  [type=multiply times=1];
+	value -> multiply;
+	`, strm.baseBenchmarkPrice))
+	}
+}
+
+func addOCRJobsEVMPremiumLegacy(
+	t *testing.T,
+	streams []Stream,
+	serverPubKey ed25519.PublicKey,
+	serverURL string,
+	configuratorAddress common.Address,
+	bootstrapPeerID string,
+	bootstrapNodePort int,
+	nodes []Node,
+	configStoreAddress common.Address,
+	clientPubKeys []ed25519.PublicKey,
+	pluginConfig,
+	relayType,
+	relayConfig string,
+) (jobIDs map[int]map[uint32]int32) {
+	// node idx => stream id => job id
+	jobIDs = make(map[int]map[uint32]int32)
+	// Add OCR jobs - one per feed on each node
+	for i, node := range nodes {
+		if jobIDs[i] == nil {
+			jobIDs[i] = make(map[uint32]int32)
+		}
+		for j, strm := range streams {
+			// assume that streams are native, link and additional streams are quote
+			if j < 2 {
+				var name string
+				if j == 0 {
+					name = "nativeprice"
+				} else {
+					name = "linkprice"
+				}
+				name = fmt.Sprintf("%s-%d-%d", name, strm.id, j)
+				bmBridge := createSingleDecimalBridge(t, name, i, strm.baseBenchmarkPrice, node.App.BridgeORM())
+				jobID := addSingleDecimalStreamJob(
+					t,
+					node,
+					strm.id,
+					bmBridge,
+				)
+				jobIDs[i][strm.id] = jobID
+			} else {
+				bmBridge := createSingleDecimalBridge(t, fmt.Sprintf("benchmarkprice-%d-%d", strm.id, j), i, strm.baseBenchmarkPrice, node.App.BridgeORM())
+				bidBridge := createSingleDecimalBridge(t, fmt.Sprintf("bid-%d-%d", strm.id, j), i, strm.baseBid, node.App.BridgeORM())
+				askBridge := createSingleDecimalBridge(t, fmt.Sprintf("ask-%d-%d", strm.id, j), i, strm.baseAsk, node.App.BridgeORM())
+				jobID := addQuoteStreamJob(
+					t,
+					node,
+					strm.id,
+					bmBridge,
+					bidBridge,
+					askBridge,
+				)
+				jobIDs[i][strm.id] = jobID
+			}
+		}
+		addLLOJob(
+			t,
+			node,
+			configuratorAddress,
+			bootstrapPeerID,
+			bootstrapNodePort,
+			clientPubKeys[i],
+			"feed-1",
+			pluginConfig,
+			relayType,
+			relayConfig,
+		)
+	}
+	return jobIDs
+}

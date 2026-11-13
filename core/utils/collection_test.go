@@ -4,11 +4,12 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestBatchSplit(t *testing.T) {
-	list := []int{}
-	for i := 0; i < 100; i++ {
+	list := make([]int, 0, 100)
+	for i := range 100 {
 		list = append(list, i)
 	}
 
@@ -38,23 +39,21 @@ func TestBatchSplit(t *testing.T) {
 				return
 			}
 
-			assert.NoError(t, err)
-			assert.Equal(t, r.num, len(batch)) // check number of batches
+			require.NoError(t, err)
+			assert.Len(t, batch, r.num) // check number of batches
 
 			temp := []int{}
-			for i := 0; i < len(batch); i++ {
+			for i := range batch {
 				expectedLen := r.max
 				if i == len(batch)-1 {
 					expectedLen = r.lastLen // expect last batch to be less than max
 				}
-				assert.Equal(t, expectedLen, len(batch[i])) // check length of batch
+				assert.Len(t, batch[i], expectedLen) // check length of batch
 
 				temp = append(temp, batch[i]...)
 			}
 			// assert order has not changed when list is reconstructed
 			assert.Equal(t, r.input, temp)
-
 		})
 	}
-
 }

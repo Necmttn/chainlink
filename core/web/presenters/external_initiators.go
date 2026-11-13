@@ -1,7 +1,7 @@
 package presenters
 
 import (
-	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/smartcontractkit/chainlink/v2/core/auth"
@@ -12,7 +12,7 @@ import (
 // ExternalInitiatorAuthentication includes initiator and authentication details.
 type ExternalInitiatorAuthentication struct {
 	Name           string        `json:"name,omitempty"`
-	URL            models.WebURL `json:"url,omitempty"`
+	URL            models.WebURL `json:"url"`
 	AccessKey      string        `json:"incomingAccessKey,omitempty"`
 	Secret         string        `json:"incomingSecret,omitempty"`
 	OutgoingToken  string        `json:"outgoingToken,omitempty"`
@@ -66,7 +66,7 @@ type ExternalInitiatorResource struct {
 
 func NewExternalInitiatorResource(ei bridges.ExternalInitiator) ExternalInitiatorResource {
 	return ExternalInitiatorResource{
-		JAID:          NewJAID(fmt.Sprintf("%d", ei.ID)),
+		JAID:          NewJAID(strconv.FormatInt(ei.ID, 10)),
 		Name:          ei.Name,
 		URL:           ei.URL,
 		AccessKey:     ei.AccessKey,

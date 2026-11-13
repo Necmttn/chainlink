@@ -44,7 +44,7 @@ func Test_PublicKey_UnmarshalJSON(t *testing.T) {
 	hexKey := hex.EncodeToString(pubKey)
 
 	actual := &PublicKey{}
-	err = actual.UnmarshalJSON([]byte(fmt.Sprintf(`"%s"`, hexKey)))
+	err = actual.UnmarshalJSON(fmt.Appendf(nil, `"%s"`, hexKey))
 	require.NoError(t, err)
 
 	assert.Equal(t, PublicKey(pubKey), *actual)
@@ -58,7 +58,7 @@ func Test_PublicKey_Scan(t *testing.T) {
 
 	// Error if not bytes
 	err = actual.Scan("not bytes")
-	assert.Error(t, err)
+	require.Error(t, err)
 
 	// Nil
 	err = actual.Scan(nil)

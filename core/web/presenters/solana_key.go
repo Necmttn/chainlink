@@ -1,7 +1,7 @@
 package presenters
 
 import (
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/solkey"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/solkey"
 )
 
 // SolanaKeyResource represents a Solana key JSONAPI resource.
@@ -25,7 +25,7 @@ func NewSolanaKeyResource(key solkey.Key) *SolanaKeyResource {
 }
 
 func NewSolanaKeyResources(keys []solkey.Key) []SolanaKeyResource {
-	rs := []SolanaKeyResource{}
+	rs := make([]SolanaKeyResource, 0, len(keys))
 	for _, key := range keys {
 		rs = append(rs, *NewSolanaKeyResource(key))
 	}

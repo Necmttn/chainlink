@@ -1,0 +1,1234 @@
+package confidentialrelay
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
+
+	relaytypes "github.com/smartcontractkit/chainlink-common/pkg/capabilities/v2/actions/confidentialrelay"
+	jsonrpc "github.com/smartcontractkit/chainlink-common/pkg/jsonrpc2"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/cresettings"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/limits"
+	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/api"
+	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/config"
+	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/handlers/common"
+	"github.com/smartcontractkit/chainlink/v2/core/services/gateway/handlers/mocks"
+)
+
+type barrierDON struct {
+	total       int
+	mu          sync.Mutex
+	started     int
+	allStarted  chan struct{}
+	releaseOnce sync.Once
+}
+
+func newBarrierDON(total int) *barrierDON {
+	return &barrierDON{
+		total:      total,
+		allStarted: make(chan struct{}),
+	}
+}
+
+func (d *barrierDON) SendToNode(ctx context.Context, _ string, _ *jsonrpc.Request[json.RawMessage]) error {
+	d.mu.Lock()
+	d.started++
+	if d.started == d.total {
+		d.releaseOnce.Do(func() { close(d.allStarted) })
+	}
+	ch := d.allStarted
+	d.mu.Unlock()
+
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// blockedDON models a node whose websocket accepts no writes: the send to blockedAddr blocks
+// until its context is cancelled, while every other node returns immediately.
+type blockedDON struct {
+	blockedAddr string
+	mu          sync.Mutex
+	delivered   []string
+}
+
+func (d *blockedDON) SendToNode(ctx context.Context, addr string, _ *jsonrpc.Request[json.RawMessage]) error {
+	if addr == d.blockedAddr {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	d.mu.Lock()
+	d.delivered = append(d.delivered, addr)
+	d.mu.Unlock()
+	return nil
+}
+
+func (d *blockedDON) deliveredCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.delivered)
+}
+
+var nodeOne = config.NodeConfig{
+	Name:    "node1",
+	Address: "0x1234",
+}
+
+// validCapParamsJSON returns JSON-RPC params for MethodCapabilityExec that satisfy
+// chainlink-common's CapabilityRequestParams.Validate (testOwner / testExecutionID
+// constants live in bundler_test.go, same package).
+func validCapParamsJSON(workflowID string) json.RawMessage {
+	raw, err := json.Marshal(validCapParams(workflowID))
+	if err != nil {
+		panic(err)
+	}
+	return json.RawMessage(raw)
+}
+
+func setupHandler(t *testing.T, numNodes int) (*handler, *common.Callback, *mocks.DON, *clockwork.FakeClock) {
+	t.Helper()
+	return setupHandlerWithF(t, numNodes, 1)
+}
+
+func setupHandlerWithF(t *testing.T, numNodes, f int) (*handler, *common.Callback, *mocks.DON, *clockwork.FakeClock) {
+	t.Helper()
+	return setupHandlerWithConfig(t, numNodes, f, Config{RequestTimeoutSec: 30})
+}
+
+func setupHandlerWithConfig(t *testing.T, numNodes, f int, handlerConfig Config) (*handler, *common.Callback, *mocks.DON, *clockwork.FakeClock) {
+	t.Helper()
+	lggr := logger.Test(t)
+	don := mocks.NewDON(t)
+
+	members := make([]config.NodeConfig, numNodes)
+	for i := range numNodes {
+		members[i] = config.NodeConfig{
+			Name:    fmt.Sprintf("node%d", i),
+			Address: fmt.Sprintf("0x%04d", i),
+		}
+	}
+
+	donConfig := &config.DONConfig{
+		DonID:   "test_relay_don",
+		F:       f,
+		Members: members,
+	}
+	methodConfig, err := json.Marshal(handlerConfig)
+	require.NoError(t, err)
+
+	clock := clockwork.NewFakeClock()
+	limitsFactory := limits.Factory{Settings: cresettings.DefaultGetter, Logger: lggr}
+	h, err := NewHandler(methodConfig, donConfig, don, lggr, clock, limitsFactory)
+	require.NoError(t, err)
+	// The default bundler is the real one; tests that need a failure inject a mock.
+	cb := common.NewCallback()
+	return h, cb, don, clock
+}
+
+// mockBundler lets a test force the bundler error path or a fixed summary.
+type mockBundler struct {
+	err     error
+	summary *BundleSummary
+}
+
+func (m *mockBundler) Bundle(_ jsonrpc.Request[json.RawMessage], _ map[string]jsonrpc.Response[json.RawMessage], _ logger.Logger) (*BundleSummary, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.summary, nil
+}
+
+func TestConfidentialRelayHandler_Methods(t *testing.T) {
+	t.Parallel()
+	h, _, _, _ := setupHandler(t, 4)
+	methods := h.Methods()
+	assert.Equal(t, []string{MethodSecretsGet, MethodCapabilityExec}, methods)
+}
+
+func TestConfidentialRelayHandler_HandleLegacyUserMessage(t *testing.T) {
+	t.Parallel()
+	h, cb, _, _ := setupHandler(t, 4)
+	err := h.HandleLegacyUserMessage(t.Context(), nil, cb)
+	require.ErrorContains(t, err, "confidential relay handler does not support legacy messages")
+}
+
+func TestConfidentialRelayHandler_RequestIDTooLong(t *testing.T) {
+	t.Parallel()
+	h, cb, _, _ := setupHandler(t, 4)
+
+	longID := strings.Repeat("x", 201)
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     longID,
+		Method: MethodCapabilityExec,
+	}
+
+	err := h.HandleJSONRPCUserMessage(t.Context(), req, cb)
+	expected := fmt.Sprintf("request ID is too long: %d. max is 200 characters", len(longID))
+	require.EqualError(t, err, expected)
+}
+
+func TestConfidentialRelayHandler_EmptyRequestID(t *testing.T) {
+	t.Parallel()
+	h, cb, _, _ := setupHandler(t, 4)
+
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "",
+		Method: MethodCapabilityExec,
+	}
+
+	err := h.HandleJSONRPCUserMessage(t.Context(), req, cb)
+	require.EqualError(t, err, "request ID cannot be empty")
+}
+
+// At F=1 the gateway forwards once it has collected 2F+1 = 3 signed responses, so
+// that (under <=F faulty) at least F+1 honest matching responses are guaranteed
+// present for the enclave to verify. The gateway itself makes no signature/quorum
+// decision beyond counting signed (non-error) replies.
+func TestConfidentialRelayHandler_ForwardsBundleAtQuorum(t *testing.T) {
+	t.Parallel()
+	h, cb, don, _ := setupHandler(t, 4)
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	params := validCapParamsJSON("wf1")
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-quorum",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+	result := relaytypes.CapabilityResponseResult{Payload: "result"}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		resp, err := cb.Wait(t.Context())
+		if !assert.NoError(t, err) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		assert.Equal(t, api.NoError, resp.ErrorCode)
+		var jsonResp jsonrpc.Response[json.RawMessage]
+		if !assert.NoError(t, json.Unmarshal(resp.RawResponse, &jsonResp)) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		if !assert.NotNil(t, jsonResp.Result) {
+			return
+		}
+		var bundle relaytypes.SignedCapabilityResponseBundle
+		if !assert.NoError(t, json.Unmarshal(*jsonResp.Result, &bundle)) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		assert.Len(t, bundle.Responses, 3, "the gateway forwards every collected signed response")
+	})
+
+	err := h.HandleJSONRPCUserMessage(t.Context(), req, cb)
+	require.NoError(t, err)
+
+	// First two signed responses do not reach the 2F+1 threshold: no callback yet.
+	for i := range 2 {
+		err = h.HandleNodeMessage(t.Context(), capExecSignedRespPtr(t, "req-quorum", result, fmt.Appendf(nil, "signer-%d", i)), fmt.Sprintf("0x%04d", i))
+		require.NoError(t, err)
+	}
+	require.NotNil(t, h.getActiveRequest(req.ID), "request stays active below the 2F+1 signed threshold")
+
+	// Third signed response reaches 2F+1 and triggers the forward.
+	err = h.HandleNodeMessage(t.Context(), capExecSignedRespPtr(t, "req-quorum", result, []byte("signer-2")), "0x0002")
+	require.NoError(t, err)
+	wg.Wait()
+}
+
+// Staging failure mode: lagging nodes return fast JSON-RPC errors (e.g. execution
+// handler not found) while only a few nodes return signed successes. Raw response
+// count can hit 2F+1 while signed count is still below F+1; the gateway must keep
+// waiting for more signed replies (or timeout), not forward a doomed bundle.
+func TestConfidentialRelayHandler_DoesNotForwardOnErrorMajority(t *testing.T) {
+	t.Parallel()
+	// F=2, N=7 => forward threshold is 2F+1 = 5 signed responses; enclave needs F+1=3.
+	h, cb, don, _ := setupHandlerWithF(t, 7, 2)
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	params := validCapParamsJSON("wf1")
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-error-majority",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+	result := relaytypes.CapabilityResponseResult{Payload: "result"}
+
+	require.NoError(t, h.HandleJSONRPCUserMessage(t.Context(), req, cb))
+
+	// 3 fast node errors + 2 signed successes = 5 raw replies, but only 2 signed.
+	// Under the old raw-count trigger this would early-forward a bundle of 2 and
+	// the enclave would fail needing F+1=3. We must stay active.
+	for i := range 3 {
+		errResp := &jsonrpc.Response[json.RawMessage]{
+			Version: jsonrpc.JsonRpcVersion,
+			ID:      req.ID,
+			Method:  MethodCapabilityExec,
+			Error:   &jsonrpc.WireError{Code: -32602, Message: "execution handler for workflow not found"},
+		}
+		require.NoError(t, h.HandleNodeMessage(t.Context(), errResp, fmt.Sprintf("0x%04d", i)))
+	}
+	for i := 3; i < 5; i++ {
+		require.NoError(t, h.HandleNodeMessage(t.Context(),
+			capExecSignedRespPtr(t, req.ID, result, fmt.Appendf(nil, "signer-%d", i)),
+			fmt.Sprintf("0x%04d", i),
+		))
+	}
+	require.NotNil(t, h.getActiveRequest(req.ID), "must not forward when signed count is below 2F+1")
+
+	// Two more signed successes (nodes 5,6) bring signed to 4 with all nodes replied.
+	// Terminal-state path: remaining=0 and signed >= F+1=3, so forward without timeout.
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		resp, err := cb.Wait(t.Context())
+		if !assert.NoError(t, err) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		assert.Equal(t, api.NoError, resp.ErrorCode)
+		var jsonResp jsonrpc.Response[json.RawMessage]
+		if !assert.NoError(t, json.Unmarshal(resp.RawResponse, &jsonResp)) {
+			return
+		}
+		var bundle relaytypes.SignedCapabilityResponseBundle
+		if !assert.NoError(t, json.Unmarshal(*jsonResp.Result, &bundle)) {
+			return
+		}
+		assert.Len(t, bundle.Responses, 4, "errors are dropped; only signed responses are bundled")
+	})
+	for i := 5; i < 7; i++ {
+		require.NoError(t, h.HandleNodeMessage(t.Context(),
+			capExecSignedRespPtr(t, req.ID, result, fmt.Appendf(nil, "signer-%d", i)),
+			fmt.Sprintf("0x%04d", i),
+		))
+	}
+	wg.Wait()
+	require.Nil(t, h.getActiveRequest(req.ID), "terminal-state forward should complete the request")
+}
+
+// When every node has replied but signed is still below F+1, the gateway must not
+// forward a doomed bundle or wait for cleanup; it fails immediately.
+func TestConfidentialRelayHandler_TerminalStateBelowQuorumFailsImmediately(t *testing.T) {
+	t.Parallel()
+	h, cb, don, _ := setupHandlerWithF(t, 4, 1) // F+1=2, 2F+1=3
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	params := validCapParamsJSON("wf1")
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-terminal-below",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+	result := relaytypes.CapabilityResponseResult{Payload: "result"}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		resp, err := cb.Wait(t.Context())
+		if !assert.NoError(t, err) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		assert.Equal(t, api.FatalError, resp.ErrorCode)
+		var jsonResp jsonrpc.Response[json.RawMessage]
+		if !assert.NoError(t, json.Unmarshal(resp.RawResponse, &jsonResp)) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		if assert.NotNil(t, jsonResp.Error) {
+			assert.Contains(t, jsonResp.Error.Message, "relay quorum unreachable")
+		}
+	})
+
+	require.NoError(t, h.HandleJSONRPCUserMessage(t.Context(), req, cb))
+
+	// 3 errors + 1 signed: all nodes replied, signed=1 < F+1=2. Fail immediately.
+	for i := range 3 {
+		errResp := &jsonrpc.Response[json.RawMessage]{
+			Version: jsonrpc.JsonRpcVersion,
+			ID:      req.ID,
+			Method:  MethodCapabilityExec,
+			Error:   &jsonrpc.WireError{Code: jsonrpc.ErrInternal, Message: "execution handler not found"},
+		}
+		require.NoError(t, h.HandleNodeMessage(t.Context(), errResp, fmt.Sprintf("0x%04d", i)))
+	}
+	require.NoError(t, h.HandleNodeMessage(t.Context(),
+		capExecSignedRespPtr(t, req.ID, result, []byte("signer-3")), "0x0003"))
+	wg.Wait()
+	require.Nil(t, h.getActiveRequest(req.ID))
+}
+
+// If outstanding replies cannot bring signed up to F+1, fail before waiting for
+// silent nodes / timeout. Example: F=1 needs 2 signed; after 3 errors on a 4-node
+// DON only 1 slot remains, so maxPossibleSigned=1.
+func TestConfidentialRelayHandler_QuorumUnreachableFailsImmediately(t *testing.T) {
+	t.Parallel()
+	h, cb, don, _ := setupHandlerWithF(t, 4, 1) // F+1=2
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	params := validCapParamsJSON("wf1")
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-unreachable",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		resp, err := cb.Wait(t.Context())
+		if !assert.NoError(t, err) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		assert.Equal(t, api.FatalError, resp.ErrorCode)
+		var jsonResp jsonrpc.Response[json.RawMessage]
+		if !assert.NoError(t, json.Unmarshal(resp.RawResponse, &jsonResp)) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		if assert.NotNil(t, jsonResp.Error) {
+			assert.Contains(t, jsonResp.Error.Message, "relay quorum unreachable")
+		}
+	})
+
+	require.NoError(t, h.HandleJSONRPCUserMessage(t.Context(), req, cb))
+
+	for i := range 3 {
+		errResp := &jsonrpc.Response[json.RawMessage]{
+			Version: jsonrpc.JsonRpcVersion,
+			ID:      req.ID,
+			Method:  MethodCapabilityExec,
+			Error:   &jsonrpc.WireError{Code: jsonrpc.ErrInternal, Message: "execution handler not found"},
+		}
+		require.NoError(t, h.HandleNodeMessage(t.Context(), errResp, fmt.Sprintf("0x%04d", i)))
+	}
+	wg.Wait()
+	require.Nil(t, h.getActiveRequest(req.ID))
+}
+
+// A single user-level node error is enough to explain an unreachable quorum, so
+// the gateway returns that error and its code rather than the generic quorum
+// failure. Here one ErrInvalidParams arrives between two system errors.
+func TestConfidentialRelayHandler_QuorumUnreachablePropagatesUserError(t *testing.T) {
+	t.Parallel()
+	h, cb, don, _ := setupHandlerWithF(t, 4, 1) // F+1=2
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	params := validCapParamsJSON("wf1")
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-user-error",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		resp, err := cb.Wait(t.Context())
+		if !assert.NoError(t, err) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		assert.Equal(t, api.InvalidParamsError, resp.ErrorCode)
+		var jsonResp jsonrpc.Response[json.RawMessage]
+		if !assert.NoError(t, json.Unmarshal(resp.RawResponse, &jsonResp)) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		if assert.NotNil(t, jsonResp.Error) {
+			assert.Equal(t, jsonrpc.ErrInvalidParams, jsonResp.Error.Code)
+			assert.Contains(t, jsonResp.Error.Message, "key does not exist")
+			assert.NotContains(t, jsonResp.Error.Message, "relay quorum unreachable")
+		}
+	})
+
+	require.NoError(t, h.HandleJSONRPCUserMessage(t.Context(), req, cb))
+
+	nodeErrs := []struct {
+		code int64
+		msg  string
+	}{
+		{jsonrpc.ErrInternal, "node unavailable"},
+		{jsonrpc.ErrInvalidParams, "vault error for secret main/API_TOKEN: key does not exist"},
+		{jsonrpc.ErrInternal, "node unavailable"},
+	}
+	for i, ne := range nodeErrs {
+		errResp := &jsonrpc.Response[json.RawMessage]{
+			Version: jsonrpc.JsonRpcVersion,
+			ID:      req.ID,
+			Method:  MethodCapabilityExec,
+			Error:   &jsonrpc.WireError{Code: ne.code, Message: ne.msg},
+		}
+		require.NoError(t, h.HandleNodeMessage(t.Context(), errResp, fmt.Sprintf("0x%04d", i)))
+	}
+	wg.Wait()
+	require.Nil(t, h.getActiveRequest(req.ID))
+}
+
+// Same staging shape, but enough later signed successes arrive to hit 2F+1 signed
+// and forward without waiting for timeout. Uses F=1 so 2F+1=3 is reachable after
+// an initial error+signed mix.
+func TestConfidentialRelayHandler_ForwardsOnceEnoughSignedArrive(t *testing.T) {
+	t.Parallel()
+	h, cb, don, _ := setupHandlerWithF(t, 5, 1) // 2F+1 = 3 signed
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	params := validCapParamsJSON("wf1")
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-signed-threshold",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+	result := relaytypes.CapabilityResponseResult{Payload: "result"}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		resp, err := cb.Wait(t.Context())
+		if !assert.NoError(t, err) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		assert.Equal(t, api.NoError, resp.ErrorCode)
+		var jsonResp jsonrpc.Response[json.RawMessage]
+		if !assert.NoError(t, json.Unmarshal(resp.RawResponse, &jsonResp)) {
+			return
+		}
+		var bundle relaytypes.SignedCapabilityResponseBundle
+		if !assert.NoError(t, json.Unmarshal(*jsonResp.Result, &bundle)) {
+			return
+		}
+		assert.Len(t, bundle.Responses, 3)
+	})
+
+	require.NoError(t, h.HandleJSONRPCUserMessage(t.Context(), req, cb))
+
+	// Two errors + one signed: raw count=3 (= old 2F+1) but signed=1. Stay open.
+	for i := range 2 {
+		errResp := &jsonrpc.Response[json.RawMessage]{
+			Version: jsonrpc.JsonRpcVersion,
+			ID:      req.ID,
+			Method:  MethodCapabilityExec,
+			Error:   &jsonrpc.WireError{Code: -32602, Message: "execution handler for workflow not found"},
+		}
+		require.NoError(t, h.HandleNodeMessage(t.Context(), errResp, fmt.Sprintf("0x%04d", i)))
+	}
+	require.NoError(t, h.HandleNodeMessage(t.Context(),
+		capExecSignedRespPtr(t, req.ID, result, []byte("signer-2")), "0x0002"))
+	require.NotNil(t, h.getActiveRequest(req.ID), "must not forward on raw 2F+1 when most are errors")
+
+	// Two more signed => signed=3 = 2F+1, forward.
+	require.NoError(t, h.HandleNodeMessage(t.Context(),
+		capExecSignedRespPtr(t, req.ID, result, []byte("signer-3")), "0x0003"))
+	require.NoError(t, h.HandleNodeMessage(t.Context(),
+		capExecSignedRespPtr(t, req.ID, result, []byte("signer-4")), "0x0004"))
+	wg.Wait()
+}
+
+// The gateway does not resolve divergent results; it forwards them all and lets the
+// enclave verify signatures and pick the result backed by F+1 valid signers.
+func TestConfidentialRelayHandler_ForwardsAllDivergentResponses(t *testing.T) {
+	t.Parallel()
+	h, cb, don, _ := setupHandler(t, 4)
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	params := validCapParamsJSON("wf1")
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-diverge",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		resp, err := cb.Wait(t.Context())
+		if !assert.NoError(t, err) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		assert.Equal(t, api.NoError, resp.ErrorCode)
+		var jsonResp jsonrpc.Response[json.RawMessage]
+		if !assert.NoError(t, json.Unmarshal(resp.RawResponse, &jsonResp)) {
+			return
+		}
+		var bundle relaytypes.SignedCapabilityResponseBundle
+		if !assert.NoError(t, json.Unmarshal(*jsonResp.Result, &bundle)) {
+			return
+		}
+		assert.Len(t, bundle.Responses, 3, "divergent and matching responses are all forwarded untouched")
+	})
+
+	err := h.HandleJSONRPCUserMessage(t.Context(), req, cb)
+	require.NoError(t, err)
+
+	divergent := relaytypes.CapabilityResponseResult{Payload: "DIVERGENT"}
+	match := relaytypes.CapabilityResponseResult{Payload: "match"}
+	err = h.HandleNodeMessage(t.Context(), capExecSignedRespPtr(t, "req-diverge", divergent, []byte("signer-0")), "0x0000")
+	require.NoError(t, err)
+	err = h.HandleNodeMessage(t.Context(), capExecSignedRespPtr(t, "req-diverge", match, []byte("signer-1")), "0x0001")
+	require.NoError(t, err)
+	err = h.HandleNodeMessage(t.Context(), capExecSignedRespPtr(t, "req-diverge", match, []byte("signer-2")), "0x0002")
+	require.NoError(t, err)
+	wg.Wait()
+}
+
+func TestConfidentialRelayHandler_BundlerErrorReturnsFatal(t *testing.T) {
+	t.Parallel()
+	h, cb, don, _ := setupHandler(t, 4)
+	h.bundler = &mockBundler{err: errors.New("boom")}
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	params := validCapParamsJSON("wf1")
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-bundler-err",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		resp, err := cb.Wait(t.Context())
+		if !assert.NoError(t, err) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		assert.Equal(t, api.FatalError, resp.ErrorCode)
+	})
+
+	require.NoError(t, h.HandleJSONRPCUserMessage(t.Context(), req, cb))
+	result := relaytypes.CapabilityResponseResult{Payload: "x"}
+	for i := range 3 {
+		err := h.HandleNodeMessage(t.Context(), capExecSignedRespPtr(t, "req-bundler-err", result, fmt.Appendf(nil, "s-%d", i)), fmt.Sprintf("0x%04d", i))
+		require.NoError(t, err)
+	}
+	wg.Wait()
+}
+
+// On timeout with fewer than 2F+1 but at least F+1 responses, the gateway forwards
+// what it collected (the bundle may still carry F+1 valid signatures, e.g. if faulty
+// nodes stayed silent) and lets the enclave decide. Here F=1, so 2 responses meet the
+// F+1 floor.
+func TestConfidentialRelayHandler_TimeoutForwardsPartialBundle(t *testing.T) {
+	t.Parallel()
+	// Grace disabled so the expiry path is the only one that can answer here; the
+	// grace window covers the same shape in TestConfidentialRelayHandler_QuorumGrace*.
+	h, cb, don, clock := setupHandlerWithConfig(t, 4, 1, Config{RequestTimeoutSec: 30, QuorumGraceMillis: -1})
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	params := validCapParamsJSON("wf1")
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-partial",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+
+	require.NoError(t, h.HandleJSONRPCUserMessage(t.Context(), req, cb))
+	result := relaytypes.CapabilityResponseResult{Payload: "x"}
+	for i := range 2 { // below 2F+1=3
+		err := h.HandleNodeMessage(t.Context(), capExecSignedRespPtr(t, "req-partial", result, fmt.Appendf(nil, "s-%d", i)), fmt.Sprintf("0x%04d", i))
+		require.NoError(t, err)
+	}
+	require.NotNil(t, h.getActiveRequest(req.ID))
+
+	// The expiry sweep delivers the partial bundle to the callback synchronously,
+	// so we can read it on the main goroutine afterwards.
+	clock.Advance(31 * time.Second)
+	h.removeExpiredRequests(t.Context())
+
+	resp, err := cb.Wait(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, api.NoError, resp.ErrorCode)
+	var jsonResp jsonrpc.Response[json.RawMessage]
+	require.NoError(t, json.Unmarshal(resp.RawResponse, &jsonResp))
+	var bundle relaytypes.SignedCapabilityResponseBundle
+	require.NoError(t, json.Unmarshal(*jsonResp.Result, &bundle))
+	require.Len(t, bundle.Responses, 2)
+}
+
+// On timeout with fewer than F+1 signed responses, the enclave could never reach
+// its F+1-valid-signature quorum, so the gateway skips the futile forward and
+// returns a timeout error directly. Here F=1, so a single response is below the
+// floor.
+func TestConfidentialRelayHandler_TimeoutBelowQuorumFloorReturnsTimeout(t *testing.T) {
+	t.Parallel()
+	h, cb, don, clock := setupHandler(t, 4)
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	params := validCapParamsJSON("wf1")
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-below-floor",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		resp, err := cb.Wait(t.Context())
+		if !assert.NoError(t, err) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		assert.Equal(t, api.RequestTimeoutError, resp.ErrorCode)
+	})
+
+	require.NoError(t, h.HandleJSONRPCUserMessage(t.Context(), req, cb))
+	result := relaytypes.CapabilityResponseResult{Payload: "x"}
+	// One response, below F+1=2.
+	require.NoError(t, h.HandleNodeMessage(t.Context(), capExecSignedRespPtr(t, "req-below-floor", result, []byte("s-0")), "0x0000"))
+	require.NotNil(t, h.getActiveRequest(req.ID))
+
+	clock.Advance(31 * time.Second)
+	h.removeExpiredRequests(t.Context())
+	wg.Wait()
+}
+
+func TestConfidentialRelayHandler_TimeoutNoResponses(t *testing.T) {
+	t.Parallel()
+	h, cb, don, clock := setupHandler(t, 4)
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	params := validCapParamsJSON("wf1")
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-timeout",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		resp, err := cb.Wait(t.Context())
+		if !assert.NoError(t, err) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		assert.Equal(t, api.RequestTimeoutError, resp.ErrorCode)
+	})
+
+	err := h.HandleJSONRPCUserMessage(t.Context(), req, cb)
+	require.NoError(t, err)
+
+	clock.Advance(31 * time.Second)
+	h.removeExpiredRequests(t.Context())
+	wg.Wait()
+}
+
+// Production shape from the staging incident: F=3 / N=10, two nodes answer with
+// JSON-RPC errors and two never answer, so signed tops out at 6 - above minQuorum=4
+// but below earlyNeed=7. Without the grace window the request is held until
+// requestTimeout and the bundle is forwarded after the caller's HTTP deadline has
+// already returned 503.
+func TestConfidentialRelayHandler_QuorumGraceForwardsPartialBundle(t *testing.T) {
+	t.Parallel()
+	h, cb, don, clock := setupHandlerWithF(t, 10, 3)
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	params := validCapParamsJSON("wf1")
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-grace",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+	result := relaytypes.CapabilityResponseResult{Payload: "result"}
+
+	require.NoError(t, h.HandleJSONRPCUserMessage(t.Context(), req, cb))
+
+	for i := range 2 {
+		errResp := &jsonrpc.Response[json.RawMessage]{
+			Version: jsonrpc.JsonRpcVersion,
+			ID:      req.ID,
+			Method:  MethodCapabilityExec,
+			Error:   &jsonrpc.WireError{Code: -32602, Message: "execution handler for workflow not found"},
+		}
+		require.NoError(t, h.HandleNodeMessage(t.Context(), errResp, fmt.Sprintf("0x%04d", i)))
+	}
+	for i := 2; i < 8; i++ {
+		require.NoError(t, h.HandleNodeMessage(t.Context(),
+			capExecSignedRespPtr(t, req.ID, result, fmt.Appendf(nil, "signer-%d", i)),
+			fmt.Sprintf("0x%04d", i),
+		))
+	}
+	require.NotNil(t, h.getActiveRequest(req.ID), "signed=6 is below earlyNeed=7, so the request stays open")
+
+	// The grace window was armed by the 4th signed response and has not elapsed yet.
+	clock.Advance(defaultQuorumGraceMillis*time.Millisecond - time.Second)
+	h.forwardGracedRequests(t.Context())
+	require.NotNil(t, h.getActiveRequest(req.ID), "must not forward before the grace window elapses")
+
+	// The sweep delivers the bundle to the callback synchronously, so it can be read
+	// on this goroutine afterwards.
+	clock.Advance(2 * time.Second)
+	h.forwardGracedRequests(t.Context())
+
+	resp, err := cb.Wait(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, api.NoError, resp.ErrorCode)
+	var jsonResp jsonrpc.Response[json.RawMessage]
+	require.NoError(t, json.Unmarshal(resp.RawResponse, &jsonResp))
+	var bundle relaytypes.SignedCapabilityResponseBundle
+	require.NoError(t, json.Unmarshal(*jsonResp.Result, &bundle))
+	require.Len(t, bundle.Responses, 6, "every collected signed response is forwarded")
+	require.Nil(t, h.getActiveRequest(req.ID))
+}
+
+// The grace window only bounds the wait; reaching earlyNeed still forwards
+// immediately, and the pending timer must not answer the request a second time.
+func TestConfidentialRelayHandler_QuorumGraceYieldsToEarlyForward(t *testing.T) {
+	t.Parallel()
+	h, cb, don, clock := setupHandler(t, 4) // F=1: minQuorum=2, earlyNeed=3
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	params := validCapParamsJSON("wf1")
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-grace-early",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+	result := relaytypes.CapabilityResponseResult{Payload: "result"}
+
+	require.NoError(t, h.HandleJSONRPCUserMessage(t.Context(), req, cb))
+	for i := range 3 {
+		require.NoError(t, h.HandleNodeMessage(t.Context(),
+			capExecSignedRespPtr(t, req.ID, result, fmt.Appendf(nil, "signer-%d", i)),
+			fmt.Sprintf("0x%04d", i),
+		))
+	}
+
+	resp, err := cb.Wait(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, api.NoError, resp.ErrorCode)
+	require.Nil(t, h.getActiveRequest(req.ID))
+
+	// The grace window armed at the second signed response outlives the forward; the
+	// sweep must not resurrect or re-answer a completed request.
+	clock.Advance(2 * defaultQuorumGraceMillis * time.Millisecond)
+	h.forwardGracedRequests(t.Context())
+	require.Nil(t, h.getActiveRequest(req.ID))
+}
+
+// A request that never reaches minQuorum arms no grace timer and is left to expiry.
+func TestConfidentialRelayHandler_QuorumGraceNotArmedBelowQuorum(t *testing.T) {
+	t.Parallel()
+	h, cb, don, clock := setupHandler(t, 4) // F=1: minQuorum=2
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	params := validCapParamsJSON("wf1")
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-grace-below",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+	result := relaytypes.CapabilityResponseResult{Payload: "result"}
+
+	require.NoError(t, h.HandleJSONRPCUserMessage(t.Context(), req, cb))
+	require.NoError(t, h.HandleNodeMessage(t.Context(),
+		capExecSignedRespPtr(t, req.ID, result, []byte("signer-0")), "0x0000"))
+
+	ar := h.getActiveRequest(req.ID)
+	require.NotNil(t, ar)
+	require.False(t, ar.graceStarted.Load(), "one signed response is below minQuorum=2")
+
+	clock.Advance(2 * defaultQuorumGraceMillis * time.Millisecond)
+	h.forwardGracedRequests(t.Context())
+	require.NotNil(t, h.getActiveRequest(req.ID), "only expiry may complete a below-quorum request")
+}
+
+func TestConfidentialRelayHandler_QuorumGraceConfig(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name        string
+		cfg         Config
+		wantGraceMs int64
+	}{
+		{"defaults when unset", Config{}, defaultQuorumGraceMillis},
+		{"honours explicit value", Config{RequestTimeoutSec: 30, QuorumGraceMillis: 2500}, 2500},
+		{"clamped to request timeout", Config{RequestTimeoutSec: 5, QuorumGraceMillis: 20000}, 5000},
+		{"default clamped by short request timeout", Config{RequestTimeoutSec: 3}, 3000},
+		{"negative disables the grace window", Config{RequestTimeoutSec: 30, QuorumGraceMillis: -1}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			lggr := logger.Test(t)
+			methodConfig, err := json.Marshal(tc.cfg)
+			require.NoError(t, err)
+			donConfig := &config.DONConfig{DonID: "test_relay_don", F: 1, Members: []config.NodeConfig{nodeOne}}
+			limitsFactory := limits.Factory{Settings: cresettings.DefaultGetter, Logger: lggr}
+
+			h, err := NewHandler(methodConfig, donConfig, mocks.NewDON(t), lggr, clockwork.NewFakeClock(), limitsFactory)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.wantGraceMs, h.quorumGrace.Milliseconds())
+			assert.LessOrEqual(t, h.quorumGrace, h.requestTimeout)
+		})
+	}
+}
+
+func TestConfidentialRelayHandler_DuplicateRequestID(t *testing.T) {
+	t.Parallel()
+	h, cb, don, _ := setupHandler(t, 4)
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	params := json.RawMessage(`{"workflow_id":"wf1"}`)
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-dup",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+
+	err := h.HandleJSONRPCUserMessage(t.Context(), req, cb)
+	require.NoError(t, err)
+
+	cb2 := common.NewCallback()
+	err = h.HandleJSONRPCUserMessage(t.Context(), req, cb2)
+	require.ErrorContains(t, err, "request ID already exists")
+}
+
+func TestConfidentialRelayHandler_RateLimitedNode(t *testing.T) {
+	t.Parallel()
+	handlerConfig := Config{
+		RequestTimeoutSec: 30,
+	}
+	methodConfig, err := json.Marshal(handlerConfig)
+	require.NoError(t, err)
+
+	lggr := logger.Test(t)
+	don := mocks.NewDON(t)
+	// F=0 so the forward threshold (2F+1) is 1: a single response from the one-node
+	// DON forwards immediately, isolating the rate-limit behavior under test.
+	donConfig := &config.DONConfig{
+		DonID:   "test_relay_don",
+		F:       0,
+		Members: []config.NodeConfig{nodeOne},
+	}
+	clock := clockwork.NewFakeClock()
+	limitsFactory := limits.Factory{Settings: cresettings.DefaultGetter, Logger: lggr}
+	h, err := NewHandler(methodConfig, donConfig, don, lggr, clock, limitsFactory)
+	require.NoError(t, err)
+	h.globalNodeRateLimiter = limits.GlobalRateLimiter(rate.Limit(100), 100)
+	h.perNodeRateLimiters[nodeOne.Address] = limits.GlobalRateLimiter(rate.Limit(0.001), 1)
+
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	cb := common.NewCallback()
+	params := json.RawMessage(`{"workflow_id":"wf1"}`)
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-ratelimit",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+
+	err = h.HandleJSONRPCUserMessage(t.Context(), req, cb)
+	require.NoError(t, err)
+
+	resultData := json.RawMessage(`{"result":{"payload":"r"},"signature":{}}`)
+	response := jsonrpc.Response[json.RawMessage]{
+		Version: jsonrpc.JsonRpcVersion,
+		ID:      "req-ratelimit",
+		Method:  MethodCapabilityExec,
+		Result:  &resultData,
+	}
+
+	// First response from node uses the burst allowance
+	err = h.HandleNodeMessage(t.Context(), &response, nodeOne.Address)
+	require.NoError(t, err)
+
+	// Verify callback was called
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	resp, err := cb.Wait(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, api.NoError, resp.ErrorCode)
+
+	// Start a new request
+	cb2 := common.NewCallback()
+	req2 := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-ratelimit-2",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+	err = h.HandleJSONRPCUserMessage(t.Context(), req2, cb2)
+	require.NoError(t, err)
+
+	response2 := jsonrpc.Response[json.RawMessage]{
+		Version: jsonrpc.JsonRpcVersion,
+		ID:      "req-ratelimit-2",
+		Method:  MethodCapabilityExec,
+		Result:  &resultData,
+	}
+
+	// Second response should be rate limited (silently dropped)
+	err = h.HandleNodeMessage(t.Context(), &response2, nodeOne.Address)
+	require.NoError(t, err)
+
+	// Callback should NOT be called - verify with timeout
+	ctx2, cancel2 := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel2()
+	_, err = cb2.Wait(ctx2)
+	require.Error(t, err) // Should timeout
+}
+
+func TestConfidentialRelayHandler_LateNodeResponse(t *testing.T) {
+	t.Parallel()
+	h, cb, _, _ := setupHandler(t, 4)
+
+	resultData := json.RawMessage(`{"result":{},"signature":{}}`)
+	staleResponse := jsonrpc.Response[json.RawMessage]{
+		Version: jsonrpc.JsonRpcVersion,
+		ID:      "nonexistent-request",
+		Method:  MethodCapabilityExec,
+		Result:  &resultData,
+	}
+
+	// This should not error, just silently ignore
+	err := h.HandleNodeMessage(t.Context(), &staleResponse, "0x0000")
+	require.NoError(t, err)
+
+	// Verify callback was not triggered
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	_, err = cb.Wait(ctx)
+	require.Error(t, err)
+}
+
+func TestConfidentialRelayHandler_AllNodesFanOutFail(t *testing.T) {
+	t.Parallel()
+	h, cb, don, _ := setupHandler(t, 4)
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(errors.New("connection refused"))
+
+	params := json.RawMessage(`{"workflow_id":"wf1"}`)
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-allfail",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		resp, err := cb.Wait(t.Context())
+		if !assert.NoError(t, err) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		assert.Equal(t, api.FatalError, resp.ErrorCode)
+		var jsonResp jsonrpc.Response[json.RawMessage]
+		err = json.Unmarshal(resp.RawResponse, &jsonResp)
+		if !assert.NoError(t, err) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		assert.Contains(t, jsonResp.Error.Message, "failed to forward user request to nodes")
+	})
+
+	err := h.HandleJSONRPCUserMessage(t.Context(), req, cb)
+	require.NoError(t, err)
+	wg.Wait()
+}
+
+func TestConfidentialRelayHandler_FanOutWaitsWhileQuorumStillPossible(t *testing.T) {
+	t.Parallel()
+	h, cb, don, _ := setupHandler(t, 4)
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(
+		func(_ context.Context, nodeAddress string, _ *jsonrpc.Request[json.RawMessage]) error {
+			switch nodeAddress {
+			case "0x0000", "0x0001":
+				return errors.New("connection refused")
+			default:
+				return nil
+			}
+		},
+	)
+
+	params := json.RawMessage(`{"workflow_id":"wf1"}`)
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-still-possible",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+
+	err := h.HandleJSONRPCUserMessage(t.Context(), req, cb)
+	require.NoError(t, err)
+
+	require.NotNil(t, h.getActiveRequest(req.ID), "request should remain active while quorum is still possible")
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	_, err = cb.Wait(ctx)
+	require.Error(t, err)
+}
+
+func TestConfidentialRelayHandler_FanOutFailsWhenQuorumBecomesImpossible(t *testing.T) {
+	t.Parallel()
+	h, cb, don, _ := setupHandler(t, 4)
+	don.On("SendToNode", mock.Anything, mock.Anything, mock.Anything).Return(
+		func(_ context.Context, nodeAddress string, _ *jsonrpc.Request[json.RawMessage]) error {
+			switch nodeAddress {
+			case "0x0000", "0x0001", "0x0002":
+				return errors.New("connection refused")
+			default:
+				return nil
+			}
+		},
+	)
+
+	params := json.RawMessage(`{"workflow_id":"wf1"}`)
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-quorum-impossible",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		resp, err := cb.Wait(t.Context())
+		if !assert.NoError(t, err) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		assert.Equal(t, api.FatalError, resp.ErrorCode)
+		var jsonResp jsonrpc.Response[json.RawMessage]
+		err = json.Unmarshal(resp.RawResponse, &jsonResp)
+		if !assert.NoError(t, err) { //nolint:testifylint // require illegal inside wg.Go goroutine
+			return
+		}
+		assert.Contains(t, jsonResp.Error.Message, "failed to forward user request to nodes")
+	})
+
+	err := h.HandleJSONRPCUserMessage(t.Context(), req, cb)
+	require.NoError(t, err)
+	wg.Wait()
+
+	require.Nil(t, h.getActiveRequest(req.ID), "request should be cleaned up once quorum is impossible")
+}
+
+func TestConfidentialRelayHandler_FanOutToNodes_IsConcurrent(t *testing.T) {
+	t.Parallel()
+	lggr := logger.Test(t)
+	don := newBarrierDON(2)
+	donConfig := &config.DONConfig{
+		DonID: "test_relay_don",
+		F:     1,
+		Members: []config.NodeConfig{
+			{Name: "node0", Address: "0x0000"},
+			{Name: "node1", Address: "0x0001"},
+		},
+	}
+
+	methodConfig, err := json.Marshal(Config{
+		RequestTimeoutSec: 30,
+	})
+	require.NoError(t, err)
+
+	limitsFactory := limits.Factory{Settings: cresettings.DefaultGetter, Logger: lggr}
+	h, err := NewHandler(methodConfig, donConfig, don, lggr, clockwork.NewFakeClock(), limitsFactory)
+	require.NoError(t, err)
+
+	cb := common.NewCallback()
+	params := json.RawMessage(`{"workflow_id":"wf1"}`)
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-concurrent-fanout",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- h.HandleJSONRPCUserMessage(ctx, req, cb)
+	}()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(100 * time.Millisecond):
+		cancel()
+		<-done
+		t.Fatal("HandleJSONRPCUserMessage did not fan out to nodes concurrently")
+	}
+
+	don.mu.Lock()
+	started := don.started
+	don.mu.Unlock()
+	assert.Equal(t, 2, started)
+}
+
+func TestConfidentialRelayHandler_NodeSendTimeoutConfig(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		cfg        Config
+		wantSendMs int64
+	}{
+		{"defaults when unset", Config{}, defaultNodeSendTimeoutSec * 1000},
+		{"honours explicit value", Config{RequestTimeoutSec: 30, NodeSendTimeoutSec: 5}, 5000},
+		{"clamped to request timeout", Config{RequestTimeoutSec: 3, NodeSendTimeoutSec: 45}, 3000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			lggr := logger.Test(t)
+			methodConfig, err := json.Marshal(tc.cfg)
+			require.NoError(t, err)
+			donConfig := &config.DONConfig{DonID: "test_relay_don", F: 1, Members: []config.NodeConfig{nodeOne}}
+			limitsFactory := limits.Factory{Settings: cresettings.DefaultGetter, Logger: lggr}
+
+			h, err := NewHandler(methodConfig, donConfig, mocks.NewDON(t), lggr, clockwork.NewFakeClock(), limitsFactory)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.wantSendMs, h.nodeSendTimeout.Milliseconds())
+			assert.LessOrEqual(t, h.nodeSendTimeout, h.requestTimeout)
+		})
+	}
+}
+
+// A node that never drains its socket must not hold the request open. Before the per-send
+// bound, group.Wait blocked until the caller's context expired, and because the gateway only
+// reads the response callback after the handler returns, a bundle that had already reached
+// quorum was discarded in favour of a client timeout.
+func TestConfidentialRelayHandler_BlockedNodeDoesNotStallFanOut(t *testing.T) {
+	t.Parallel()
+	lggr := logger.Test(t)
+	don := &blockedDON{blockedAddr: "0x0002"}
+	donConfig := &config.DONConfig{
+		DonID: "test_relay_don",
+		F:     1,
+		Members: []config.NodeConfig{
+			{Name: "node0", Address: "0x0000"},
+			{Name: "node1", Address: "0x0001"},
+			{Name: "node2", Address: "0x0002"},
+			{Name: "node3", Address: "0x0003"},
+		},
+	}
+
+	methodConfig, err := json.Marshal(Config{RequestTimeoutSec: 30})
+	require.NoError(t, err)
+	limitsFactory := limits.Factory{Settings: cresettings.DefaultGetter, Logger: lggr}
+	h, err := NewHandler(methodConfig, donConfig, don, lggr, clockwork.NewFakeClock(), limitsFactory)
+	require.NoError(t, err)
+	// Shortened so the test exercises the bound without waiting the production default.
+	h.nodeSendTimeout = 50 * time.Millisecond
+
+	params := json.RawMessage(`{"workflow_id":"wf1"}`)
+	req := jsonrpc.Request[json.RawMessage]{
+		ID:     "req-blocked-node",
+		Method: MethodCapabilityExec,
+		Params: &params,
+	}
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		done <- h.HandleJSONRPCUserMessage(t.Context(), req, common.NewCallback())
+	}()
+
+	select {
+	case fanOutErr := <-done:
+		// Three of four nodes still received the request, so quorum remains possible and the
+		// blocked node is reported as a node error rather than a request failure.
+		require.NoError(t, fanOutErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("fan-out stalled on the blocked node instead of bounding the send")
+	}
+
+	assert.Less(t, time.Since(start), h.requestTimeout, "fan-out must return well inside the request timeout")
+	assert.Equal(t, 3, don.deliveredCount(), "healthy nodes should all receive the request")
+}
+
+func capExecSignedRespPtr(t *testing.T, id string, result relaytypes.CapabilityResponseResult, signer []byte) *jsonrpc.Response[json.RawMessage] {
+	r := capExecSignedResponse(t, id, result, signer)
+	return &r
+}

@@ -11,32 +11,34 @@ import (
 	"testing"
 	"time"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/txmgr"
+	gethTypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/robfig/cron/v3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"github.com/jmoiron/sqlx"
-
-	evmclient "github.com/smartcontractkit/chainlink/v2/core/chains/evm/client"
-	evmtypes "github.com/smartcontractkit/chainlink/v2/core/chains/evm/types"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm"
-	evmmocks "github.com/smartcontractkit/chainlink/v2/core/chains/legacyevm/mocks"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-common/pkg/types"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
+	evmclient "github.com/smartcontractkit/chainlink-evm/pkg/client"
+	"github.com/smartcontractkit/chainlink-evm/pkg/config/toml"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr"
+	evmtypes "github.com/smartcontractkit/chainlink-evm/pkg/types"
+	evmmocks "github.com/smartcontractkit/chainlink/v2/common/chains/mocks"
 	"github.com/smartcontractkit/chainlink/v2/core/cmd"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/evmtest"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
 	"github.com/smartcontractkit/chainlink/v2/core/sessions"
 	"github.com/smartcontractkit/chainlink/v2/core/web"
-
-	gethTypes "github.com/ethereum/go-ethereum/core/types"
-	"github.com/robfig/cron/v3"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // MockSubscription a mock subscription
 type MockSubscription struct {
 	t            testing.TB
 	mut          sync.Mutex
-	channel      interface{}
+	channel      any
 	unsubscribed bool
 	Errors       chan error
 }
@@ -58,13 +60,13 @@ func (mes *MockSubscription) Unsubscribe() {
 		return
 	}
 	mes.unsubscribed = true
-	switch mes.channel.(type) {
+	switch c := mes.channel.(type) {
 	case chan struct{}:
-		close(mes.channel.(chan struct{}))
+		close(c)
 	case chan gethTypes.Log:
-		close(mes.channel.(chan gethTypes.Log))
+		close(c)
 	case chan *evmtypes.Head:
-		close(mes.channel.(chan *evmtypes.Head))
+		close(c)
 	default:
 		logger.TestLogger(mes.t).Fatalf("Unable to close MockSubscription channel of type %T", mes.channel)
 	}
@@ -73,11 +75,11 @@ func (mes *MockSubscription) Unsubscribe() {
 
 // RendererMock a mock renderer
 type RendererMock struct {
-	Renders []interface{}
+	Renders []any
 }
 
 // Render appends values to renderer mock
-func (rm *RendererMock) Render(v interface{}, headers ...string) error {
+func (rm *RendererMock) Render(v any, headers ...string) error {
 	rm.Renders = append(rm.Renders, v)
 	return nil
 }
@@ -88,7 +90,7 @@ type InstanceAppFactory struct {
 }
 
 // NewApplication creates a new application with specified config
-func (f InstanceAppFactory) NewApplication(context.Context, chainlink.GeneralConfig, logger.Logger, *sqlx.DB) (chainlink.Application, error) {
+func (f InstanceAppFactory) NewApplication(context.Context, chainlink.GeneralConfig, logger.Logger, prometheus.Registerer, sqlutil.DataSource, keystore.Master) (chainlink.Application, error) {
 	return f.App, nil
 }
 
@@ -96,7 +98,7 @@ type seededAppFactory struct {
 	Application chainlink.Application
 }
 
-func (s seededAppFactory) NewApplication(context.Context, chainlink.GeneralConfig, logger.Logger, *sqlx.DB) (chainlink.Application, error) {
+func (s seededAppFactory) NewApplication(context.Context, chainlink.GeneralConfig, logger.Logger, prometheus.Registerer, sqlutil.DataSource, keystore.Master) (chainlink.Application, error) {
 	return noopStopApplication{s.Application}, nil
 }
 
@@ -165,7 +167,7 @@ func NewHTTPMockServer(
 	response string,
 	callback ...func(http.Header, string),
 ) *httptest.Server {
-	called := false
+	var called atomic.Bool
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
 		assert.NoError(t, err)
@@ -173,7 +175,7 @@ func NewHTTPMockServer(
 		if len(callback) > 0 {
 			callback[0](r.Header, string(b))
 		}
-		called = true
+		called.Store(true)
 
 		w.WriteHeader(status)
 		_, _ = io.WriteString(w, response) // Assignment for errcheck. Only used in tests so we can ignore.
@@ -182,7 +184,7 @@ func NewHTTPMockServer(
 	server := httptest.NewServer(handler)
 	t.Cleanup(func() {
 		server.Close()
-		assert.True(t, called, "expected call Mock HTTP endpoint '%s'", server.URL)
+		assert.True(t, called.Load(), "expected call Mock HTTP endpoint '%s'", server.URL)
 	})
 	return server
 }
@@ -271,21 +273,6 @@ type MockCronEntry struct {
 	Function func()
 }
 
-// MockHeadTrackable allows you to mock HeadTrackable
-type MockHeadTrackable struct {
-	onNewHeadCount atomic.Int32
-}
-
-// OnNewLongestChain increases the OnNewLongestChainCount count by one
-func (m *MockHeadTrackable) OnNewLongestChain(context.Context, *evmtypes.Head) {
-	m.onNewHeadCount.Add(1)
-}
-
-// OnNewLongestChainCount returns the count of new heads, safely.
-func (m *MockHeadTrackable) OnNewLongestChainCount() int32 {
-	return m.onNewHeadCount.Load()
-}
-
 // NeverSleeper is a struct that never sleeps
 type NeverSleeper struct{}
 
@@ -312,10 +299,11 @@ func MustRandomUser(t testing.TB) sessions.User {
 }
 
 func NewUserWithSession(t testing.TB, orm sessions.AuthenticationProvider) sessions.User {
+	ctx := t.Context()
 	u := MustRandomUser(t)
-	require.NoError(t, orm.CreateUser(&u))
+	require.NoError(t, orm.CreateUser(ctx, &u))
 
-	_, err := orm.CreateSession(sessions.SessionRequest{
+	_, err := orm.CreateSession(ctx, sessions.SessionRequest{
 		Email:    u.Email,
 		Password: Password,
 	})
@@ -332,13 +320,13 @@ func NewMockAPIInitializer(t testing.TB) *MockAPIInitializer {
 	return &MockAPIInitializer{t: t}
 }
 
-func (m *MockAPIInitializer) Initialize(orm sessions.BasicAdminUsersORM, lggr logger.Logger) (sessions.User, error) {
-	if user, err := orm.FindUser(APIEmailAdmin); err == nil {
-		return user, err
+func (m *MockAPIInitializer) Initialize(ctx context.Context, orm sessions.BasicAdminUsersORM, lggr logger.Logger) (sessions.User, error) {
+	if user, err := orm.FindUser(ctx, APIEmailAdmin); err == nil {
+		return user, nil
 	}
 	m.Count++
 	user := MustRandomUser(m.t)
-	return user, orm.CreateUser(&user)
+	return user, orm.CreateUser(ctx, &user)
 }
 
 func NewMockAuthenticatedHTTPClient(lggr logger.Logger, cfg cmd.ClientOpts, sessionID string) cmd.HTTPClient {
@@ -399,19 +387,19 @@ func (m MockPasswordPrompter) Prompt() string {
 	return m.Password
 }
 
-func NewLegacyChainsWithMockChain(t testing.TB, ethClient evmclient.Client, cfg legacyevm.AppConfig) legacyevm.LegacyChainContainer {
+func NewLegacyChainsWithMockChain(t testing.TB, ethClient evmclient.Client, cfg toml.HasEVMConfigs) legacyevm.LegacyChainContainer {
 	ch := new(evmmocks.Chain)
 	ch.On("Client").Return(ethClient)
 	ch.On("Logger").Return(logger.TestLogger(t))
 	scopedCfg := evmtest.NewChainScopedConfig(t, cfg)
 	ch.On("ID").Return(scopedCfg.EVM().ChainID())
 	ch.On("Config").Return(scopedCfg)
+	ch.On("HeadTracker").Return(nil)
 
-	return NewLegacyChainsWithChain(ch, cfg)
-
+	return NewLegacyChainsWithChain(ch)
 }
 
-func NewLegacyChainsWithMockChainAndTxManager(t testing.TB, ethClient evmclient.Client, cfg legacyevm.AppConfig, txm txmgr.TxManager) legacyevm.LegacyChainContainer {
+func NewLegacyChainsWithMockChainAndTxManager(t testing.TB, ethClient evmclient.Client, cfg toml.HasEVMConfigs, txm txmgr.TxManager) legacyevm.LegacyChainContainer {
 	ch := new(evmmocks.Chain)
 	ch.On("Client").Return(ethClient)
 	ch.On("Logger").Return(logger.TestLogger(t))
@@ -420,10 +408,10 @@ func NewLegacyChainsWithMockChainAndTxManager(t testing.TB, ethClient evmclient.
 	ch.On("Config").Return(scopedCfg)
 	ch.On("TxManager").Return(txm)
 
-	return NewLegacyChainsWithChain(ch, cfg)
+	return NewLegacyChainsWithChain(ch)
 }
 
-func NewLegacyChainsWithChain(ch legacyevm.Chain, cfg legacyevm.AppConfig) legacyevm.LegacyChainContainer {
-	m := map[string]legacyevm.Chain{ch.ID().String(): ch}
-	return legacyevm.NewLegacyChains(m, cfg.EVMConfigs())
+func NewLegacyChainsWithChain(ch legacyevm.Chain) legacyevm.LegacyChainContainer {
+	m := map[string]types.ChainService{ch.ID().String(): ch}
+	return legacyevm.NewLegacyChains(m)
 }

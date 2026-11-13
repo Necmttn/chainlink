@@ -10,21 +10,22 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/guregu/null.v4"
 
+	"github.com/smartcontractkit/chainlink-common/pkg/utils/jsonserializable"
 	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 )
 
 func TestRun_Status(t *testing.T) {
 	t.Parallel()
 
-	assert.Equal(t, pipeline.RunStatusUnknown.Finished(), false)
-	assert.Equal(t, pipeline.RunStatusRunning.Finished(), false)
-	assert.Equal(t, pipeline.RunStatusCompleted.Finished(), true)
-	assert.Equal(t, pipeline.RunStatusErrored.Finished(), true)
+	assert.False(t, pipeline.RunStatusUnknown.Finished())
+	assert.False(t, pipeline.RunStatusRunning.Finished())
+	assert.True(t, pipeline.RunStatusCompleted.Finished())
+	assert.True(t, pipeline.RunStatusErrored.Finished())
 
-	assert.Equal(t, pipeline.RunStatusUnknown.Errored(), false)
-	assert.Equal(t, pipeline.RunStatusRunning.Errored(), false)
-	assert.Equal(t, pipeline.RunStatusCompleted.Errored(), false)
-	assert.Equal(t, pipeline.RunStatusErrored.Errored(), true)
+	assert.False(t, pipeline.RunStatusUnknown.Errored())
+	assert.False(t, pipeline.RunStatusRunning.Errored())
+	assert.False(t, pipeline.RunStatusCompleted.Errored())
+	assert.True(t, pipeline.RunStatusErrored.Errored())
 
 	now := null.TimeFrom(time.Now())
 
@@ -38,7 +39,7 @@ func TestRun_Status(t *testing.T) {
 			run: &pipeline.Run{
 				AllErrors:   pipeline.RunErrors{},
 				FatalErrors: pipeline.RunErrors{},
-				Outputs:     pipeline.JSONSerializable{},
+				Outputs:     jsonserializable.JSONSerializable{},
 				FinishedAt:  null.Time{},
 			},
 			want: pipeline.RunStatusRunning,
@@ -48,7 +49,7 @@ func TestRun_Status(t *testing.T) {
 			run: &pipeline.Run{
 				AllErrors:   pipeline.RunErrors{},
 				FatalErrors: pipeline.RunErrors{},
-				Outputs:     pipeline.JSONSerializable{Val: []interface{}{10, 10}, Valid: true},
+				Outputs:     jsonserializable.JSONSerializable{Val: []any{10, 10}, Valid: true},
 				FinishedAt:  now,
 			},
 			want: pipeline.RunStatusCompleted,
@@ -58,7 +59,7 @@ func TestRun_Status(t *testing.T) {
 			run: &pipeline.Run{
 				AllErrors:   pipeline.RunErrors{null.StringFrom(errors.New("fail").Error())},
 				FatalErrors: pipeline.RunErrors{null.StringFrom(errors.New("fail").Error())},
-				Outputs:     pipeline.JSONSerializable{},
+				Outputs:     jsonserializable.JSONSerializable{},
 				FinishedAt:  null.Time{},
 			},
 			want: pipeline.RunStatusErrored,
@@ -73,12 +74,11 @@ func TestRun_Status(t *testing.T) {
 }
 
 func TestRunErrors_ToError(t *testing.T) {
-	runErrors := pipeline.RunErrors{}
+	runErrors := make(pipeline.RunErrors, 0, 3)
 	runErrors = append(runErrors, null.NewString("bad thing happened", true))
 	runErrors = append(runErrors, null.NewString("pretty bad thing happened", true))
 	runErrors = append(runErrors, null.NewString("", false))
-	expected := errors.New("bad thing happened; pretty bad thing happened")
-	require.Equal(t, expected.Error(), runErrors.ToError().Error())
+	require.ErrorContains(t, runErrors.ToError(), "bad thing happened\npretty bad thing happened")
 }
 
 func TestRun_StringOutputs(t *testing.T) {
@@ -86,12 +86,12 @@ func TestRun_StringOutputs(t *testing.T) {
 
 	t.Run("invalid outputs", func(t *testing.T) {
 		run := &pipeline.Run{
-			Outputs: pipeline.JSONSerializable{
+			Outputs: jsonserializable.JSONSerializable{
 				Valid: false,
 			},
 		}
 		outputs, err := run.StringOutputs()
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Empty(t, outputs)
 	})
 
@@ -100,7 +100,7 @@ func TestRun_StringOutputs(t *testing.T) {
 
 	testCases := []struct {
 		name string
-		val  interface{}
+		val  any
 		want string
 	}{
 		{"int64", int64(123), "123"},
@@ -116,14 +116,14 @@ func TestRun_StringOutputs(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			run := &pipeline.Run{
-				Outputs: pipeline.JSONSerializable{
+				Outputs: jsonserializable.JSONSerializable{
 					Valid: true,
-					Val:   []interface{}{tc.val},
+					Val:   []any{tc.val},
 				},
 			}
 			t.Log(tc.val)
 			outputs, err := run.StringOutputs()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.NotNil(t, outputs)
 			assert.Len(t, outputs, 1)
 			assert.Equal(t, tc.want, *outputs[0])

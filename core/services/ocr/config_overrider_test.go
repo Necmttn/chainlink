@@ -15,18 +15,18 @@ import (
 	ocrtypes "github.com/smartcontractkit/libocr/offchainreporting/types"
 
 	"github.com/smartcontractkit/chainlink-common/pkg/services/servicetest"
-	evmutils "github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils"
+	"github.com/smartcontractkit/chainlink-evm/pkg/types"
+	evmutils "github.com/smartcontractkit/chainlink-evm/pkg/utils"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/v2/core/internal/mocks"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
-	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
 	"github.com/smartcontractkit/chainlink/v2/core/services/ocr"
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
 )
 
 type configOverriderUni struct {
 	overrider       *ocr.ConfigOverriderImpl
-	contractAddress ethkey.EIP55Address
+	contractAddress types.EIP55Address
 }
 
 type deltaCConfig struct{}
@@ -56,6 +56,10 @@ func newConfigOverriderUni(t *testing.T, pollITicker utils.TickerBase, flagsCont
 }
 
 func TestIntegration_OCRConfigOverrider_EntersHibernation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
 	g := gomega.NewWithT(t)
 
 	flagsContract := mocks.NewFlags(t)
@@ -164,10 +168,10 @@ func Test_OCRConfigOverrider(t *testing.T) {
 		flagsContract := mocks.NewFlags(t)
 		flags := &ocr.ContractFlags{FlagsInterface: flagsContract}
 
-		address1, err := ethkey.NewEIP55Address(common.BigToAddress(big.NewInt(10000)).Hex())
+		address1, err := types.NewEIP55Address(common.BigToAddress(big.NewInt(10000)).Hex())
 		require.NoError(t, err)
 
-		address2, err := ethkey.NewEIP55Address(common.BigToAddress(big.NewInt(1234567890)).Hex())
+		address2, err := types.NewEIP55Address(common.BigToAddress(big.NewInt(1234567890)).Hex())
 		require.NoError(t, err)
 
 		overrider1a, err := ocr.NewConfigOverriderImpl(testLogger, deltaCConfig{}, address1, flags, nil)
@@ -185,7 +189,7 @@ func Test_OCRConfigOverrider(t *testing.T) {
 	})
 }
 
-func checkFlagsAddress(t *testing.T, contractAddress ethkey.EIP55Address) func(args mock.Arguments) {
+func checkFlagsAddress(t *testing.T, contractAddress types.EIP55Address) func(args mock.Arguments) {
 	return func(args mock.Arguments) {
 		require.Equal(t, []common.Address{
 			evmutils.ZeroAddress,

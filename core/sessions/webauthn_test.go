@@ -3,6 +3,7 @@ package sessions
 import (
 	"encoding/json"
 	"fmt"
+	mrand "math/rand"
 	"testing"
 
 	"github.com/go-webauthn/webauthn/protocol"
@@ -29,7 +30,7 @@ func TestWebAuthnSessionStore(t *testing.T) {
 	s := NewWebAuthnSessionStore()
 
 	val, ok := s.take(key)
-	assert.Equal(t, "", val)
+	assert.Empty(t, val)
 	require.False(t, ok)
 
 	require.NoError(t, s.SaveWebauthnSession(key, &data))
@@ -39,11 +40,11 @@ func TestWebAuthnSessionStore(t *testing.T) {
 	assert.Equal(t, data, got)
 
 	val, ok = s.take(key)
-	assert.Equal(t, "", val)
+	assert.Empty(t, val)
 	require.False(t, ok)
 
 	_, err = s.GetWebauthnSession(key)
-	assert.ErrorContains(t, err, "assertion not in challenge store")
+	require.ErrorContains(t, err, "assertion not in challenge store")
 
 	user := mustRandomUser(t)
 	cred := webauthn.Credential{
@@ -62,7 +63,7 @@ func TestWebAuthnSessionStore(t *testing.T) {
 	wcfg := WebAuthnConfiguration{RPID: "test-rpid", RPOrigin: "test-rporigin"}
 	cc, err := s.BeginWebAuthnRegistration(user, uwas, wcfg)
 	require.NoError(t, err)
-	require.Equal(t, "Chainlink Operator", cc.Response.RelyingParty.CredentialEntity.Name)
+	require.Equal(t, "Chainlink Operator", cc.Response.RelyingParty.Name)
 	require.Equal(t, "test-rpid", cc.Response.RelyingParty.ID)
 	require.Equal(t, user.Email, cc.Response.User.Name)
 	require.Equal(t, user.Email, cc.Response.User.DisplayName)
@@ -71,8 +72,22 @@ func TestWebAuthnSessionStore(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestBeginWebAuthnRegistration_EmptyRPOrigin(t *testing.T) {
+	t.Parallel()
+
+	s := NewWebAuthnSessionStore()
+	user := mustRandomUser(t)
+
+	// An empty RPOrigin must still fail at construction time, matching
+	// go-webauthn's own validation, rather than silently producing a
+	// RelyingParty with no allowed origins.
+	wcfg := WebAuthnConfiguration{RPID: "test-rpid", RPOrigin: ""}
+	_, err := s.BeginWebAuthnRegistration(user, nil, wcfg)
+	require.ErrorContains(t, err, "RPOrigins")
+}
+
 func mustRandomUser(t testing.TB) User {
-	email := fmt.Sprintf("user-%v@chainlink.test", testutils.NewRandomPositiveInt64())
+	email := fmt.Sprintf("user-%v@chainlink.test", mrand.Int63())
 	r, err := NewUser(email, testutils.Password, UserRoleAdmin)
 	if err != nil {
 		t.Fatal(err)

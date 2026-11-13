@@ -24,6 +24,21 @@ func Test_NewChainType(t *testing.T) {
 			want: ChainTypeEVM,
 		},
 		{
+			name: "Starknet Chain Type",
+			give: "STARKNET",
+			want: ChainTypeStarknet,
+		},
+		{
+			name: "Tron Chain Type",
+			give: "TRON",
+			want: ChainTypeTron,
+		},
+		{
+			name: "TON Chain Type",
+			give: "TON",
+			want: ChainTypeTON,
+		},
+		{
 			name:    "Invalid Chain Type",
 			give:    "",
 			want:    ChainTypeUnknown,
@@ -32,8 +47,6 @@ func Test_NewChainType(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			ct, err := NewChainType(tt.give)
 
@@ -50,23 +63,27 @@ func Test_ToPluginType(t *testing.T) {
 
 	pt, err := ToPluginType("commit")
 	require.NoError(t, err)
-	assert.Equal(t, pt, PluginTypeCommit)
+	assert.Equal(t, PluginTypeCommit, pt)
 
 	pt, err = ToPluginType("execute")
 	require.NoError(t, err)
-	assert.Equal(t, pt, PluginTypeExecute)
+	assert.Equal(t, PluginTypeExecute, pt)
 
 	pt, err = ToPluginType("median")
 	require.NoError(t, err)
-	assert.Equal(t, pt, PluginTypeMedian)
+	assert.Equal(t, PluginTypeMedian, pt)
 
 	pt, err = ToPluginType("mercury")
 	require.NoError(t, err)
-	assert.Equal(t, pt, PluginTypeMercury)
+	assert.Equal(t, PluginTypeMercury, pt)
+
+	pt, err = ToPluginType("rebalancer")
+	require.NoError(t, err)
+	assert.Equal(t, PluginTypeRebalancer, pt)
 
 	pt, err = ToPluginType("xxx")
 	require.Error(t, err)
-	assert.Equal(t, pt, PluginTypeUnknown)
+	assert.Equal(t, PluginTypeUnknown, pt)
 	assert.EqualError(t, err, "unknown plugin type")
 }
 
@@ -77,37 +94,8 @@ func Test_FromPluginType(t *testing.T) {
 	assert.Equal(t, "execute", FromPluginTypeInput(PluginTypeExecute))
 	assert.Equal(t, "median", FromPluginTypeInput(PluginTypeMedian))
 	assert.Equal(t, "mercury", FromPluginTypeInput(PluginTypeMercury))
+	assert.Equal(t, "rebalancer", FromPluginTypeInput(PluginTypeRebalancer))
 	assert.Equal(t, "unknown", FromPluginTypeInput(PluginTypeUnknown))
-}
-
-func Test_FluxMonitorConfig_Value(t *testing.T) {
-	t.Parallel()
-
-	cfg := FluxMonitorConfig{Enabled: true}
-	want := `{"enabled":true}`
-
-	val, err := cfg.Value()
-	require.NoError(t, err)
-
-	actual, ok := val.([]byte)
-	require.True(t, ok)
-
-	assert.Equal(t, want, string(actual))
-}
-
-func Test_FluxMonitorConfig_Scan(t *testing.T) {
-	t.Parallel()
-
-	var (
-		give = `{"enabled":true}`
-		want = FluxMonitorConfig{Enabled: true}
-	)
-
-	var actual FluxMonitorConfig
-	err := actual.Scan([]byte(give))
-	require.NoError(t, err)
-
-	assert.Equal(t, want, actual)
 }
 
 func Test_OCR1Config_Value(t *testing.T) {
@@ -160,8 +148,6 @@ func Test_OCR1Config_Value(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			val, err := tt.give.Value()
 			require.NoError(t, err)
@@ -224,8 +210,6 @@ func Test_OCR1Config_Scan(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			var actual OCR1Config
 			err := actual.Scan([]byte(tt.give))
@@ -241,12 +225,13 @@ func Test_Plugins_Value(t *testing.T) {
 
 	var (
 		give = Plugins{
-			Commit:  true,
-			Execute: true,
-			Median:  false,
-			Mercury: true,
+			Commit:     true,
+			Execute:    true,
+			Median:     false,
+			Mercury:    true,
+			Rebalancer: false,
 		}
-		want = `{"commit":true,"execute":true,"median":false,"mercury":true}`
+		want = `{"commit":true,"execute":true,"median":false,"mercury":true,"rebalancer":false}`
 	)
 
 	val, err := give.Value()
@@ -262,12 +247,13 @@ func Test_Plugins_Scan(t *testing.T) {
 	t.Parallel()
 
 	var (
-		give = `{"commit":true,"execute":true,"median":false,"mercury":true}`
+		give = `{"commit":true,"execute":true,"median":false,"mercury":true,"rebalancer":false}`
 		want = Plugins{
-			Commit:  true,
-			Execute: true,
-			Median:  false,
-			Mercury: true,
+			Commit:     true,
+			Execute:    true,
+			Median:     false,
+			Mercury:    true,
+			Rebalancer: false,
 		}
 	)
 
@@ -290,13 +276,14 @@ func Test_OCR2Config_Value(t *testing.T) {
 			P2PPeerID:        null.StringFrom("peerid"),
 			KeyBundleID:      null.StringFrom("ocrkeyid"),
 			Plugins: Plugins{
-				Commit:  true,
-				Execute: true,
-				Median:  false,
-				Mercury: true,
+				Commit:     true,
+				Execute:    true,
+				Median:     false,
+				Mercury:    true,
+				Rebalancer: false,
 			},
 		}
-		want = `{"enabled":true,"is_bootstrap":false,"multiaddr":"multiaddr","forwarder_address":"forwarderaddress","p2p_peer_id":"peerid","key_bundle_id":"ocrkeyid","plugins":{"commit":true,"execute":true,"median":false,"mercury":true}}`
+		want = `{"enabled":true,"is_bootstrap":false,"multiaddr":"multiaddr","forwarder_address":"forwarderaddress","p2p_peer_id":"peerid","key_bundle_id":"ocrkeyid","plugins":{"commit":true,"execute":true,"median":false,"mercury":true,"rebalancer":false}}`
 	)
 
 	val, err := give.Value()
@@ -312,7 +299,7 @@ func Test_OCR2Config_Scan(t *testing.T) {
 	t.Parallel()
 
 	var (
-		give = `{"enabled":true,"is_bootstrap":false,"multiaddr":"multiaddr","forwarder_address":"forwarderaddress","p2p_peer_id":"peerid","key_bundle_id":"ocrkeyid","plugins":{"commit":true,"execute":true,"median":false,"mercury":true}}`
+		give = `{"enabled":true,"is_bootstrap":false,"multiaddr":"multiaddr","forwarder_address":"forwarderaddress","p2p_peer_id":"peerid","key_bundle_id":"ocrkeyid","plugins":{"commit":true,"execute":true,"median":false,"mercury":true,"rebalancer":false}}`
 		want = OCR2ConfigModel{
 			Enabled:          true,
 			IsBootstrap:      false,
@@ -321,10 +308,11 @@ func Test_OCR2Config_Scan(t *testing.T) {
 			P2PPeerID:        null.StringFrom("peerid"),
 			KeyBundleID:      null.StringFrom("ocrkeyid"),
 			Plugins: Plugins{
-				Commit:  true,
-				Execute: true,
-				Median:  false,
-				Mercury: true,
+				Commit:     true,
+				Execute:    true,
+				Median:     false,
+				Mercury:    true,
+				Rebalancer: false,
 			},
 		}
 	)
@@ -367,7 +355,6 @@ func Test_JobProposal_CanEditDefinition(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -392,12 +379,12 @@ func Test_toMetrics(t *testing.T) {
 
 	metrics := jpCounts.toMetrics()
 
-	assert.Equal(t, metrics, map[JobProposalStatus]float64{
+	assert.Equal(t, map[JobProposalStatus]float64{
 		JobProposalStatusCancelled: 0,
 		JobProposalStatusPending:   1,
 		JobProposalStatusApproved:  2,
 		JobProposalStatusRejected:  3,
 		JobProposalStatusDeleted:   4,
 		JobProposalStatusRevoked:   5,
-	})
+	}, metrics)
 }

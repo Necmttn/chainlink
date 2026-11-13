@@ -5,7 +5,7 @@ import (
 
 	"github.com/graph-gophers/dataloader"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/txmgr"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
 	"github.com/smartcontractkit/chainlink/v2/core/utils/stringutils"
 )
@@ -28,7 +28,7 @@ func (b *ethTransactionAttemptBatcher) loadByEthTransactionIDs(ctx context.Conte
 		keyOrder[key.String()] = ix
 	}
 
-	attempts, err := b.app.TxmStorageService().FindTxAttemptConfirmedByTxIDs(ethTxsIDs)
+	attempts, err := b.app.TxmStorageService().FindTxAttemptConfirmedByTxIDs(ctx, ethTxsIDs)
 	if err != nil {
 		return []*dataloader.Result{{Data: nil, Error: err}}
 	}

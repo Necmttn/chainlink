@@ -9,7 +9,10 @@ import (
 )
 
 // ToDecimal converts an input to a decimal
-func ToDecimal(input interface{}) (decimal.Decimal, error) {
+// TODO: Currently this function does not handle hex string as the input.
+// Draft PR to add hex string handling to utils.ToDecimal (review if this breaks other services):
+// https://github.com/smartcontractkit/chainlink/pull/14841
+func ToDecimal(input any) (decimal.Decimal, error) {
 	switch v := input.(type) {
 	case string:
 		return decimal.NewFromString(v)
@@ -20,19 +23,19 @@ func ToDecimal(input interface{}) (decimal.Decimal, error) {
 	case int16:
 		return decimal.New(int64(v), 0), nil
 	case int32:
-		return decimal.New(int64(v), 0), nil
+		return decimal.NewFromInt32(v), nil
 	case int64:
 		return decimal.New(v, 0), nil
 	case uint:
-		return decimal.New(int64(v), 0), nil
+		return decimal.NewFromUint64(uint64(v)), nil
 	case uint8:
-		return decimal.New(int64(v), 0), nil
+		return decimal.NewFromUint64(uint64(v)), nil
 	case uint16:
-		return decimal.New(int64(v), 0), nil
+		return decimal.NewFromUint64(uint64(v)), nil
 	case uint32:
-		return decimal.New(int64(v), 0), nil
+		return decimal.NewFromUint64(uint64(v)), nil
 	case uint64:
-		return decimal.New(int64(v), 0), nil
+		return decimal.NewFromUint64(v), nil
 	case float64:
 		if !validFloat(v) {
 			return decimal.Decimal{}, errors.Errorf("invalid float %v, cannot convert to decimal", v)

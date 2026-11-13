@@ -6,9 +6,9 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/assets"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/txmgr"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr"
 )
 
 // EthTxResource represents a Ethereum Transaction JSONAPI resource.
@@ -25,7 +25,7 @@ type EthTxResource struct {
 	SentAt     string          `json:"sentAt"`
 	To         *common.Address `json:"to"`
 	Value      string          `json:"value"`
-	EVMChainID big.Big         `json:"evmChainID"`
+	EVMChainID sqlutil.Big     `json:"evmChainID"`
 }
 
 // GetName implements the api2go EntityNamer interface
@@ -43,14 +43,14 @@ func NewEthTxResource(tx txmgr.Tx) EthTxResource {
 	r := EthTxResource{
 		Data:     hexutil.Bytes(tx.EncodedPayload),
 		From:     &tx.FromAddress,
-		GasLimit: strconv.FormatUint(uint64(tx.FeeLimit), 10),
+		GasLimit: strconv.FormatUint(tx.FeeLimit, 10),
 		State:    string(tx.State),
 		To:       &tx.ToAddress,
 		Value:    v.String(),
 	}
 
 	if tx.ChainID != nil {
-		r.EVMChainID = *big.New(tx.ChainID)
+		r.EVMChainID = *sqlutil.New(tx.ChainID)
 	}
 	return r
 }
@@ -60,19 +60,20 @@ func NewEthTxResourceFromAttempt(txa txmgr.TxAttempt) EthTxResource {
 
 	r := NewEthTxResource(tx)
 	r.JAID = NewJAID(txa.Hash.String())
-	r.GasPrice = txa.TxFee.Legacy.ToInt().String()
+	r.GasPrice = txa.TxFee.GasPrice.ToInt().String()
 	r.Hash = txa.Hash
 	r.Hex = hexutil.Encode(txa.SignedRawTx)
 
 	if txa.Tx.ChainID != nil {
-		r.EVMChainID = *big.New(txa.Tx.ChainID)
+		r.EVMChainID = *sqlutil.New(txa.Tx.ChainID)
+		r.JAID = NewPrefixedJAID(r.ID, txa.Tx.ChainID.String())
 	}
 
 	if tx.Sequence != nil {
-		r.Nonce = strconv.FormatUint(uint64(*tx.Sequence), 10)
+		r.Nonce = strconv.FormatInt(int64(*tx.Sequence), 10)
 	}
 	if txa.BroadcastBeforeBlockNum != nil {
-		r.SentAt = strconv.FormatUint(uint64(*txa.BroadcastBeforeBlockNum), 10)
+		r.SentAt = strconv.FormatInt(*txa.BroadcastBeforeBlockNum, 10)
 	}
 	return r
 }

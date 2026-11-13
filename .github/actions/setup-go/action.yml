@@ -4,61 +4,223 @@ inputs:
   only-modules:
     description: Set to 'true' to only cache modules
     default: "false"
-  cache-version: 
+  cache-version:
     description: Set this to cache bust
     default: "1"
+  build-cache-version:
+    description: For scoping build caches to certain matrix jobs, takes precedence over cache-version
+    default: ""
   go-version-file:
     description: Set where the go version file is located at
     default: "go.mod"
   go-module-file:
     description: Set where the go module file is located at
     default: "go.sum"
+  restore-module-cache-only:
+    description: |
+      Only restore the module cache, don't automatically update it.
+      Leave the updating to go-mod-cache.yml.
+    default: "true"
+  build-cache-write:
+    description: |
+      When to save the Go build cache.
+        always              - save on every run (use for single-instance hot-path jobs)
+        default-branch-only - save only on push to the default branch; PRs restore the
+                              develop checkpoint. Use for large caches and for any job
+                              that fans out across a matrix.
+        never               - restore only.
+      Callers that save MUST pass a `build-cache-version` unique to the job, otherwise
+      concurrent jobs race on one key.
+    default: "always"
+
+outputs:
+  primary-cache-hit-modules:
+    description: |
+      Set to 'true' if the primary cache for modules was hit.
+      This is useful for debugging cache misses.
+    value: ${{ steps.cache-modules.outputs.cache-hit == 'true' || steps.cache-modules-restore.outputs.cache-hit == 'true' }}
 
 runs:
   using: composite
   steps:
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v7
       with:
+        # setup-go reads the toolchain directive, falling back to the go directive.
+        # go.mod pins an exact patch version, so check-latest would only add a
+        # manifest lookup per job.
         go-version-file: ${{ inputs.go-version-file }}
         cache: false
 
-    - name: Get branch name
-      if: ${{ inputs.only-modules == 'false' }}
-      id: branch-name
-      uses: tj-actions/branch-names@2e5354c6733793113f416314375826df030ada23 #v6.5
-
-    - name: Set go cache keys
+    - name: Set go cache paths and version
       shell: bash
       id: go-cache-dir
       run: |
-        echo "gomodcache=$(go env GOMODCACHE)" >> $GITHUB_OUTPUT
-        echo "gobuildcache=$(go env GOCACHE)" >> $GITHUB_OUTPUT
+        {
+          echo "gomodcache=$(go env GOMODCACHE)"
+          echo "gobuildcache=$(go env GOCACHE)"
+          echo "goversion=$(go env GOVERSION)"
+        } >> "${GITHUB_OUTPUT}"
 
-    - name: Set go module path
-      id: go-module-path
-      shell: bash
-      run: echo "path=./${{ inputs.go-module-file }}" >> $GITHUB_OUTPUT
+    # By default, restore the cache only.
+    # If multiple jobs call actions/cache, then only one will get priority to create upon a cache miss.
+    # We will only restore the cache by default (by calling actions/cache/restore) and let the
+    # `go-mod-cache.yml` workflow handle the creation.
+    - uses: actions/cache/restore@v6
+      if: ${{ inputs.restore-module-cache-only == 'true' }}
+      name: Cache Go Modules (Restore)
+      id: cache-modules-restore
+      with:
+        path: |
+          ${{ steps.go-cache-dir.outputs.gomodcache }}
+        # The lifetime of go modules is much higher than the build outputs, so we increase cache efficiency
+        # here by not having the primary key contain the branch name
+        key: ${{ runner.os }}-gomod-${{ inputs.cache-version }}-${{ hashFiles(inputs.go-module-file) }}
+        restore-keys: |
+          ${{ runner.os }}-gomod-${{ inputs.cache-version }}-
 
-    - uses: actions/cache@v3
+    # If this is called, then it will create the cache entry upon a cache miss.
+    # The cache is created after a cache miss, and after job completes successfully.
+    - uses: actions/cache@v6
+      if: ${{ inputs.restore-module-cache-only != 'true' }}
+      id: cache-modules
       name: Cache Go Modules
       with:
         path: |
           ${{ steps.go-cache-dir.outputs.gomodcache }}
         # The lifetime of go modules is much higher than the build outputs, so we increase cache efficiency
         # here by not having the primary key contain the branch name
-        key: ${{ runner.os }}-gomod-${{ inputs.cache-version }}-${{ hashFiles(steps.go-module-path.output.path) }}
-        restore-keys: |
-          ${{ runner.os }}-gomod-${{ inputs.cache-version }}-
+        key: ${{ runner.os }}-gomod-${{ inputs.cache-version }}-${{ hashFiles(inputs.go-module-file) }}
 
-    - uses: actions/cache@v3
+    # BUILD CACHE LOGIC
+    # ---
+
+    # 1. Resolve the build cache write policy
+    # ---
+    - name: Resolve Build Cache Write Policy
       if: ${{ inputs.only-modules == 'false' }}
+      id: build-cache-policy
+      shell: bash
+      env:
+        BUILD_CACHE_WRITE: ${{ inputs.build-cache-write }}
+        # On pull_request the checked-out ref is the merge commit, so use the head branch.
+        # merge_group refs (gh-readonly-queue/<branch>/pr-...) are unique per run, which
+        # combined with the merge-queue save guard below keeps them out of the cache.
+        CURRENT_BRANCH: ${{ github.head_ref || github.ref_name }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: |
+        case "${BUILD_CACHE_WRITE}" in
+          always)
+            SAVE="true"
+            ;;
+          default-branch-only)
+            SAVE="false"
+            if [ "${CURRENT_BRANCH}" = "${DEFAULT_BRANCH}" ] && \
+               { [ "${GITHUB_EVENT_NAME}" = "push" ] || [ "${GITHUB_EVENT_NAME}" = "schedule" ]; }; then
+              SAVE="true"
+            fi
+            ;;
+          never)
+            SAVE="false"
+            ;;
+          *)
+            echo "::error::invalid build-cache-write '${BUILD_CACHE_WRITE}'"
+            exit 1
+            ;;
+        esac
+
+        # The merge queue must never write: its refs are ephemeral and its caches
+        # are unreachable afterwards.
+        if [ "${GITHUB_EVENT_NAME}" = "merge_group" ]; then
+          SAVE="false"
+        fi
+
+        echo "policy='${BUILD_CACHE_WRITE}' event='${GITHUB_EVENT_NAME}' -> save=${SAVE}"
+        echo "save=${SAVE}" >> "${GITHUB_OUTPUT}"
+
+    # 2. Build the cache keys
+    # ---
+    # - The primary key is the Go version + branch name + short SHA
+    # - The secondary key is the Go version + branch name + no SHA
+    # - The tertiary key is the Go version + default branch name + no SHA
+    # ---
+    # We build the cache keys here so that we can guarantee that the cache keys are the same
+    # across the conditional steps below.
+    # ---
+    # Why do we include the Go version in the cache key?
+    #   Go build cache entries are only valid for the toolchain that produced them, so a toolchain
+    #   bump makes every restored entry a miss. Restoring anyway is pure cost: wasted restore time
+    #   plus several GB of dead weight on disk, which has pushed the largest lint modules into
+    #   "no space left on device" failures.
+    # ---
+    # Why do we use a SHA and the branch name in the cache key?
+    #   We use a SHA and the branch name in the cache key, so that build caches can be "upserted".
+    #   As a PR progresses, it will continue to use a cache that is relevant to a recent commit.
+    #   If the cache is only created once and reused over the life of a PR, then it will become stale over time.
+    #   As the cache would be populated on the first run, and then never updated again.
+    # ---
+    # Why do exclude the secondary and tertiary keys for events on the default branch?
+    #   We don't include 'restore-keys' for the default branch, so we build/test from scratch.
+    #   This ensures:
+    #   1. The default branch creates brand new caches for PR branches to use, which excludes potentially stale data. Which could be present if we restored from a previous cache.
+    #     - We can treat develop caches as standalone cache "checkpoints" for the PR branches to use.
+    #   2. Caches, on a long-lived branch like develop, don't become over-inflated over time.
+    #     - These "checkpoints" are always being created from scratch, rather than upserted.
+    #     - Upserting increases the size of the cache over time, which is fine for PR branches, but not for develop.
+    - name: Build Cache Key
+      if: ${{ inputs.only-modules == 'false' }}
+      id: build-cache-keys
+      shell: bash
+      env:
+        RAW_CACHE_VERSION: ${{ inputs.build-cache-version || inputs.cache-version }}
+        CURRENT_BRANCH: ${{ github.head_ref || github.ref_name }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        GO_VERSION: ${{ steps.go-cache-dir.outputs.goversion }}
+        RUNNER_OS: ${{ runner.os }}
+        RUNNER_ARCH: ${{ runner.arch }}
+      run: |
+        CACHE_VERSION="${RAW_CACHE_VERSION//\//-}"
+        SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
+        KEY_PREFIX="${RUNNER_OS}-${RUNNER_ARCH}-gobuild-go${GO_VERSION}-${CACHE_VERSION}"
+
+        echo "primary-key=${KEY_PREFIX}-${CURRENT_BRANCH}-${SHORT_SHA}" >> "${GITHUB_OUTPUT}"
+
+        if [ "$CURRENT_BRANCH" = "$DEFAULT_BRANCH" ]; then
+          exit 0
+        fi
+
+        echo "secondary-key=${KEY_PREFIX}-${CURRENT_BRANCH}-" >> "${GITHUB_OUTPUT}"
+        echo "develop-key=${KEY_PREFIX}-${DEFAULT_BRANCH}-" >> "${GITHUB_OUTPUT}"
+
+    # 3. Restore the build cache
+    # ---
+    # For certain events, we don't necessarily want to create a build cache, but we will benefit from restoring from one.
+    # This calls actions/cache/restore instead of actions/cache.
+    # This will only restore the cache if it exists, and will not create a new cache entry.
+    - uses: actions/cache/restore@v6
+      name: Cache Go Build Outputs (restore)
+      id: build-cache-restore
+      if: ${{ inputs.only-modules == 'false' && steps.build-cache-policy.outputs.save != 'true' }}
+      with:
+        path: |
+          ${{ steps.go-cache-dir.outputs.gobuildcache }}
+        key: ${{ steps.build-cache-keys.outputs.primary-key }}
+        restore-keys: |
+          ${{ steps.build-cache-keys.outputs.secondary-key }}
+          ${{ steps.build-cache-keys.outputs.develop-key }}
+
+    # 4. Upsert/Create the build cache
+    # ---
+    # A negation of the above actions/cache/restore call.
+    # This will create the cache entry upon a cache miss for the primary key.
+    - uses: actions/cache@v6
+      if: ${{ inputs.only-modules == 'false' && steps.build-cache-policy.outputs.save == 'true' }}
+      id: build-cache
       name: Cache Go Build Outputs
       with:
         path: |
           ${{ steps.go-cache-dir.outputs.gobuildcache }}
-        # The lifetime of go build outputs is pretty short, so we make our primary cache key be the branch name
-        key: ${{ runner.os }}-gobuild-${{ inputs.cache-version }}-${{ hashFiles(steps.go-module-path.output.path) }}-${{ steps.branch-name.outputs.current_branch }}
+        key: ${{ steps.build-cache-keys.outputs.primary-key }}
         restore-keys: |
-          ${{ runner.os }}-gobuild-${{ inputs.cache-version }}-${{ hashFiles(steps.go-module-path.output.path) }}-
-          ${{ runner.os }}-gobuild-${{ inputs.cache-version }}-
+          ${{ steps.build-cache-keys.outputs.secondary-key }}
+          ${{ steps.build-cache-keys.outputs.develop-key }}

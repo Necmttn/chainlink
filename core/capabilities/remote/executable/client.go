@@ -1,0 +1,343 @@
+package executable
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	commoncap "github.com/smartcontractkit/chainlink-common/pkg/capabilities"
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities/pb"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/services"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities/remote"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities/remote/executable/request"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities/remote/types"
+)
+
+// client is a shim for remote executable capabilities.
+// It translates between capability API calls and network messages.
+// Its responsibilities are:
+//  1. Transmit capability requests to remote nodes according to a transmission schedule
+//  2. Aggregate responses from remote nodes and return the aggregated response
+//
+// client communicates with corresponding server on remote nodes.
+type client struct {
+	services.StateMachine
+	capabilityID  string
+	capMethodName string
+	dispatcher    types.Dispatcher
+	cfg           atomic.Pointer[dynamicConfig]
+	lggr          logger.Logger
+
+	aggregatorFactory request.AggregatorFactory
+
+	requestIDToCallerRequest map[string]*request.ClientRequest
+	mutex                    sync.Mutex
+	stopCh                   services.StopChan
+	wg                       sync.WaitGroup
+}
+
+type dynamicConfig struct {
+	remoteCapabilityInfo commoncap.CapabilityInfo
+	localDONInfo         commoncap.DON
+	requestTimeout       time.Duration
+	// Has to be set only for V2 capabilities using OCR.
+	signers [][]byte
+	// minResponsesToAggregate overrides the default F+1 matching threshold for read consensus.
+	// 0 defaults to F+1.
+	minResponsesToAggregate uint32
+}
+
+type Client interface {
+	commoncap.ExecutableCapability
+	Receive(ctx context.Context, msg *types.MessageBody)
+	SetConfig(remoteCapabilityInfo commoncap.CapabilityInfo, localDonInfo commoncap.DON, requestTimeout time.Duration, signers [][]byte, minResponsesToAggregate uint32) error
+}
+
+var (
+	_ Client           = &client{}
+	_ types.Receiver   = &client{}
+	_ services.Service = &client{}
+)
+
+const defaultExpiryCheckInterval = 30 * time.Second
+
+var (
+	ErrRequestExpired                  = errors.New("request expired by executable client")
+	ErrContextDoneBeforeResponseQuorum = errors.New("context done before remote client received a quorum of responses")
+)
+
+// ClientOption configures a client.
+type ClientOption func(*client)
+
+// WithAggregatorFactory overrides the response aggregator used to decide the
+// outcome of requests created through this client. Nil keeps the default
+// quorum aggregator.
+func WithAggregatorFactory(f request.AggregatorFactory) ClientOption {
+	return func(c *client) { c.aggregatorFactory = f }
+}
+
+func NewClient(capabilityID, capMethodName string, dispatcher types.Dispatcher, lggr logger.Logger, opts ...ClientOption) *client {
+	c := &client{
+		capabilityID:             capabilityID,
+		capMethodName:            capMethodName,
+		dispatcher:               dispatcher,
+		lggr:                     logger.With(logger.Named(lggr, "ExecutableCapabilityClient"), "capabilityID", capabilityID, "capMethodName", capMethodName),
+		requestIDToCallerRequest: make(map[string]*request.ClientRequest),
+		stopCh:                   make(services.StopChan),
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+// SetConfig sets the remote capability configuration dynamically
+func (c *client) SetConfig(remoteCapabilityInfo commoncap.CapabilityInfo, localDonInfo commoncap.DON, requestTimeout time.Duration, signers [][]byte, minResponsesToAggregate uint32) error {
+	if remoteCapabilityInfo.ID == "" || remoteCapabilityInfo.ID != c.capabilityID {
+		return fmt.Errorf("capability info provided does not match the client's capabilityID: %s != %s", remoteCapabilityInfo.ID, c.capabilityID)
+	}
+	if remoteCapabilityInfo.DON == nil {
+		return errors.New("remote capability info missing DON")
+	}
+	if len(localDonInfo.Members) == 0 {
+		return errors.New("empty localDonInfo provided")
+	}
+	if requestTimeout <= 0 {
+		return errors.New("requestTimeout must be positive")
+	}
+
+	newCfg := &dynamicConfig{
+		remoteCapabilityInfo:    remoteCapabilityInfo,
+		localDONInfo:            localDonInfo,
+		requestTimeout:          requestTimeout,
+		signers:                 signers,
+		minResponsesToAggregate: minResponsesToAggregate,
+	}
+	// always replace the whole dynamicConfig object to avoid inconsistent state
+	if prev := c.cfg.Swap(newCfg); prev == nil || !reflect.DeepEqual(*prev, *newCfg) {
+		c.lggr.Infow("SetConfig", "remoteDONName", remoteCapabilityInfo.DON.Name, "remoteDONID", remoteCapabilityInfo.DON.ID, "requestTimeout", requestTimeout, "minResponsesToAggregate", minResponsesToAggregate)
+	}
+	return nil
+}
+
+func (c *client) Start(ctx context.Context) error {
+	return c.StartOnce(c.Name(), func() error {
+		cfg := c.cfg.Load()
+
+		// Validate that all required fields are set before starting
+		if cfg == nil {
+			return errors.New("config not set - call SetConfig() before Start()")
+		}
+		if c.dispatcher == nil {
+			return errors.New("dispatcher set to nil, cannot start client")
+		}
+
+		c.wg.Go(func() {
+			c.checkForExpiredRequests()
+		})
+		c.wg.Go(func() {
+			c.checkDispatcherReady()
+		})
+
+		c.lggr.Info("ExecutableCapabilityClient started")
+		return nil
+	})
+}
+
+func (c *client) Close() error {
+	return c.StopOnce(c.Name(), func() error {
+		close(c.stopCh)
+		c.cancelAllRequests(errors.New("client closed"))
+		c.wg.Wait()
+		c.lggr.Info("ExecutableCapabilityClient closed")
+		return nil
+	})
+}
+
+func (c *client) checkDispatcherReady() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			if err := c.dispatcher.Ready(); err != nil {
+				c.cancelAllRequests(fmt.Errorf("dispatcher not ready: %w", err))
+			}
+		}
+	}
+}
+
+func (c *client) checkForExpiredRequests() {
+	ticker := time.NewTicker(getClientTickerInterval(c.cfg.Load()))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			ticker.Reset(getClientTickerInterval(c.cfg.Load()))
+			c.expireRequests()
+		}
+	}
+}
+
+func getClientTickerInterval(cfg *dynamicConfig) time.Duration {
+	if cfg != nil && cfg.requestTimeout > 0 {
+		return cfg.requestTimeout
+	}
+	return defaultExpiryCheckInterval
+}
+
+func (c *client) expireRequests() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	for messageID, req := range c.requestIDToCallerRequest {
+		if req.Expired() {
+			req.Cancel(ErrRequestExpired)
+			delete(c.requestIDToCallerRequest, messageID)
+		}
+
+		if c.dispatcher.Ready() != nil {
+			c.cancelAllRequestsLocked(errors.New("dispatcher not ready"))
+			return
+		}
+	}
+}
+
+func (c *client) cancelAllRequests(err error) {
+	c.mutex.Lock()
+	c.cancelAllRequestsLocked(err)
+	c.mutex.Unlock()
+}
+
+func (c *client) cancelAllRequestsLocked(err error) {
+	for _, req := range c.requestIDToCallerRequest {
+		req.Cancel(err)
+	}
+}
+
+func (c *client) Info(ctx context.Context) (commoncap.CapabilityInfo, error) {
+	cfg := c.cfg.Load()
+	if cfg == nil {
+		return commoncap.CapabilityInfo{}, errors.New("config not set - call SetConfig() before Info()")
+	}
+	return cfg.remoteCapabilityInfo, nil
+}
+
+func (c *client) RegisterToWorkflow(ctx context.Context, registerRequest commoncap.RegisterToWorkflowRequest) error {
+	return nil
+}
+
+func (c *client) UnregisterFromWorkflow(ctx context.Context, unregisterRequest commoncap.UnregisterFromWorkflowRequest) error {
+	return nil
+}
+
+func (c *client) Execute(ctx context.Context, capReq commoncap.CapabilityRequest) (commoncap.CapabilityResponse, error) {
+	cfg := c.cfg.Load()
+	if cfg == nil {
+		return commoncap.CapabilityResponse{}, errors.New("config not set - call SetConfig() before Execute()")
+	}
+
+	var agg request.ResponseAggregator
+	if c.aggregatorFactory != nil {
+		agg = c.aggregatorFactory(capReq, *cfg.remoteCapabilityInfo.DON)
+	}
+
+	var req *request.ClientRequest
+	var err error
+	if agg != nil {
+		req, err = request.NewClientExecuteRequestWithAggregator(ctx, c.lggr, capReq, cfg.remoteCapabilityInfo, cfg.localDONInfo, c.dispatcher,
+			cfg.requestTimeout, c.capMethodName, agg)
+	} else {
+		req, err = request.NewClientExecuteRequest(ctx, c.lggr, capReq, cfg.remoteCapabilityInfo, cfg.localDONInfo, c.dispatcher,
+			cfg.requestTimeout, c.capMethodName, cfg.signers, cfg.minResponsesToAggregate)
+	}
+	if err != nil {
+		return commoncap.CapabilityResponse{}, fmt.Errorf("failed to create client request: %w", err)
+	}
+	c.lggr.Debugw("created new client request", "requestID", req.ID())
+
+	if err = c.storeRequest(req); err != nil {
+		return commoncap.CapabilityResponse{}, fmt.Errorf("failed to store request: %w", err)
+	}
+	req.Send()
+
+	var respResult []byte
+	var respErr error
+	select {
+	case resp := <-req.ResponseChan():
+		respResult = resp.Result
+		respErr = resp.Err
+	case <-ctx.Done():
+		// NOTE: ClientRequest will not block on sending to ResponseChan() because that channel is buffered (with size 1)
+		return commoncap.CapabilityResponse{}, errors.Join(ErrContextDoneBeforeResponseQuorum, ctx.Err())
+	}
+
+	if respErr != nil {
+		return commoncap.CapabilityResponse{}, fmt.Errorf("error executing request: %w", respErr)
+	}
+
+	capabilityResponse, err := pb.UnmarshalCapabilityResponse(respResult)
+	if err != nil {
+		return commoncap.CapabilityResponse{}, fmt.Errorf("failed to unmarshal capability response: %w", err)
+	}
+
+	if c.cfg.Load() != nil {
+		capabilityResponse.Metadata.CapDON_N = uint32(len(c.cfg.Load().localDONInfo.Members)) //nolint:gosec // G115
+	}
+
+	return capabilityResponse, nil
+}
+
+func (c *client) storeRequest(req *request.ClientRequest) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if _, ok := c.requestIDToCallerRequest[req.ID()]; ok {
+		return fmt.Errorf("request for ID %s already exists", req.ID())
+	}
+	c.requestIDToCallerRequest[req.ID()] = req
+	return nil
+}
+
+func (c *client) Receive(ctx context.Context, msg *types.MessageBody) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	messageID, err := GetMessageID(msg)
+	if err != nil {
+		c.lggr.Errorw("invalid message ID", "err", err, "id", remote.SanitizeLogString(string(msg.MessageId)))
+		return
+	}
+
+	c.lggr.Debugw("Remote client executable receiving message", "messageID", messageID)
+
+	req := c.requestIDToCallerRequest[messageID]
+	if req == nil {
+		c.lggr.Warnw("received response for unknown message ID ", "messageID", messageID)
+		return
+	}
+
+	if err := req.OnMessage(ctx, msg); err != nil {
+		c.lggr.Errorw("failed to add response to request", "messageID", messageID, "err", err)
+	}
+}
+
+func (c *client) Ready() error {
+	return nil
+}
+
+func (c *client) HealthReport() map[string]error {
+	return nil
+}
+
+func (c *client) Name() string {
+	return c.lggr.Name()
+}

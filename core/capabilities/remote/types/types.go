@@ -1,0 +1,62 @@
+// Note: the proto_path below directive ensures the generated protobuf's file descriptor has a fully
+// qualified path, ensuring we avoid conflicts with other files called messages.proto
+//
+//go:generate protoc --proto_path=../../../../ --go_out=../../../../ --go_opt=paths=source_relative core/capabilities/remote/types/messages.proto
+package types
+
+import (
+	"context"
+
+	commoncap "github.com/smartcontractkit/chainlink-common/pkg/capabilities"
+	"github.com/smartcontractkit/chainlink-common/pkg/services"
+	p2ptypes "github.com/smartcontractkit/chainlink/v2/core/services/p2p/types"
+)
+
+const (
+	MethodRegisterTrigger          = "RegisterTrigger"
+	MethodUnregisterTrigger        = "UnregisterTrigger"
+	MethodTriggerRegistrationCheck = "TriggerRegistrationCheck"
+	MethodTriggerEvent             = "TriggerEvent"
+	MethodExecute                  = "Execute"
+	MethodTriggerEventAck          = "TriggerEventACK"
+	MethodExecutionStatusUpdate    = "ExecutionStatusUpdate"
+)
+
+type Dispatcher interface {
+	services.Service
+	SetReceiver(capabilityID string, donID uint32, receiver Receiver) error
+	RemoveReceiver(capabilityID string, donID uint32)
+	SetReceiverForMethod(capabilityID string, donID uint32, method string, receiver Receiver) error
+	RemoveReceiverForMethod(capabilityID string, donID uint32, method string)
+	Send(peerID p2ptypes.PeerID, msgBody *MessageBody) error
+}
+
+type Receiver interface {
+	Receive(ctx context.Context, msg *MessageBody)
+}
+
+type ReceiverService interface {
+	services.Service
+	Receiver
+}
+
+type Aggregator interface {
+	Aggregate(eventID string, responses [][]byte) (commoncap.TriggerResponse, error)
+}
+
+type MessageHasher interface {
+	Hash(ctx context.Context, msg *MessageBody) ([32]byte, error)
+}
+
+// RequestAccumulator collects the payloads of the requests for a single server request that
+// produced the same MessageHasher hash, and builds the payload the capability is executed with.
+type RequestAccumulator interface {
+	Add(sender p2ptypes.PeerID, payload []byte) error
+	// Payload returns the payload to execute the capability with. ready is false while no
+	// executable payload can be built yet. A non-nil error means the request can never be executed.
+	Payload() (payload []byte, ready bool, err error)
+}
+
+type RequestAccumulatorFactory interface {
+	NewAccumulator(ctx context.Context, capabilityID string, callingDon commoncap.DON) (RequestAccumulator, error)
+}

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,9 +10,8 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
-	"go.uber.org/multierr"
 
-	"github.com/smartcontractkit/chainlink/v2/core/services/signatures/secp256k1"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/vrfkey/secp256k1"
 	"github.com/smartcontractkit/chainlink/v2/core/utils"
 	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 )
@@ -104,7 +104,7 @@ type VRFKeyPresenters []VRFKeyPresenter
 // RenderTable implements TableRenderer
 func (ps VRFKeyPresenters) RenderTable(rt RendererTable) error {
 	headers := []string{"Compressed", "Uncompressed", "Hash"}
-	rows := [][]string{}
+	rows := make([][]string, 0, len(ps))
 
 	for _, p := range ps {
 		rows = append(rows, p.ToRow())
@@ -124,7 +124,7 @@ func (s *Shell) CreateVRFKey(_ *cli.Context) error {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -160,7 +160,7 @@ func (s *Shell) ImportVRFKey(c *cli.Context) error {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -201,7 +201,7 @@ func (s *Shell) ExportVRFKey(c *cli.Context) error {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -219,7 +219,7 @@ func (s *Shell) ExportVRFKey(c *cli.Context) error {
 		return s.errorOut(errors.Wrapf(err, "Could not write %v", filepath))
 	}
 
-	_, err = os.Stderr.WriteString(fmt.Sprintf("Exported VRF key %s to %s\n", pk.String(), filepath))
+	_, err = fmt.Fprintf(os.Stderr, "Exported VRF key %s to %s\n", pk.String(), filepath)
 	if err != nil {
 		return s.errorOut(err)
 	}
@@ -254,7 +254,7 @@ func (s *Shell) DeleteVRFKey(c *cli.Context) error {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 
@@ -265,7 +265,7 @@ func (s *Shell) DeleteVRFKey(c *cli.Context) error {
 func getPublicKey(c *cli.Context) (secp256k1.PublicKey, error) {
 	pkHexString := c.Args().Get(0)
 	if pkHexString == "" {
-		return secp256k1.PublicKey{}, fmt.Errorf("must specify public key")
+		return secp256k1.PublicKey{}, errors.New("must specify public key")
 	}
 	publicKey, err := secp256k1.NewPublicKeyFromHex(pkHexString)
 	if err != nil {
@@ -282,7 +282,7 @@ func (s *Shell) ListVRFKeys(_ *cli.Context) error {
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
+			err = stderrors.Join(err, cerr)
 		}
 	}()
 

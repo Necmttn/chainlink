@@ -1,0 +1,105 @@
+package chainlink
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink/v2/core/config/toml"
+)
+
+func TestCapabilitiesLocalConfig(t *testing.T) {
+	opts := GeneralConfigOpts{
+		ConfigStrings: []string{fullTOML},
+	}
+	cfg, err := opts.New()
+	require.NoError(t, err)
+
+	local := cfg.Capabilities().Local()
+
+	// Test RegistryBasedLaunchAllowlist - now contains regex patterns
+	allowlist := local.RegistryBasedLaunchAllowlist()
+	assert.Equal(t, []string{"^cron@1\\.0\\.0$", "^http-actions@.*$"}, allowlist)
+
+	// Test IsAllowlisted with regex matching
+	assert.True(t, local.IsAllowlisted("cron@1.0.0"))         // exact match via regex
+	assert.False(t, local.IsAllowlisted("cron@2.0.0"))        // version mismatch
+	assert.True(t, local.IsAllowlisted("http-actions@1.0.0")) // matches any version
+	assert.True(t, local.IsAllowlisted("http-actions@2.0.0")) // matches any version
+	assert.False(t, local.IsAllowlisted("unknown@1.0.0"))
+}
+
+func TestCapabilitiesLocalConfigEmpty(t *testing.T) {
+	tomlStr := `
+[Capabilities.Local]
+`
+	opts := GeneralConfigOpts{
+		ConfigStrings: []string{tomlStr},
+	}
+	cfg, err := opts.New()
+	require.NoError(t, err)
+
+	local := cfg.Capabilities().Local()
+	assert.Empty(t, local.RegistryBasedLaunchAllowlist())
+	assert.False(t, local.IsAllowlisted("any@1.0.0"))
+}
+
+func TestValidateCapabilityID(t *testing.T) {
+	tests := []struct {
+		name    string
+		capID   string
+		wantErr bool
+	}{
+		{"valid simple", "cron@1.0.0", false},
+		{"valid with hyphen", "http-actions@1.0.0", false},
+		{"valid with prerelease", "http-actions@1.0.0-alpha", false},
+		{"valid complex version", "my-capability@10.20.30", false},
+		{"invalid missing version", "cron", true},
+		{"invalid missing name", "@1.0.0", true},
+		{"invalid uppercase", "Cron@1.0.0", true},
+		{"invalid version format", "cron@1.0", true},
+		{"invalid special chars", "cron!@1.0.0", true},
+		{"invalid spaces", "cron @1.0.0", true},
+		{"empty string", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := toml.ValidateCapabilityID(tt.capID)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestLocalCapabilitiesValidation(t *testing.T) {
+	t.Run("valid config with regex patterns", func(t *testing.T) {
+		cfg := toml.LocalCapabilities{
+			RegistryBasedLaunchAllowlist: []string{"^cron@1\\.0\\.0$", "^http-actions@.*$", ".*"},
+		}
+		err := cfg.ValidateConfig()
+		assert.NoError(t, err)
+	})
+
+	t.Run("invalid regex pattern", func(t *testing.T) {
+		cfg := toml.LocalCapabilities{
+			RegistryBasedLaunchAllowlist: []string{"[invalid"},
+		}
+		err := cfg.ValidateConfig()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "RegistryBasedLaunchAllowlist")
+		assert.Contains(t, err.Error(), "invalid regex pattern")
+	})
+
+	t.Run("multiple errors", func(t *testing.T) {
+		cfg := toml.LocalCapabilities{
+			RegistryBasedLaunchAllowlist: []string{"[invalid1", "[invalid2"},
+		}
+		err := cfg.ValidateConfig()
+		assert.Error(t, err)
+	})
+}

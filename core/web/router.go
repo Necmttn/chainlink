@@ -33,9 +33,10 @@ import (
 	"github.com/ulule/limiter/v3/drivers/store/memory"
 	"github.com/unrolled/secure"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
+	"go.opentelemetry.io/otel"
 
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/build"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
 	"github.com/smartcontractkit/chainlink/v2/core/web/auth"
 	"github.com/smartcontractkit/chainlink/v2/core/web/loader"
@@ -61,7 +62,8 @@ func NewRouter(app chainlink.Application, prometheus *ginprom.Prometheus) (*gin.
 
 	tls := config.WebServer().TLS()
 	engine.Use(
-		otelgin.Middleware("chainlink-web-routes"),
+		otelgin.Middleware("chainlink-web-routes",
+			otelgin.WithTracerProvider(otel.GetTracerProvider())),
 		limits.RequestSizeLimiter(config.WebServer().HTTPMaxSize()),
 		loggerFunc(app.GetLogger()),
 		gin.Recovery(),
@@ -72,7 +74,6 @@ func NewRouter(app chainlink.Application, prometheus *ginprom.Prometheus) (*gin.
 		engine.Use(prometheus.Instrument())
 	}
 	engine.Use(helmet.Default())
-
 	rl := config.WebServer().RateLimit()
 	api := engine.Group(
 		"/",
@@ -96,6 +97,11 @@ func NewRouter(app chainlink.Application, prometheus *ginprom.Prometheus) (*gin.
 		loader.Middleware(app),
 		graphqlHandler(app),
 	)
+
+	err = app.AuthenticationProvider().ExtendRouter(api)
+	if err != nil {
+		return nil, err
+	}
 
 	return engine, nil
 }
@@ -154,7 +160,6 @@ func secureMiddleware(tlsRedirect bool, tlsHost string, devWebServer bool) gin.H
 	secureFunc := func() gin.HandlerFunc {
 		return func(c *gin.Context) {
 			err := secureMiddleware.Process(c.Writer, c.Request)
-
 			// If there was an error, do not continue.
 			if err != nil {
 				c.Abort()
@@ -176,7 +181,7 @@ func debugRoutes(app chainlink.Application, r *gin.RouterGroup) {
 	group.GET("/vars", expvar.Handler())
 }
 
-func metricRoutes(r *gin.RouterGroup, includeHeap bool) {
+func metricRoutes(r *gin.RouterGroup) {
 	pprofGroup := r.Group("/debug/pprof")
 	pprofGroup.GET("/", ginHandlerFromHTTP(pprof.Index))
 	pprofGroup.GET("/cmdline", ginHandlerFromHTTP(pprof.Cmdline))
@@ -187,9 +192,7 @@ func metricRoutes(r *gin.RouterGroup, includeHeap bool) {
 	pprofGroup.GET("/allocs", ginHandlerFromHTTP(pprof.Handler("allocs").ServeHTTP))
 	pprofGroup.GET("/block", ginHandlerFromHTTP(pprof.Handler("block").ServeHTTP))
 	pprofGroup.GET("/goroutine", ginHandlerFromHTTP(pprof.Handler("goroutine").ServeHTTP))
-	if includeHeap {
-		pprofGroup.GET("/heap", ginHandlerFromHTTP(pprof.Handler("heap").ServeHTTP))
-	}
+	pprofGroup.GET("/heap", ginHandlerFromHTTP(pprof.Handler("heap").ServeHTTP))
 	pprofGroup.GET("/mutex", ginHandlerFromHTTP(pprof.Handler("mutex").ServeHTTP))
 	pprofGroup.GET("/threadcreate", ginHandlerFromHTTP(pprof.Handler("threadcreate").ServeHTTP))
 }
@@ -216,6 +219,7 @@ func sessionRoutes(app chainlink.Application, r *gin.RouterGroup) {
 func healthRoutes(app chainlink.Application, r *gin.RouterGroup) {
 	hc := HealthController{app}
 	r.GET("/readyz", hc.Readyz)
+	r.GET("/public-readyz", hc.PublicReadyz)
 	r.GET("/health", hc.Health)
 	r.GET("/health.txt", func(context *gin.Context) {
 		context.Request.Header.Set("Accept", gin.MIMEPlain)
@@ -226,7 +230,8 @@ func loopRoutes(app chainlink.Application, r *gin.RouterGroup) {
 	loopRegistry := NewLoopRegistryServer(app)
 	r.GET("/discovery", ginHandlerFromHTTP(loopRegistry.discoveryHandler))
 	r.GET("/plugins/:name/metrics", loopRegistry.pluginMetricHandler)
-
+	r.GET("/plugins/:name/debug/pprof/*profile", loopRegistry.pluginPPROFHandler)
+	r.POST("/plugins/:name/debug/pprof/symbol", loopRegistry.pluginPPROFPOSTSymbolHandler)
 }
 
 func v2Routes(app chainlink.Application, r *gin.RouterGroup) {
@@ -269,8 +274,7 @@ func v2Routes(app chainlink.Application, r *gin.RouterGroup) {
 		ets := EVMTransfersController{app}
 		authv2.POST("/transfers", auth.RequiresAdminRole(ets.Create))
 		authv2.POST("/transfers/evm", auth.RequiresAdminRole(ets.Create))
-		tts := CosmosTransfersController{app}
-		authv2.POST("/transfers/cosmos", auth.RequiresAdminRole(tts.Create))
+
 		sts := SolanaTransfersController{app}
 		authv2.POST("/transfers/solana", auth.RequiresAdminRole(sts.Create))
 
@@ -290,6 +294,15 @@ func v2Routes(app chainlink.Application, r *gin.RouterGroup) {
 
 		rc := ReplayController{app}
 		authv2.POST("/replay_from_block/:number", auth.RequiresRunRole(rc.ReplayFromBlock))
+		lcaC := LCAController{app}
+		authv2.GET("/find_lca", auth.RequiresRunRole(lcaC.FindLCA))
+		lpSkipC := LPSkipController{app}
+		authv2.POST("/lp_skip_to_block", auth.RequiresRunRole(lpSkipC.LPSkipToBlock))
+
+		if build.IsDev() {
+			capContr := CapabilityController{app}
+			authv2.POST("/execute_capability", auth.RequiresRunRole(capContr.ExecuteCapability))
+		}
 
 		csakc := CSAKeysController{app}
 		authv2.GET("/keys/csa", csakc.Index)
@@ -345,10 +358,12 @@ func v2Routes(app chainlink.Application, r *gin.RouterGroup) {
 			kc   KeysController
 		}{
 			{"solana", NewSolanaKeysController(app)},
-			{"cosmos", NewCosmosKeysController(app)},
 			{"starknet", NewStarkNetKeysController(app)},
-			{"dkgsign", NewDKGSignKeysController(app)},
-			{"dkgencrypt", NewDKGEncryptKeysController(app)},
+			{"aptos", NewAptosKeysController(app)},
+			{"stellar", NewStellarKeysController(app)},
+			{"tron", NewTronKeysController(app)},
+			{"sui", NewSuiKeysController(app)},
+			{"ton", NewTONKeysController(app)},
 		} {
 			authv2.GET("/keys/"+keys.path, keys.kc.Index)
 			authv2.POST("/keys/"+keys.path, auth.RequiresEditRole(keys.kc.Create))
@@ -363,6 +378,12 @@ func v2Routes(app chainlink.Application, r *gin.RouterGroup) {
 		authv2.DELETE("/keys/vrf/:keyID", auth.RequiresAdminRole(vrfkc.Delete))
 		authv2.POST("/keys/vrf/import", auth.RequiresAdminRole(vrfkc.Import))
 		authv2.POST("/keys/vrf/export/:keyID", auth.RequiresAdminRole(vrfkc.Export))
+
+		wfkc := WorkflowKeysController{app}
+		authv2.GET("/keys/workflow", wfkc.Index)
+
+		dkrkc := DKGRecipientKeysController{app}
+		authv2.GET("/keys/dkgrecipient", dkrkc.Index)
 
 		jc := JobsController{app}
 		authv2.GET("/jobs", paginatedRequest(jc.Index))
@@ -388,36 +409,23 @@ func v2Routes(app chainlink.Application, r *gin.RouterGroup) {
 		authv2.PATCH("/log", auth.RequiresAdminRole(lgc.Patch))
 
 		chains := authv2.Group("chains")
-		for _, chain := range []struct {
-			path string
-			cc   ChainsController
-		}{
-			{"evm", NewEVMChainsController(app)},
-			{"solana", NewSolanaChainsController(app)},
-			{"starknet", NewStarkNetChainsController(app)},
-			{"cosmos", NewCosmosChainsController(app)},
-		} {
-			chains.GET(chain.path, paginatedRequest(chain.cc.Index))
-			chains.GET(chain.path+"/:ID", chain.cc.Show)
-		}
+		chainController := NewChainsController(
+			app.GetRelayers(),
+			app.GetLogger(),
+			app.GetAuditLogger(),
+		)
+		chains.GET("", paginatedRequest(chainController.Index))
+		chains.GET("/:network", paginatedRequest(chainController.Index))
+		chains.GET("/:network/:ID", chainController.Show)
 
 		nodes := authv2.Group("nodes")
-		for _, chain := range []struct {
-			path string
-			nc   NodesController
-		}{
-			{"evm", NewEVMNodesController(app)},
-			{"solana", NewSolanaNodesController(app)},
-			{"starknet", NewStarkNetNodesController(app)},
-			{"cosmos", NewCosmosNodesController(app)},
-		} {
-			if chain.path == "evm" {
-				// TODO still EVM only https://app.shortcut.com/chainlinklabs/story/26276/multi-chain-type-ui-node-chain-configuration
-				nodes.GET("", paginatedRequest(chain.nc.Index))
-			}
-			nodes.GET(chain.path, paginatedRequest(chain.nc.Index))
-			chains.GET(chain.path+"/:ID/nodes", paginatedRequest(chain.nc.Index))
-		}
+		nodesController := NewNodesController(
+			app.GetRelayers(),
+			app.GetAuditLogger(),
+		)
+		nodes.GET("", paginatedRequest(nodesController.Index))
+		nodes.GET("/:network", paginatedRequest(nodesController.Index))
+		chains.GET("/:network/:ID/nodes", paginatedRequest(nodesController.Index))
 
 		efc := EVMForwardersController{app}
 		authv2.GET("/nodes/evm/forwarders", paginatedRequest(efc.Index))
@@ -427,8 +435,12 @@ func v2Routes(app chainlink.Application, r *gin.RouterGroup) {
 		buildInfo := BuildInfoController{app}
 		authv2.GET("/build_info", buildInfo.Show)
 
+		vault := VaultController{app}
+		authv2.POST("/vault/dkg_results/verify", auth.RequiresEditRole(vault.VerifyDKGResult))
+		authv2.POST("/vault/dkg_results/export", auth.RequiresEditRole(vault.ExportDKGResult))
+
 		// Debug routes accessible via authentication
-		metricRoutes(authv2, build.IsDev())
+		metricRoutes(authv2)
 	}
 
 	ping := PingController{app}
@@ -443,14 +455,16 @@ func v2Routes(app chainlink.Application, r *gin.RouterGroup) {
 
 // This is higher because it serves main.js and any static images. There are
 // 5 assets which must be served, so this allows for 20 requests/min
-var staticAssetsRateLimit = int64(100)
-var staticAssetsRateLimitPeriod = 1 * time.Minute
-var indexRateLimit = int64(20)
-var indexRateLimitPeriod = 1 * time.Minute
+var (
+	staticAssetsRateLimit       = int64(100)
+	staticAssetsRateLimitPeriod = 1 * time.Minute
+	indexRateLimit              = int64(20)
+	indexRateLimitPeriod        = 1 * time.Minute
+)
 
 // guiAssetRoutes serves the operator UI static files and index.html. Rate
 // limiting is disabled when in dev mode.
-func guiAssetRoutes(engine *gin.Engine, rateLimitingDisabled bool, lggr logger.SugaredLogger) {
+func guiAssetRoutes(engine *gin.Engine, rateLimitingDisabled bool, lggr logger.Logger) {
 	// Serve static files
 	var assetsRouterHandlers []gin.HandlerFunc
 	if !rateLimitingDisabled {
@@ -507,7 +521,7 @@ func guiAssetRoutes(engine *gin.Engine, rateLimitingDisabled bool, lggr logger.S
 			}
 			return
 		}
-		defer lggr.ErrorIfFn(file.Close, "Error closing file")
+		defer logger.Sugared(lggr).ErrorIfFn(file.Close, "Error closing file")
 
 		http.ServeContent(c.Writer, c.Request, path, time.Time{}, file)
 	})
@@ -591,13 +605,13 @@ func readBody(reader io.Reader, lggr logger.Logger) string {
 }
 
 func readSanitizedJSON(buf *bytes.Buffer) (string, error) {
-	var dst map[string]interface{}
+	var dst map[string]any
 	err := json.Unmarshal(buf.Bytes(), &dst)
 	if err != nil {
 		return "", err
 	}
 
-	cleaned := map[string]interface{}{}
+	cleaned := map[string]any{}
 	for k, v := range dst {
 		if isBlacklisted(k) {
 			cleaned[k] = "*REDACTED*"
@@ -673,7 +687,7 @@ func prometheusHandler(token string, h http.Handler) gin.HandlerFunc {
 			return
 		}
 
-		bearer := fmt.Sprintf("Bearer %s", token)
+		bearer := "Bearer " + token
 
 		if header != bearer {
 			c.String(http.StatusUnauthorized, ginprom.ErrInvalidToken.Error())

@@ -1,29 +1,31 @@
 package telemetry
 
 import (
-	"context"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/pkg/errors"
-	"go.uber.org/multierr"
 
 	"github.com/smartcontractkit/libocr/commontypes"
 
+	"github.com/smartcontractkit/chainlink-common/pkg/beholder"
+	"github.com/smartcontractkit/chainlink-common/pkg/chipingress"
+	common "github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink-common/pkg/services"
 	"github.com/smartcontractkit/chainlink/v2/core/config"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
 	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
 	"github.com/smartcontractkit/chainlink/v2/core/services/synchronization"
 )
 
 type Manager struct {
-	services.StateMachine
-	bufferSize                  uint
-	endpoints                   []*telemetryEndpoint
-	ks                          keystore.CSA
-	lggr                        logger.Logger
+	services.Service
+	eng *services.Engine
+
+	bufferSize uint
+	endpoints  []*telemetryEndpoint
+	ks         keystore.CSA
+
 	logging                     bool
 	maxBatchSize                uint
 	sendInterval                time.Duration
@@ -31,126 +33,162 @@ type Manager struct {
 	uniConn                     bool
 	useBatchSend                bool
 	MonitoringEndpointGenerator MonitoringEndpointGenerator
+
+	chipIngressClient chipingress.Client
 }
 
 type telemetryEndpoint struct {
-	ChainID string
-	Network string
-	URL     *url.URL
-	client  synchronization.TelemetryService
-	PubKey  string
+	ChainID           string
+	Network           string
+	URL               *url.URL
+	client            synchronization.TelemetryService
+	PubKey            string
+	chipIngressClient synchronization.ChipIngressService
 }
 
 // NewManager create a new telemetry manager that is responsible for configuring telemetry agents and generating the defined telemetry endpoints and monitoring endpoints
-func NewManager(cfg config.TelemetryIngress, csaKeyStore keystore.CSA, lggr logger.Logger) *Manager {
+func NewManager(cfg config.TelemetryIngress, csaKeyStore keystore.CSA, lggr common.Logger) *Manager {
+	var chipIngressClient chipingress.Client
+	if cfg.ChipIngressEnabled() {
+		lggr.Info("ChIP Ingress is enabled for telemetry")
+		chipIngressClient = beholder.GetClient().Chip
+	}
+
 	m := &Manager{
-		bufferSize:   cfg.BufferSize(),
-		endpoints:    nil,
-		ks:           csaKeyStore,
-		lggr:         lggr.Named("TelemetryManager"),
-		logging:      cfg.Logging(),
-		maxBatchSize: cfg.MaxBatchSize(),
-		sendInterval: cfg.SendInterval(),
-		sendTimeout:  cfg.SendTimeout(),
-		uniConn:      cfg.UniConn(),
-		useBatchSend: cfg.UseBatchSend(),
+		bufferSize:        cfg.BufferSize(),
+		ks:                csaKeyStore,
+		logging:           cfg.Logging(),
+		maxBatchSize:      cfg.MaxBatchSize(),
+		sendInterval:      cfg.SendInterval(),
+		sendTimeout:       cfg.SendTimeout(),
+		uniConn:           cfg.UniConn(),
+		useBatchSend:      cfg.UseBatchSend(),
+		chipIngressClient: chipIngressClient,
 	}
-	for _, e := range cfg.Endpoints() {
-		if err := m.addEndpoint(e); err != nil {
-			m.lggr.Error(err)
-		}
-	}
+	m.Service, m.eng = services.Config{
+		Name: "TelemetryManager",
+		NewSubServices: func(lggr common.Logger) (subs []services.Service) {
+			for _, e := range cfg.Endpoints() {
+				if sub, err := m.newEndpoint(e, lggr, cfg); err != nil {
+					lggr.Error(err)
+				} else {
+					subs = append(subs, sub)
+				}
+			}
+			return
+		},
+	}.NewServiceEngine(lggr)
+
 	return m
-}
-
-func (m *Manager) Start(ctx context.Context) error {
-	return m.StartOnce("TelemetryManager", func() error {
-		var err error
-		for _, e := range m.endpoints {
-			err = multierr.Append(err, e.client.Start(ctx))
-		}
-		return err
-	})
-}
-func (m *Manager) Close() error {
-	return m.StopOnce("TelemetryManager", func() error {
-		var err error
-		for _, e := range m.endpoints {
-			err = multierr.Append(err, e.client.Close())
-		}
-		return err
-	})
-}
-
-func (m *Manager) Name() string {
-	return m.lggr.Name()
-}
-
-func (m *Manager) HealthReport() map[string]error {
-	hr := map[string]error{m.Name(): m.Healthy()}
-
-	for _, e := range m.endpoints {
-		services.CopyHealth(hr, e.client.HealthReport())
-	}
-	return hr
 }
 
 // GenMonitoringEndpoint creates a new monitoring endpoints based on the existing available endpoints defined in the core config TOML, if no endpoint for the network and chainID exists, a NOOP agent will be used and the telemetry will not be sent
 func (m *Manager) GenMonitoringEndpoint(network string, chainID string, contractID string, telemType synchronization.TelemetryType) commontypes.MonitoringEndpoint {
-
 	e, found := m.getEndpoint(network, chainID)
 
 	if !found {
-		m.lggr.Warnf("no telemetry endpoint found for network %q chainID %q, telemetry %q for contactID %q will NOT be sent", network, chainID, telemType, contractID)
+		m.eng.Warnf("no telemetry endpoint found for network %q chainID %q, telemetry %q for contractID %q will NOT be sent", network, chainID, telemType, contractID)
 		return &NoopAgent{}
 	}
 
-	if m.useBatchSend {
-		return NewIngressAgentBatch(e.client, network, chainID, contractID, telemType)
+	if m.chipIngressClient != nil {
+		lggr := m.eng.Named("chip-ingress")
+		adapter, err := NewChipIngressAgent(e.chipIngressClient, network, chainID, contractID, telemType, lggr)
+		if err != nil {
+			m.eng.Errorw("failed to create ChIP ingress agent, falling back to noop", "error", err, "network", network, "chainID", chainID, "contractID", contractID, "telemType", telemType)
+			return &NoopAgent{}
+		}
+		return adapter
 	}
 
-	return NewIngressAgent(e.client, network, chainID, contractID, telemType)
+	if m.useBatchSend {
+		return NewTypedIngressAgentBatch(e.client, network, chainID, contractID, telemType)
+	}
 
+	return NewTypedIngressAgent(e.client, network, chainID, contractID, telemType)
 }
 
-func (m *Manager) addEndpoint(e config.TelemetryIngressEndpoint) error {
+func (m *Manager) GenMultitypeMonitoringEndpoint(network string, chainID string, contractID string) MultitypeMonitoringEndpoint {
+	e, found := m.getEndpoint(network, chainID)
+
+	if !found {
+		m.eng.Warnf("no telemetry endpoint found for network %q chainID %q, telemetry for contractID %q will NOT be sent", network, chainID, contractID)
+		return &NoopAgent{}
+	}
+
+	if m.chipIngressClient != nil {
+		lggr := m.eng.Named("chip-ingress-multipletype")
+		adapter, err := NewChipIngressAgentMultitype(e.chipIngressClient, network, chainID, contractID, lggr)
+		if err != nil {
+			m.eng.Errorw("failed to create ChIP ingress multitype agent, falling back to noop", "error", err, "network", network, "chainID", chainID, "contractID", contractID)
+			return &NoopAgent{}
+		}
+		return adapter
+	}
+
+	if m.useBatchSend {
+		return NewMultiIngressAgentBatch(e.client, network, chainID, contractID)
+	}
+
+	return NewMultiIngressAgent(e.client, network, chainID, contractID)
+}
+
+func (m *Manager) newEndpoint(e config.TelemetryIngressEndpoint, lggr common.Logger, cfg config.TelemetryIngress) (services.Service, error) {
 	if e.Network() == "" {
-		return errors.New("cannot add telemetry endpoint, network cannot be empty")
+		return nil, errors.New("cannot add telemetry endpoint, network cannot be empty")
 	}
 
 	if e.ChainID() == "" {
-		return errors.New("cannot add telemetry endpoint, chainID cannot be empty")
+		return nil, errors.New("cannot add telemetry endpoint, chainID cannot be empty")
 	}
 
 	if e.URL() == nil {
-		return errors.New("cannot add telemetry endpoint, URL cannot be empty")
+		return nil, errors.New("cannot add telemetry endpoint, URL cannot be empty")
 	}
 
 	if e.ServerPubKey() == "" {
-		return errors.New("cannot add telemetry endpoint, ServerPubKey cannot be empty")
+		return nil, errors.New("cannot add telemetry endpoint, ServerPubKey cannot be empty")
 	}
 
 	if _, found := m.getEndpoint(e.Network(), e.ChainID()); found {
-		return errors.Errorf("cannot add telemetry endpoint for network %q and chainID %q, endpoint already exists", e.Network(), e.ChainID())
+		return nil, errors.Errorf("cannot add telemetry endpoint for network %q and chainID %q, endpoint already exists", e.Network(), e.ChainID())
 	}
 
+	lggr = common.Sugared(lggr).Named(e.Network()).Named(e.ChainID())
+
+	if m.chipIngressClient != nil {
+		lggr.Infof("Using chip-ingress client for network %q chainID %q", e.Network(), e.ChainID())
+		// When ChIP ingress is enabled, we create a ChipIngressService
+		chipIngressService := synchronization.NewChipIngressBatchClient(m.chipIngressClient, cfg.Logging(), lggr, cfg.BufferSize(), cfg.MaxBatchSize(), cfg.SendInterval(), cfg.SendTimeout())
+		te := telemetryEndpoint{
+			Network:           strings.ToUpper(e.Network()),
+			ChainID:           strings.ToUpper(e.ChainID()),
+			URL:               e.URL(),
+			PubKey:            e.ServerPubKey(),
+			chipIngressClient: chipIngressService,
+		}
+		m.endpoints = append(m.endpoints, &te)
+		return chipIngressService, nil
+	}
+
+	// Otherwise use the traditional telemetry service
 	var tClient synchronization.TelemetryService
 	if m.useBatchSend {
-		tClient = synchronization.NewTelemetryIngressBatchClient(e.URL(), e.ServerPubKey(), m.ks, m.logging, m.lggr, m.bufferSize, m.maxBatchSize, m.sendInterval, m.sendTimeout, m.uniConn, e.Network(), e.ChainID())
+		tClient = synchronization.NewTelemetryIngressBatchClient(e.URL(), e.ServerPubKey(), m.ks, cfg.Logging(), lggr, cfg.BufferSize(), cfg.MaxBatchSize(), cfg.SendInterval(), cfg.SendTimeout(), cfg.UniConn())
 	} else {
-		tClient = synchronization.NewTelemetryIngressClient(e.URL(), e.ServerPubKey(), m.ks, m.logging, m.lggr, m.bufferSize, e.Network(), e.ChainID())
+		tClient = synchronization.NewTelemetryIngressClient(e.URL(), e.ServerPubKey(), m.ks, lggr, cfg.BufferSize())
 	}
 
 	te := telemetryEndpoint{
 		Network: strings.ToUpper(e.Network()),
 		ChainID: strings.ToUpper(e.ChainID()),
 		URL:     e.URL(),
-		PubKey:  e.ServerPubKey(),
 		client:  tClient,
+		PubKey:  e.ServerPubKey(),
 	}
 
 	m.endpoints = append(m.endpoints, &te)
-	return nil
+	return te.client, nil
 }
 
 func (m *Manager) getEndpoint(network string, chainID string) (*telemetryEndpoint, bool) {

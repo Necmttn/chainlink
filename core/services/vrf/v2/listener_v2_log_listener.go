@@ -3,18 +3,18 @@ package v2
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"go.uber.org/multierr"
 
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 	"github.com/smartcontractkit/chainlink-common/pkg/utils/mathutil"
-	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/logpoller"
-	evmtypes "github.com/smartcontractkit/chainlink/v2/core/chains/evm/types"
-	"github.com/smartcontractkit/chainlink/v2/core/logger"
-	"github.com/smartcontractkit/chainlink/v2/core/services/pg"
+	"github.com/smartcontractkit/chainlink-evm/pkg/logpoller"
+	evmtypes "github.com/smartcontractkit/chainlink-evm/pkg/types"
 	"github.com/smartcontractkit/chainlink/v2/core/services/vrf/vrfcommon"
 )
 
@@ -30,6 +30,7 @@ func (lsn *listenerV2) runLogListener(
 		lastProcessedBlock int64
 		startingUp         = true
 	)
+	filterName := lsn.getLogPollerFilterName()
 	ctx, cancel := lsn.chStop.NewCtx()
 	defer cancel()
 	for {
@@ -39,31 +40,30 @@ func (lsn *listenerV2) runLogListener(
 		case <-ticker.C:
 			start := time.Now()
 			lsn.l.Debugw("log listener loop")
-			// Filter registration is idempotent, so we can just call it every time
-			// and retry on errors using the ticker.
-			err := lsn.chain.LogPoller().RegisterFilter(logpoller.Filter{
-				Name: logpoller.FilterName(
-					"VRFListener",
-					"version", lsn.coordinator.Version(),
-					"keyhash", lsn.job.VRFSpec.PublicKey.MustHash(),
-					"coordinatorAddress", lsn.coordinator.Address()),
-				EventSigs: evmtypes.HashArray{
-					lsn.coordinator.RandomWordsFulfilledTopic(),
-					lsn.coordinator.RandomWordsRequestedTopic(),
-				},
-				Addresses: evmtypes.AddressArray{
-					lsn.coordinator.Address(),
-				},
-			})
-			if err != nil {
-				lsn.l.Errorw("error registering filter in log poller, retrying",
-					"err", err,
-					"elapsed", time.Since(start))
-				continue
+
+			// If filter has not already been successfully registered, register it.
+			if !lsn.chain.LogPoller().HasFilter(filterName) {
+				err := lsn.chain.LogPoller().RegisterFilter(ctx, logpoller.Filter{
+					Name: filterName,
+					EventSigs: evmtypes.HashArray{
+						lsn.coordinator.RandomWordsFulfilledTopic(),
+						lsn.coordinator.RandomWordsRequestedTopic(),
+					},
+					Addresses: evmtypes.AddressArray{
+						lsn.coordinator.Address(),
+					},
+				})
+				if err != nil {
+					lsn.l.Errorw("error registering filter in log poller, retrying",
+						"err", err,
+						"elapsed", time.Since(start))
+					continue
+				}
 			}
 
 			// on startup we want to initialize the last processed block
 			if startingUp {
+				var err error
 				lsn.l.Debugw("initializing last processed block on startup")
 				lastProcessedBlock, err = lsn.initializeLastProcessedBlock(ctx)
 				if err != nil {
@@ -98,6 +98,15 @@ func (lsn *listenerV2) runLogListener(
 	}
 }
 
+func (lsn *listenerV2) getLogPollerFilterName() string {
+	return logpoller.FilterName(
+		"VRFListener",
+		"version", lsn.coordinator.Version(),
+		"keyhash", lsn.job.VRFSpec.PublicKey.MustHash(),
+		"coordinatorAddress", lsn.coordinator.Address(),
+	)
+}
+
 // initializeLastProcessedBlock returns the earliest block number that we need to
 // process requests for. This is the block number of the earliest unfulfilled request
 // or the latest finalized block, if there are no unfulfilled requests.
@@ -107,7 +116,7 @@ func (lsn *listenerV2) initializeLastProcessedBlock(ctx context.Context) (lastPr
 	start := time.Now()
 
 	// will retry on error in the runLogListener loop
-	latestBlock, err := lp.LatestBlock()
+	latestBlock, err := lp.LatestBlock(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("LogPoller.LatestBlock(): %w", err)
 	}
@@ -115,28 +124,35 @@ func (lsn *listenerV2) initializeLastProcessedBlock(ctx context.Context) (lastPr
 	ll := lsn.l.With(
 		"latestFinalizedBlock", latestBlock.FinalizedBlockNumber,
 		"latestBlock", latestBlock.BlockNumber,
-		"fromTimestamp", fromTimestamp)
+		"fromTimestamp", fromTimestamp,
+	)
 	ll.Debugw("Initializing last processed block")
 	defer func() {
 		ll.Debugw("Done initializing last processed block", "elapsed", time.Since(start))
 	}()
 
 	numBlocksToReplay := numReplayBlocks(lsn.job.VRFSpec.RequestTimeout, lsn.chain.ID())
-	ll.Debugw("running replay on log poller")
-	err = lp.Replay(ctx, mathutil.Max(latestBlock.FinalizedBlockNumber-numBlocksToReplay, 1))
+	replayStartBlock := mathutil.Max(latestBlock.FinalizedBlockNumber-numBlocksToReplay, 1)
+	ll.Debugw("running replay on log poller",
+		"numBlocksToReplay", numBlocksToReplay,
+		"replayStartBlock", replayStartBlock,
+		"requestTimeout", lsn.job.VRFSpec.RequestTimeout,
+	)
+	err = lp.Replay(ctx, replayStartBlock)
 	if err != nil {
 		return 0, fmt.Errorf("LogPoller.Replay: %w", err)
 	}
 
 	// get randomness requested logs with the appropriate keyhash
-	// keyhash is specified in topic1
+	// is specified in topic1
 	requests, err := lp.IndexedLogsCreatedAfter(
+		ctx,
 		lsn.coordinator.RandomWordsRequestedTopic(), // event sig
 		lsn.coordinator.Address(),                   // address
 		1,                                           // topic index
 		[]common.Hash{lsn.job.VRFSpec.PublicKey.MustHash()}, // topic values
-		fromTimestamp,       // from time
-		logpoller.Finalized, // confs
+		fromTimestamp,      // from time
+		evmtypes.Finalized, // confs
 	)
 	if err != nil {
 		return 0, fmt.Errorf("LogPoller.LogsCreatedAfter RandomWordsRequested logs: %w", err)
@@ -145,10 +161,11 @@ func (lsn *listenerV2) initializeLastProcessedBlock(ctx context.Context) (lastPr
 	// fulfillments don't have keyhash indexed, we'll have to get all of them
 	// TODO: can we instead write a single query that joins on request id's somehow?
 	fulfillments, err := lp.LogsCreatedAfter(
+		ctx,
 		lsn.coordinator.RandomWordsFulfilledTopic(), // event sig
 		lsn.coordinator.Address(),                   // address
 		fromTimestamp,                               // from time
-		logpoller.Finalized,                         // confs
+		evmtypes.Finalized,                          // confs
 	)
 	if err != nil {
 		return 0, fmt.Errorf("LogPoller.LogsCreatedAfter RandomWordsFulfilled logs: %w", err)
@@ -158,21 +175,29 @@ func (lsn *listenerV2) initializeLastProcessedBlock(ctx context.Context) (lastPr
 	// find request block of earliest unfulfilled request
 	// even if this block is > latest finalized, we use latest finalized as earliest unprocessed
 	// because re-orgs can occur on any unfinalized block.
-	var earliestUnfulfilledBlock = latestBlock.FinalizedBlockNumber
+	finalized := latestBlock.FinalizedBlockNumber
+	if finalized < 0 {
+		lsn.l.Errorw("unexpected negative finalized block number", "finalized", finalized)
+		finalized = 0
+	}
+	earliestU := uint64(finalized)
 	for _, req := range unfulfilled {
-		if req.Raw().BlockNumber < uint64(earliestUnfulfilledBlock) {
-			earliestUnfulfilledBlock = int64(req.Raw().BlockNumber)
+		rb := req.Raw().BlockNumber
+		if rb < earliestU {
+			earliestU = rb
 		}
 	}
-
-	return earliestUnfulfilledBlock, nil
+	if earliestU > uint64(math.MaxInt64) {
+		return math.MaxInt64, nil
+	}
+	return int64(earliestU), nil
 }
 
 func (lsn *listenerV2) updateLastProcessedBlock(ctx context.Context, currLastProcessedBlock int64) (lastProcessedBlock int64, err error) {
 	lp := lsn.chain.LogPoller()
 	start := time.Now()
 
-	latestBlock, err := lp.LatestBlock(pg.WithParentCtx(ctx))
+	latestBlock, err := lp.LatestBlock(ctx)
 	if err != nil {
 		lsn.l.Errorw("error getting latest block", "err", err)
 		return 0, fmt.Errorf("LogPoller.LatestBlock(): %w", err)
@@ -180,18 +205,19 @@ func (lsn *listenerV2) updateLastProcessedBlock(ctx context.Context, currLastPro
 	ll := lsn.l.With(
 		"currLastProcessedBlock", currLastProcessedBlock,
 		"latestBlock", latestBlock.BlockNumber,
-		"latestFinalizedBlock", latestBlock.FinalizedBlockNumber)
+		"latestFinalizedBlock", latestBlock.FinalizedBlockNumber,
+	)
 	ll.Debugw("updating last processed block")
 	defer func() {
 		ll.Debugw("done updating last processed block", "elapsed", time.Since(start))
 	}()
 
 	logs, err := lp.LogsWithSigs(
+		ctx,
 		currLastProcessedBlock,
 		latestBlock.FinalizedBlockNumber,
 		[]common.Hash{lsn.coordinator.RandomWordsFulfilledTopic(), lsn.coordinator.RandomWordsRequestedTopic()},
 		lsn.coordinator.Address(),
-		pg.WithParentCtx(ctx),
 	)
 	if err != nil {
 		return currLastProcessedBlock, fmt.Errorf("LogPoller.LogsWithSigs: %w", err)
@@ -201,7 +227,12 @@ func (lsn *listenerV2) updateLastProcessedBlock(ctx context.Context, currLastPro
 	// find request block of earliest unfulfilled request
 	// even if this block is > latest finalized, we use latest finalized as earliest unprocessed
 	// because re-orgs can occur on any unfinalized block.
-	var earliestUnprocessedRequestBlock = latestBlock.FinalizedBlockNumber
+	finalized := latestBlock.FinalizedBlockNumber
+	if finalized < 0 {
+		lsn.l.Errorw("unexpected negative finalized block number", "finalized", finalized)
+		finalized = 0
+	}
+	earliestU := uint64(finalized)
 	for i, req := range unfulfilled {
 		// need to drop requests that have timed out otherwise the earliestUnprocessedRequestBlock
 		// will be unnecessarily far back and our queries will be slower.
@@ -212,12 +243,15 @@ func (lsn *listenerV2) updateLastProcessedBlock(ctx context.Context, currLastPro
 			)
 			continue
 		}
-		if req.Raw().BlockNumber < uint64(earliestUnprocessedRequestBlock) {
-			earliestUnprocessedRequestBlock = int64(req.Raw().BlockNumber)
+		rb := req.Raw().BlockNumber
+		if rb < earliestU {
+			earliestU = rb
 		}
 	}
-
-	return earliestUnprocessedRequestBlock, nil
+	if earliestU > uint64(math.MaxInt64) {
+		return math.MaxInt64, nil
+	}
+	return int64(earliestU), nil
 }
 
 // pollLogs uses the log poller to poll for the latest VRF logs
@@ -228,7 +262,7 @@ func (lsn *listenerV2) pollLogs(ctx context.Context, minConfs uint32, lastProces
 	// latest unfinalized block used on purpose to get bleeding edge logs
 	// we don't really have the luxury to wait for finalization on most chains
 	// if we want to fulfill on time.
-	latestBlock, err := lp.LatestBlock()
+	latestBlock, err := lp.LatestBlock(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("LogPoller.LatestBlock(): %w", err)
 	}
@@ -237,7 +271,8 @@ func (lsn *listenerV2) pollLogs(ctx context.Context, minConfs uint32, lastProces
 		"lastProcessedBlock", lastProcessedBlock,
 		"minConfs", minConfs,
 		"latestBlock", latestBlock.BlockNumber,
-		"latestFinalizedBlock", latestBlock.FinalizedBlockNumber)
+		"latestFinalizedBlock", latestBlock.FinalizedBlockNumber,
+	)
 	ll.Debugw("polling for logs")
 	defer func() {
 		ll.Debugw("done polling for logs", "elapsed", time.Since(start))
@@ -246,11 +281,11 @@ func (lsn *listenerV2) pollLogs(ctx context.Context, minConfs uint32, lastProces
 	// We don't specify confs because each request can have a different conf above
 	// the minimum. So we do all conf handling in getConfirmedAt.
 	logs, err := lp.LogsWithSigs(
+		ctx,
 		lastProcessedBlock,
 		latestBlock.BlockNumber,
 		[]common.Hash{lsn.coordinator.RandomWordsFulfilledTopic(), lsn.coordinator.RandomWordsRequestedTopic()},
 		lsn.coordinator.Address(),
-		pg.WithParentCtx(ctx),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("LogPoller.LogsWithSigs: %w", err)
@@ -281,7 +316,7 @@ func (lsn *listenerV2) getUnfulfilled(logs []logpoller.Log, ll logger.Logger) (u
 			parsed, err2 := lsn.coordinator.ParseRandomWordsFulfilled(l.ToGethLog())
 			if err2 != nil {
 				// should never happen
-				errs = multierr.Append(errs, err2)
+				errs = errors.Join(errs, err2)
 				continue
 			}
 			fulfilled[parsed.RequestID().String()] = parsed
@@ -289,7 +324,7 @@ func (lsn *listenerV2) getUnfulfilled(logs []logpoller.Log, ll logger.Logger) (u
 			parsed, err2 := lsn.coordinator.ParseRandomWordsRequested(l.ToGethLog())
 			if err2 != nil {
 				// should never happen
-				errs = multierr.Append(errs, err2)
+				errs = errors.Join(errs, err2)
 				continue
 			}
 			keyHash := parsed.KeyHash()
@@ -328,18 +363,24 @@ func (lsn *listenerV2) getConfirmedAt(req RandomWordsRequested, nodeMinConfs uin
 	// Take the max(nodeMinConfs, requestedConfs + requestedConfsDelay).
 	// Add the requested confs delay if provided in the jobspec so that we avoid an edge case
 	// where the primary and backup VRF v2 nodes submit a proof at the same time.
-	minConfs := nodeMinConfs
-	if uint32(req.MinimumRequestConfirmations())+uint32(lsn.job.VRFSpec.RequestedConfsDelay) > nodeMinConfs {
-		minConfs = uint32(req.MinimumRequestConfirmations()) + uint32(lsn.job.VRFSpec.RequestedConfsDelay)
+	delay := lsn.job.VRFSpec.RequestedConfsDelay
+	var delayU32 uint32
+	switch {
+	case delay < 0:
+		delayU32 = 0
+	case delay > math.MaxUint32:
+		delayU32 = math.MaxUint32
+	default:
+		delayU32 = uint32(delay)
 	}
-	newConfs := uint64(minConfs) * (1 << lsn.respCount[req.RequestID().String()])
-	// We cap this at 200 because solidity only supports the most recent 256 blocks
-	// in the contract so if it was older than that, fulfillments would start failing
-	// without the blockhash store feeder. We use 200 to give the node plenty of time
-	// to fulfill even on fast chains.
-	if newConfs > 200 {
-		newConfs = 200
-	}
+	minConfs := max(uint32(req.MinimumRequestConfirmations())+delayU32, nodeMinConfs)
+	newConfs := min(
+		// We cap this at 200 because solidity only supports the most recent 256 blocks
+		// in the contract so if it was older than that, fulfillments would start failing
+		// without the blockhash store feeder. We use 200 to give the node plenty of time
+		// to fulfill even on fast chains.
+		uint64(minConfs)*(1<<lsn.respCount[req.RequestID().String()]), 200,
+	)
 	if lsn.respCount[req.RequestID().String()] > 0 {
 		lsn.l.Warnw("Duplicate request found after fulfillment, doubling incoming confirmations",
 			"txHash", req.Raw().TxHash,
@@ -387,10 +428,14 @@ func (lsn *listenerV2) handleRequested(requested []RandomWordsRequested, request
 			"confirmedAt", confirmedAt,
 			"subID", req.SubID(),
 			"sender", req.Sender())
+		// restore backoff state from previous ticks, if any
+		rs := lsn.retries[req.RequestID().String()]
 		pendingRequests = append(pendingRequests, pendingRequest{
 			confirmedAtBlock: confirmedAt,
 			req:              req,
 			utcTimestamp:     requestedLP[i].CreatedAt.UTC(),
+			attempts:         rs.attempts,
+			lastTry:          rs.lastTry,
 		})
 		lsn.reqAdded()
 	}
@@ -403,49 +448,58 @@ func (lsn *listenerV2) handleRequested(requested []RandomWordsRequested, request
 // if the chain ID is not recognized it assumes a block time of 1 second
 // and returns the number of blocks in a day.
 func numReplayBlocks(requestTimeout time.Duration, chainID *big.Int) int64 {
-	var timeoutSeconds = int64(requestTimeout.Seconds())
+	timeoutSeconds := int64(requestTimeout.Seconds())
 	switch chainID.String() {
-	case "1": // eth mainnet
-	case "3": // eth ropsten
-	case "4": // eth rinkeby
-	case "5": // eth goerli
-	case "11155111": // eth sepolia
+	case
+		"1",        // eth mainnet
+		"3",        // eth robsten
+		"4",        // eth rinkeby
+		"5",        // eth goerli
+		"11155111": // eth sepolia
 		// block time is 12s
 		return timeoutSeconds / 12
-	case "137": // polygon mainnet
-	case "80001": // polygon mumbai
+	case
+		"137",   // polygon mainnet
+		"80001", // polygon mumbai
+		"80002": // polygon amoy
 		// block time is 2s
 		return timeoutSeconds / 2
-	case "56": // bsc mainnet
-	case "97": // bsc testnet
+	case
+		"56", // bsc mainnet
+		"97": // bsc testnet
 		// block time is 2s
 		return timeoutSeconds / 2
-	case "43114": // avalanche mainnet
-	case "43113": // avalanche fuji
+	case
+		"43114", // avalanche mainnet
+		"43113": // avalanche fuji
 		// block time is 1s
 		return timeoutSeconds
-	case "250": // fantom mainnet
-	case "4002": // fantom testnet
+	case
+		"250",  // fantom mainnet
+		"4002": // fantom testnet
 		// block time is 1s
 		return timeoutSeconds
-	case "42161": // arbitrum mainnet
-	case "421613": // arbitrum goerli
-	case "421614": // arbitrum sepolia
+	case
+		"42161",  // arbitrum mainnet
+		"421613", // arbitrum goerli
+		"421614": // arbitrum sepolia
 		// block time is 0.25s in the worst case
 		return timeoutSeconds * 4
-	case "10": // optimism mainnet
-	case "69": // optimism kovan
-	case "420": // optimism goerli
-	case "11155420": // optimism sepolia
-	case "8453": // base mainnet
-	case "84531": // base goerli
-	case "84532": // base sepolia
+	case
+		"10",       // optimism mainnet
+		"69",       // optimism kovan
+		"420",      // optimism goerli
+		"11155420": // optimism sepolia
+		// block time is 2s
+		return timeoutSeconds / 2
+	case
+		"8453",  // base mainnet
+		"84531", // base goerli
+		"84532": // base sepolia
 		// block time is 2s
 		return timeoutSeconds / 2
 	default:
 		// assume block time of 1s
 		return timeoutSeconds
 	}
-	// assume block time of 1s
-	return timeoutSeconds
 }

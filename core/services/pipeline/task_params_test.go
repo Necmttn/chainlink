@@ -24,8 +24,8 @@ func TestStringParam_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
 		// valid
@@ -56,20 +56,20 @@ func TestStringSliceParam_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
 		{"json", `[ "foo", "bar", "baz" ]`, expected, nil},
 		{"[]string", []string{"foo", "bar", "baz"}, expected, nil},
-		{"[]interface{} with strings", []interface{}{"foo", "bar", "baz"}, expected, nil},
-		{"[]interface{} with []byte", []interface{}{[]byte("foo"), []byte("bar"), []byte("baz")}, expected, nil},
-		{"SliceParam", pipeline.SliceParam([]interface{}{"foo", "bar", "baz"}), expected, nil},
+		{"[]interface{} with strings", []any{"foo", "bar", "baz"}, expected, nil},
+		{"[]interface{} with []byte", []any{[]byte("foo"), []byte("bar"), []byte("baz")}, expected, nil},
+		{"SliceParam", pipeline.SliceParam([]any{"foo", "bar", "baz"}), expected, nil},
 
 		{"nil", nil, pipeline.StringSliceParam(nil), nil},
 
 		{"bad json", `[ "foo", 1, false ]`, nil, pipeline.ErrBadInput},
-		{"[]interface{} with bad types", []interface{}{123, true}, nil, pipeline.ErrBadInput},
+		{"[]interface{} with bad types", []any{123, true}, nil, pipeline.ErrBadInput},
 	}
 
 	for _, test := range tests {
@@ -82,7 +82,6 @@ func TestStringSliceParam_UnmarshalPipelineParam(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 func TestBytesParam_UnmarshalPipelineParam(t *testing.T) {
@@ -90,8 +89,8 @@ func TestBytesParam_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
 		{"string", "foo bar baz", pipeline.BytesParam("foo bar baz"), nil},
@@ -121,8 +120,8 @@ func TestAddressParam_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
 		{"20-char string", "deadbeefdeadbeefdead", addr, nil},
@@ -168,19 +167,19 @@ func TestAddressSliceParam_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
 		{"json", `[ "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "0xcafebabecafebabecafebabecafebabecafebabe" ]`, expected, nil},
 		{"[]common.Address", []common.Address{addr1, addr2}, expected, nil},
-		{"[]interface{} with common.Address", []interface{}{addr1, addr2}, expected, nil},
-		{"[]interface{} with strings", []interface{}{addr1.String(), addr2.String()}, expected, nil},
-		{"[]interface{} with []byte", []interface{}{[]byte(addr1.String()), []byte(addr2.String())}, expected, nil},
+		{"[]interface{} with common.Address", []any{addr1, addr2}, expected, nil},
+		{"[]interface{} with strings", []any{addr1.String(), addr2.String()}, expected, nil},
+		{"[]interface{} with []byte", []any{[]byte(addr1.String()), []byte(addr2.String())}, expected, nil},
 		{"nil", nil, pipeline.AddressSliceParam(nil), nil},
 
 		{"bad json", `[ "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef" "0xcafebabecafebabecafebabecafebabecafebabe" ]`, nil, pipeline.ErrBadInput},
-		{"[]interface{} with bad types", []interface{}{123, true}, nil, pipeline.ErrBadInput},
+		{"[]interface{} with bad types", []any{123, true}, nil, pipeline.ErrBadInput},
 	}
 
 	for _, test := range tests {
@@ -200,8 +199,8 @@ func TestUint64Param_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
 		// positive
@@ -245,8 +244,8 @@ func TestMaybeUint64Param_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
 		// positive
@@ -298,8 +297,8 @@ func TestMaybeBigIntParam_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
 		// positive
@@ -346,8 +345,8 @@ func TestMaybeInt32Param_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
 		{"string", "123", pipeline.NewMaybeInt32Param(123, true), nil},
@@ -386,8 +385,8 @@ func TestBoolParam_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
 		{"string true", "true", pipeline.BoolParam(true), nil},
@@ -418,8 +417,8 @@ func TestDecimalParam_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
 		// valid
@@ -451,8 +450,8 @@ func TestURLParam_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
 		{"good", "https://chain.link/foo?bar=sergey", pipeline.URLParam(*good), nil},
@@ -484,21 +483,21 @@ func TestMapParam_UnmarshalPipelineParam(t *testing.T) {
         }
     }`
 
-	inputMap := map[string]interface{}{
-		"chain": map[string]interface{}{
+	inputMap := map[string]any{
+		"chain": map[string]any{
 			"abc": "def",
 		},
-		"link": map[string]interface{}{
+		"link": map[string]any{
 			"sergey": "def",
 			"123":    "satoshi",
 		},
 	}
 
 	expected := pipeline.MapParam{
-		"chain": map[string]interface{}{
+		"chain": map[string]any{
 			"abc": "def",
 		},
-		"link": map[string]interface{}{
+		"link": map[string]any{
 			"sergey": "def",
 			"123":    "satoshi",
 		},
@@ -506,8 +505,8 @@ func TestMapParam_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
 		// valid
@@ -537,13 +536,13 @@ func TestSliceParam_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
-		{"[]interface{}", []interface{}{1, 2, 3}, pipeline.SliceParam([]interface{}{1, 2, 3}), nil},
-		{"[]byte", []byte(`[1, 2, 3]`), pipeline.SliceParam([]interface{}{float64(1), float64(2), float64(3)}), nil},
-		{"string", `[1, 2, 3]`, pipeline.SliceParam([]interface{}{float64(1), float64(2), float64(3)}), nil},
+		{"[]interface{}", []any{1, 2, 3}, pipeline.SliceParam([]any{1, 2, 3}), nil},
+		{"[]byte", []byte(`[1, 2, 3]`), pipeline.SliceParam([]any{float64(1), float64(2), float64(3)}), nil},
+		{"string", `[1, 2, 3]`, pipeline.SliceParam([]any{float64(1), float64(2), float64(3)}), nil},
 		{"bool", true, pipeline.SliceParam(nil), pipeline.ErrBadInput},
 		{"nil", nil, pipeline.SliceParam(nil), nil},
 	}
@@ -567,18 +566,18 @@ func TestHashSliceParam_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
 		{"json", `[ "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "0xcafebabecafebabecafebabecafebabecafebabedeadbeefdeadbeefdeadbeef" ]`, expected, nil},
 		{"[]common.Hash", []common.Hash{hash1, hash2}, expected, nil},
-		{"[]interface{} with common.Hash", []interface{}{hash1, hash2}, expected, nil},
-		{"[]interface{} with strings", []interface{}{hash1.String(), hash2.String()}, expected, nil},
-		{"[]interface{} with []byte", []interface{}{[]byte(hash1.String()), []byte(hash2.String())}, expected, nil},
+		{"[]interface{} with common.Hash", []any{hash1, hash2}, expected, nil},
+		{"[]interface{} with strings", []any{hash1.String(), hash2.String()}, expected, nil},
+		{"[]interface{} with []byte", []any{[]byte(hash1.String()), []byte(hash2.String())}, expected, nil},
 		{"nil", nil, pipeline.HashSliceParam(nil), nil},
 		{"bad json", `[ "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef" "0xcafebabecafebabecafebabecafebabecafebabedeadbeefdeadbeefdeadbeef" ]`, nil, pipeline.ErrBadInput},
-		{"[]interface{} with bad types", []interface{}{123, true}, nil, pipeline.ErrBadInput},
+		{"[]interface{} with bad types", []any{123, true}, nil, pipeline.ErrBadInput},
 	}
 
 	for _, test := range tests {
@@ -602,6 +601,15 @@ func TestSliceParam_FilterErrors(t *testing.T) {
 	require.Equal(t, pipeline.SliceParam{"foo", "baz"}, vals)
 }
 
+func TestSliceParam_FilterNils(t *testing.T) {
+	t.Parallel()
+	testErr := errors.New("bar")
+	s := pipeline.SliceParam{"foo", testErr, nil, "baz", nil}
+	vals, n := s.FilterNils()
+	require.Equal(t, 2, n)
+	require.Equal(t, pipeline.SliceParam{"foo", testErr, "baz"}, vals)
+}
+
 func TestDecimalSliceParam_UnmarshalPipelineParam(t *testing.T) {
 	t.Parallel()
 
@@ -610,11 +618,11 @@ func TestDecimalSliceParam_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
-		{"[]interface{}", []interface{}{1.1, "2.2", *mustDecimal(t, "3.3")}, expected, nil},
+		{"[]interface{}", []any{1.1, "2.2", *mustDecimal(t, "3.3")}, expected, nil},
 		{"string", `[1.1, "2.2", 3.3]`, expected, nil},
 		{"[]byte", `[1.1, "2.2", 3.3]`, expected, nil},
 		{"[]interface{} with error", `[1.1, true, "abc"]`, pipeline.DecimalSliceParam(nil), pipeline.ErrBadInput},
@@ -640,11 +648,11 @@ func TestJSONPathParam_UnmarshalPipelineParam(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    interface{}
-		expected interface{}
+		input    any
+		expected any
 		err      error
 	}{
-		{"[]interface{}", []interface{}{"1.1", "2.2", "3.3", "sergey"}, expected, nil},
+		{"[]interface{}", []any{"1.1", "2.2", "3.3", "sergey"}, expected, nil},
 		{"string", `1.1,2.2,3.3,sergey`, expected, nil},
 		{"[]byte", []byte(`1.1,2.2,3.3,sergey`), expected, nil},
 		{"bool", true, pipeline.JSONPathParam(nil), pipeline.ErrBadInput},
@@ -670,15 +678,15 @@ func TestResolveValue(t *testing.T) {
 
 		called := []int{}
 		getters := []pipeline.GetterFunc{
-			func() (interface{}, error) {
+			func() (any, error) {
 				called = append(called, 0)
 				return nil, errors.Wrap(pipeline.ErrParameterEmpty, "make sure it still notices when wrapped")
 			},
-			func() (interface{}, error) {
+			func() (any, error) {
 				called = append(called, 1)
 				return 123, nil
 			},
-			func() (interface{}, error) {
+			func() (any, error) {
 				called = append(called, 2)
 				return 123, nil
 			},
@@ -695,15 +703,15 @@ func TestResolveValue(t *testing.T) {
 		expectedErr := errors.New("some other issue")
 
 		getters := []pipeline.GetterFunc{
-			func() (interface{}, error) {
+			func() (any, error) {
 				called = append(called, 0)
 				return nil, expectedErr
 			},
-			func() (interface{}, error) {
+			func() (any, error) {
 				called = append(called, 1)
 				return 123, nil
 			},
-			func() (interface{}, error) {
+			func() (any, error) {
 				called = append(called, 2)
 				return 123, nil
 			},
@@ -721,7 +729,7 @@ func TestResolveValue(t *testing.T) {
 		param.On("UnmarshalPipelineParam", expectedValue).Return(nil)
 
 		getters := []pipeline.GetterFunc{
-			func() (interface{}, error) {
+			func() (any, error) {
 				return expectedValue, nil
 			},
 		}
@@ -738,7 +746,7 @@ func TestResolveValue(t *testing.T) {
 		param.On("UnmarshalPipelineParam", expectedValue).Return(expectedErr)
 
 		getters := []pipeline.GetterFunc{
-			func() (interface{}, error) {
+			func() (any, error) {
 				return expectedValue, nil
 			},
 		}

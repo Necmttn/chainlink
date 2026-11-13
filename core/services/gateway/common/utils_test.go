@@ -2,8 +2,8 @@ package common_test
 
 import (
 	"bytes"
+	"math/rand"
 	"testing"
-	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/stretchr/testify/require"
@@ -14,7 +14,7 @@ import (
 func TestUtils_BytesUint32Conversions(t *testing.T) {
 	t.Parallel()
 
-	val := uint32(time.Now().Unix())
+	val := rand.Uint32()
 	data := common.Uint32ToBytes(val)
 	require.Equal(t, val, common.BytesToUint32(data))
 }
@@ -47,7 +47,7 @@ func TestUtils_BytesSignAndValidate(t *testing.T) {
 
 	signature, err := common.SignData(privateKey, data)
 	require.NoError(t, err)
-	require.Equal(t, 65, len(signature))
+	require.Len(t, signature, 65)
 
 	// valid
 	signer, err := common.ExtractSigner(signature, data)
